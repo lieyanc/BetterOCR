@@ -1,0 +1,6 @@
+# Binaries
+betterocr
+
+# Test
+*.test
+*.out
