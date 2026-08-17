@@ -1,6 +1,9 @@
 // BetterOCR 是一个多引擎 OCR 融合工具:并发调用多个便宜的 VLM 引擎,
 // 行级对齐后一致的行免费通过,只有分歧行交给更强的 VLM 仲裁。
 // 强模型成本与分歧量成正比,融合准确率可超过任何单个引擎。
+//
+// 全部运行参数来自 JSON 配置文件(模板内置在二进制中,启动时自动
+// 释放/补全),不读取任何环境变量。
 package main
 
 import (
@@ -13,34 +16,49 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/pipeline"
 	"github.com/lieyanc/BetterOCR/internal/server"
 )
 
 func main() {
 	var (
-		engines   = flag.String("engines", "", "基础 VLM 引擎模型,逗号分隔;同一模型重复出现即多路采样(CLI 模式必填,Web 模式作为页面默认值)")
-		arbModel  = flag.String("arbiter", "", "仲裁 VLM 模型(应显著强于基础引擎);留空则分歧行退化为本地择优")
-		baseURL   = flag.String("base-url", "", "OpenAI 兼容 API 地址;默认依次取 $OPENAI_BASE_URL、$OPENAI_API_BASE,最后 https://api.openai.com/v1")
-		timeout   = flag.Duration("timeout", 2*time.Minute, "单次识别的端到端超时(含引擎识别与仲裁)")
-		pretty    = flag.Bool("pretty", false, "美化 JSON 输出(CLI 模式)")
-		serveAddr = flag.String("serve", "", "以 Web 模式启动并监听该地址,如 127.0.0.1:8787;前端已内嵌在二进制中")
+		configPath = flag.String("config", config.DefaultPath, "JSON 配置文件路径;不存在时自动释放内置模板,缺字段时按模板补全写回")
+		serveMode  = flag.Bool("serve", false, "以 Web 模式启动,监听配置中的 serve_addr;前端已内嵌在二进制中")
+		pretty     = flag.Bool("pretty", false, "美化 JSON 输出(CLI 模式)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
-			"用法: betterocr -engines <models> [-arbiter <model>] [flags] image.png\n"+
-				"      betterocr -serve 127.0.0.1:8787 [-engines <models>] [-arbiter <model>]\n\n"+
-				"API Key 从 $OPENAI_API_KEY 读取(本地服务可不设)。\n\n")
+			"用法: betterocr [-config betterocr.json] [-pretty] image.png\n"+
+				"      betterocr [-config betterocr.json] -serve\n\n"+
+				"引擎、仲裁模型、base_url、api_key、超时与监听地址全部来自 JSON 配置文件;\n"+
+				"首次运行自动生成模板,不读取任何环境变量。\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if *serveAddr != "" {
-		runServe(*serveAddr, *engines, *arbModel, *baseURL, *timeout)
+	cfg, action, err := config.Load(*configPath)
+	if err != nil {
+		fatal("加载配置失败:", err)
+	}
+	switch action {
+	case config.ActionReleased:
+		fmt.Fprintf(os.Stderr, "已生成默认配置文件 %s(内置模板),请按需修改 api_key、engines 等字段\n", *configPath)
+		if !*serveMode {
+			// 模板值直接识别几乎必然失败,提示编辑后退出
+			fmt.Fprintln(os.Stderr, "请编辑配置后重新运行")
+			os.Exit(1)
+		}
+	case config.ActionSupplemented:
+		fmt.Fprintf(os.Stderr, "配置文件 %s 缺少字段,已按内置模板补全\n", *configPath)
+	}
+
+	if *serveMode {
+		runServe(cfg)
 		return
 	}
 
-	if *engines == "" || flag.NArg() != 1 {
+	if flag.NArg() != 1 {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -48,18 +66,18 @@ func main() {
 	if err != nil {
 		fatal("读取图片失败:", err)
 	}
-	if *arbModel == "" {
-		fmt.Fprintln(os.Stderr, "警告: 未配置 -arbiter,分歧行将退化为本地择优,无法获得超越单引擎的准确率")
+	if cfg.Arbiter == "" {
+		fmt.Fprintln(os.Stderr, "警告: 配置中 arbiter 为空,分歧行将退化为本地择优,无法获得超越单引擎的准确率")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout())
 	defer cancel()
 
 	final, err := pipeline.Run(ctx, pipeline.Config{
-		Engines: pipeline.SplitList(*engines),
-		Arbiter: *arbModel,
-		BaseURL: pipeline.ResolveBaseURL(*baseURL),
-		APIKey:  os.Getenv("OPENAI_API_KEY"),
+		Engines: cfg.Engines,
+		Arbiter: cfg.Arbiter,
+		BaseURL: cfg.BaseURL,
+		APIKey:  cfg.APIKey,
 	}, image)
 	if err != nil {
 		fatal("识别失败:", err)
@@ -82,17 +100,20 @@ func main() {
 	}
 }
 
-// runServe 启动 Web 模式:内嵌前端 + /api 接口,CLI 参数作为页面默认值。
-func runServe(addr, engines, arbModel, baseURL string, timeout time.Duration) {
-	srv := &server.Server{
-		DefaultEngines: pipeline.SplitList(engines),
-		DefaultArbiter: arbModel,
-		BaseURL:        pipeline.ResolveBaseURL(baseURL),
-		APIKey:         os.Getenv("OPENAI_API_KEY"),
-		Timeout:        timeout,
+// runServe 启动 Web 模式:内嵌前端 + /api 接口,配置文件的值作为页面默认值。
+func runServe(cfg config.Config) {
+	if cfg.ServeAddr == "" {
+		fatal("配置错误:", "serve_addr 为空,Web 模式无监听地址")
 	}
-	fmt.Fprintf(os.Stderr, "BetterOCR Web 模式已启动: http://%s\n", displayAddr(addr))
-	hs := &http.Server{Addr: addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	srv := &server.Server{
+		DefaultEngines: cfg.Engines,
+		DefaultArbiter: cfg.Arbiter,
+		BaseURL:        cfg.BaseURL,
+		APIKey:         cfg.APIKey,
+		Timeout:        cfg.Timeout(),
+	}
+	fmt.Fprintf(os.Stderr, "BetterOCR Web 模式已启动: http://%s\n", displayAddr(cfg.ServeAddr))
+	hs := &http.Server{Addr: cfg.ServeAddr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	if err := hs.ListenAndServe(); err != nil {
 		fatal("HTTP 服务失败:", err)
 	}

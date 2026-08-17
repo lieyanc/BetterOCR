@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/lieyanc/BetterOCR/internal/agent"
@@ -16,13 +15,17 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
 )
 
+// DefaultBaseURL 是 base_url 未配置(或被显式清空)时的兜底端点。
+const DefaultBaseURL = "https://api.openai.com/v1"
+
 // Config 描述一次识别的全部参数。
 type Config struct {
 	// Engines 是基础 VLM 模型列表;同一模型重复出现即多路采样。
 	Engines []string
 	// Arbiter 是仲裁模型;为空则分歧行退化为本地择优。
 	Arbiter string
-	// BaseURL 是 OpenAI 兼容端点地址,APIKey 为空时不发送认证头。
+	// BaseURL 是 OpenAI 兼容端点地址,为空时回退 DefaultBaseURL;
+	// APIKey 为空时不发送认证头。
 	BaseURL string
 	APIKey  string
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
@@ -34,7 +37,11 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	if len(cfg.Engines) == 0 {
 		return arbiter.Final{}, errors.New("未配置任何引擎模型")
 	}
-	oc := agents.OpenAIConfig{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, HTTPClient: cfg.HTTPClient}
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	oc := agents.OpenAIConfig{BaseURL: baseURL, APIKey: cfg.APIKey, HTTPClient: cfg.HTTPClient}
 
 	reg := agent.NewRegistry()
 	for i, model := range cfg.Engines {
@@ -49,16 +56,6 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 
 	results := agent.NewCoordinator(reg).RunConcurrent(ctx, image)
 	return arb.Fuse(ctx, image, results), nil
-}
-
-// ResolveBaseURL 按 显式值 > $OPENAI_BASE_URL > $OPENAI_API_BASE > 官方默认 解析。
-func ResolveBaseURL(explicit string) string {
-	for _, v := range []string{explicit, os.Getenv("OPENAI_BASE_URL"), os.Getenv("OPENAI_API_BASE")} {
-		if v != "" {
-			return v
-		}
-	}
-	return "https://api.openai.com/v1"
 }
 
 // SplitList 把逗号分隔的模型列表拆成去空白的非空项。

@@ -249,7 +249,7 @@ export default function App() {
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
                   placeholder={
-                    cfg?.has_api_key ? "留空使用服务端 $OPENAI_API_KEY" : "sk-…(本地服务可留空)"
+                    cfg?.has_api_key ? "留空使用服务端配置的 api_key" : "sk-…(本地服务可留空)"
                   }
                 />
               </div>

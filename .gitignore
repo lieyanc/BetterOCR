@@ -1,6 +1,9 @@
 # Binaries(仅根目录的编译产物;不能写成未锚定的 betterocr,会误伤 cmd/betterocr/)
 /betterocr
 
+# 运行时释放的配置文件,内含 api_key,严禁入库
+betterocr.json
+
 # Test
 *.test
 *.out

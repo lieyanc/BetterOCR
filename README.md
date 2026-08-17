@@ -36,18 +36,37 @@
 任何暴露 `/chat/completions` 的 OpenAI 兼容服务都能用
 (OpenAI、SiliconFlow、DashScope、vLLM、Ollama……),零第三方依赖。
 
-```bash
-export OPENAI_API_KEY=sk-...                          # 本地服务可不设
-export OPENAI_BASE_URL=https://api.siliconflow.cn/v1  # 或 -base-url 指定
+全部运行参数来自 JSON 配置文件(默认 `./betterocr.json`,可用 `-config` 指定),
+**不读取任何环境变量**。首次运行自动释放内置模板:
 
-go run ./cmd/betterocr \
-  -engines qwen2.5-vl-7b,qwen2.5-vl-7b,glm-4v-9b \
-  -arbiter qwen2.5-vl-72b \
-  -pretty invoice.png
+```bash
+go run ./cmd/betterocr invoice.png   # 首次运行:生成 betterocr.json 后退出
 ```
 
-同一模型重复出现即多路采样(`qwen2.5-vl-7b,qwen2.5-vl-7b`),
+编辑生成的 `betterocr.json`(填入 api_key,按需调整模型与端点):
+
+```json
+{
+  "engines": ["qwen2.5-vl-7b", "qwen2.5-vl-7b", "glm-4v-9b"],
+  "arbiter": "qwen2.5-vl-72b",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "api_key": "sk-…",
+  "timeout_seconds": 120,
+  "serve_addr": "127.0.0.1:8787"
+}
+```
+
+再次运行即可识别:
+
+```bash
+go run ./cmd/betterocr -pretty invoice.png
+```
+
+同一模型在 `engines` 里重复出现即多路采样(如 `qwen2.5-vl-7b` 出现两次),
 利用采样随机性制造独立证据,是最便宜的引擎组合方式。
+
+配置文件缺少字段时,启动会按内置模板自动补全并写回;显式空值视为用户
+决定,不会被改写;无法解析的文件绝不会被改动。
 
 ## Web 界面(单文件二进制)
 
@@ -57,19 +76,18 @@ go run ./cmd/betterocr \
 ```bash
 make build    # = cd web && npm install && npm run build,再 go build
 
-./betterocr -serve 127.0.0.1:8787 \
-  -engines qwen2.5-vl-7b,qwen2.5-vl-7b,glm-4v-9b \
-  -arbiter qwen2.5-vl-72b
+./betterocr -serve    # 监听配置中的 serve_addr,默认 127.0.0.1:8787
 ```
 
 浏览器打开 http://127.0.0.1:8787:拖拽 / 点击 / Ctrl+V 粘贴图片,页面上可
 覆盖引擎、仲裁模型、Base URL 与 API Key;结果按 文本 / 逐行(来源与置信度
 标注)/ 引擎对比 / JSON 四个视图展示。
 
-- Web 模式下 `-engines` / `-arbiter` / `-base-url` 只是页面预填的默认值,可省略。
-- 服务端的 `$OPENAI_API_KEY` 绝不下发给页面;页面留空即用服务端的 key,
+- Web 模式下配置文件里的 `engines` / `arbiter` / `base_url` 只是页面预填的
+  默认值,每次请求可逐项覆盖。
+- 服务端配置的 `api_key` 绝不下发给页面;页面留空即用服务端的 key,
   填了则覆盖本次请求。
-- 监听地址请保持 127.0.0.1;要暴露到公网需自行加认证层。
+- 监听地址(`serve_addr`)请保持 127.0.0.1;要暴露到公网需自行加认证层。
 - 前端开发:`cd web && npm run dev`(Vite 把 /api 代理到 127.0.0.1:8787)。
 - 未构建前端时 `go build` 依然可用,`-serve` 会返回一页构建指引。
 
@@ -100,16 +118,27 @@ make build    # = cd web && npm install && npm run build,再 go build
 | `escalated` | 分歧行,由仲裁 VLM 看原图裁定              | 一次打包 |
 | `fallback`  | 未配置仲裁器或仲裁失败,本地确定性择优兜底 | 免费     |
 
-## 参数
+## 配置与参数
 
-| 参数        | 说明                                                         |
-|-------------|--------------------------------------------------------------|
-| `-engines`  | 基础引擎模型,逗号分隔;重复即多路采样(CLI 必填)           |
-| `-arbiter`  | 仲裁模型,应显著强于基础引擎;留空则分歧行退化为本地择优     |
-| `-base-url` | API 地址;默认依次取 `$OPENAI_BASE_URL`、`$OPENAI_API_BASE`  |
-| `-serve`    | 以 Web 模式启动并监听该地址,如 `127.0.0.1:8787`             |
-| `-timeout`  | 单次识别的端到端超时,默认 2m                                |
-| `-pretty`   | 美化 JSON 输出(CLI 模式)                                   |
+命令行只保留三个开关,识别参数全部在 JSON 配置文件里:
+
+| 命令行参数 | 说明                                                           |
+|------------|----------------------------------------------------------------|
+| `-config`  | 配置文件路径,默认 `betterocr.json`;不存在时自动释放内置模板  |
+| `-serve`   | 以 Web 模式启动,监听配置中的 `serve_addr`                     |
+| `-pretty`  | 美化 JSON 输出(CLI 模式)                                     |
+
+| 配置字段          | 说明                                                        |
+|-------------------|-------------------------------------------------------------|
+| `engines`         | 基础引擎模型数组;重复即多路采样(CLI 模式必填)            |
+| `arbiter`         | 仲裁模型,应显著强于基础引擎;置空则分歧行退化为本地择优    |
+| `base_url`        | OpenAI 兼容 API 地址;置空回退 `https://api.openai.com/v1`  |
+| `api_key`         | API 密钥;本地服务可留空(不发送认证头)                    |
+| `timeout_seconds` | 单次识别的端到端超时秒数,非正数按 120 处理                 |
+| `serve_addr`      | Web 模式监听地址,如 `127.0.0.1:8787`                       |
+
+启动时的配置文件处理:不存在 → 释放内置模板;缺字段 → 按模板补全写回;
+解析失败 → 报错且绝不改动原文件。不读取任何环境变量。
 
 单引擎失败不影响其他引擎;全部失败时退出码 1,细节在 `candidates[].err`。
 
