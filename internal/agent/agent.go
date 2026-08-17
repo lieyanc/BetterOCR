@@ -4,30 +4,39 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
 
+// Line 是识别结果中的一行文本。行是融合的最小单元:
+// 只有行级结构才能让仲裁发生在低于整篇文本的粒度上,
+// 融合准确率才有机会超过最好的单个引擎。
+type Line struct {
+	// Text 是该行的原始识别文本。
+	Text string `json:"text"`
+	// Confidence 是引擎对该行的自报置信度,范围 [0,1]。
+	// 不同引擎的置信度刻度不可比,仲裁器只在同引擎内部使用它。
+	Confidence float64 `json:"confidence"`
+}
+
 // Result 是单个 Agent 的一次识别结果。
 type Result struct {
-	// Agent 是产出该结果的 Agent 名称。
+	// Agent 是产出该结果的 Agent 名称,由 Coordinator 填写。
 	Agent string `json:"agent"`
-	// Text 是识别出的完整文本。
-	Text string `json:"text"`
-	// Confidence 是该 Agent 对结果的置信度，范围 [0,1]。
-	Confidence float64 `json:"confidence"`
-	// LatencyMS 是本次识别耗时（毫秒）。
+	// Lines 是按阅读顺序排列的识别行。
+	Lines []Line `json:"lines,omitempty"`
+	// LatencyMS 是本次识别耗时(毫秒)。
 	LatencyMS int64 `json:"latency_ms"`
-	// Err 为非空时表示该 Agent 识别失败，此时 Text 无效。
+	// Err 为非空时表示该 Agent 识别失败,此时 Lines 无效。
 	Err string `json:"err,omitempty"`
 }
 
-// Agent 是一个 OCR 引擎的抽象。实现方应尽量返回带置信度的结果，
-// 以便 Arbiter 进行融合决策。
+// Agent 是一个 OCR 引擎的抽象。实现方应尽量按行返回带置信度的结果。
 type Agent interface {
-	// Name 返回 Agent 唯一名称，如 "tesseract"、"paddle"。
+	// Name 返回 Agent 唯一名称,如 "tesseract"、"claude-haiku-4-5#1"。
 	Name() string
-	// Recognize 对输入图片执行 OCR，返回识别结果。
+	// Recognize 对输入图片执行 OCR。实现必须尊重 ctx 取消。
 	Recognize(ctx context.Context, image []byte) (Result, error)
 }
 
@@ -42,7 +51,7 @@ func NewRegistry() *Registry {
 	return &Registry{agents: make(map[string]Agent)}
 }
 
-// Register 注册一个 Agent，重名时返回错误。
+// Register 注册一个 Agent,重名时返回错误。
 func (r *Registry) Register(a Agent) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -53,7 +62,7 @@ func (r *Registry) Register(a Agent) error {
 	return nil
 }
 
-// MustRegister 注册 Agent，重名时 panic。
+// MustRegister 注册 Agent,重名时 panic。
 func (r *Registry) MustRegister(a Agent) {
 	if err := r.Register(a); err != nil {
 		panic(err)
@@ -68,7 +77,15 @@ func (r *Registry) Get(name string) (Agent, bool) {
 	return a, ok
 }
 
-// List 返回所有已注册 Agent。
+// Len 返回已注册 Agent 数量。
+func (r *Registry) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.agents)
+}
+
+// List 返回所有已注册 Agent,按名称字典序排列。
+// 确定性顺序是整条流水线可复现的前提。
 func (r *Registry) List() []Agent {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -76,10 +93,11 @@ func (r *Registry) List() []Agent {
 	for _, a := range r.agents {
 		out = append(out, a)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name() < out[j].Name() })
 	return out
 }
 
-// Coordinator 并发调度多个 Agent，并收集结果。
+// Coordinator 并发调度多个 Agent,并收集结果。
 type Coordinator struct {
 	registry *Registry
 }
@@ -89,16 +107,19 @@ func NewCoordinator(reg *Registry) *Coordinator {
 	return &Coordinator{registry: reg}
 }
 
-// RunConcurrent 并发调用所有已注册 Agent，ctx 取消时提前返回。
-// 单个 Agent 失败不影响其他 Agent，错误记录在 Result.Err 中。
+// RunConcurrent 并发调用所有已注册 Agent。ctx 结束时立即返回,
+// 未完成的 Agent 在结果中记为 ctx 错误——即使某个 Agent 不尊重 ctx,
+// 也不会拖死整条流水线(其 goroutine 会在自身返回后经缓冲通道退出,不会永久泄漏)。
+// 单个 Agent 失败不影响其他 Agent,错误记录在 Result.Err 中。
 func (c *Coordinator) RunConcurrent(ctx context.Context, image []byte) []Result {
 	agents := c.registry.List()
-	results := make([]Result, len(agents))
-	var wg sync.WaitGroup
+	type slot struct {
+		i   int
+		res Result
+	}
+	ch := make(chan slot, len(agents))
 	for i, a := range agents {
-		wg.Add(1)
 		go func(i int, a Agent) {
-			defer wg.Done()
 			start := time.Now()
 			res, err := a.Recognize(ctx, image)
 			res.Agent = a.Name()
@@ -106,9 +127,25 @@ func (c *Coordinator) RunConcurrent(ctx context.Context, image []byte) []Result 
 			if err != nil {
 				res.Err = err.Error()
 			}
-			results[i] = res
+			ch <- slot{i, res}
 		}(i, a)
 	}
-	wg.Wait()
+
+	results := make([]Result, len(agents))
+	done := make([]bool, len(agents))
+	for range agents {
+		select {
+		case s := <-ch:
+			results[s.i] = s.res
+			done[s.i] = true
+		case <-ctx.Done():
+			for i, a := range agents {
+				if !done[i] {
+					results[i] = Result{Agent: a.Name(), Err: ctx.Err().Error()}
+				}
+			}
+			return results
+		}
+	}
 	return results
 }

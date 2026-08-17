@@ -1,6 +1,11 @@
-# Binaries
-betterocr
+# Binaries(仅根目录的编译产物;不能写成未锚定的 betterocr,会误伤 cmd/betterocr/)
+/betterocr
 
 # Test
 *.test
 *.out
+
+# Web 前端(dist 由 npm run build 生成;保留 .gitkeep 占位保证 go:embed 始终可编译)
+/web/node_modules
+/web/dist/*
+!/web/dist/.gitkeep

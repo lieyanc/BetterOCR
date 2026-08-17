@@ -2,25 +2,26 @@ package arbiter
 
 import "strings"
 
-// Similarity 计算两个字符串的相似度，基于二元组（bigram）Jaccard 系数，
-// 返回值范围 [0,1]。空字符串与任意字符串相似度为 0。
+// Normalize 将文本规整为一致性比较用的形式:去首尾空白、
+// 折叠连续空白为单个空格。排版差异不构成分歧,字符差异才构成;
+// 大小写与全半角差异保留——那是真实的识别分歧,应交给仲裁。
+func Normalize(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// Similarity 计算两段文本的相似度,基于二元组(bigram)Jaccard 系数,
+// 返回值范围 [0,1]。比较前先 Normalize;空文本与任何文本相似度为 0。
 func Similarity(a, b string) float64 {
-	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	a, b = Normalize(a), Normalize(b)
 	if a == "" || b == "" {
 		return 0
 	}
 	if a == b {
 		return 1
 	}
-	setA := bigrams(a)
-	setB := bigrams(b)
+	setA, setB := bigrams(a), bigrams(b)
 	if len(setA) == 0 || len(setB) == 0 {
-		// 单字符字符串没有 bigram，退化为逐字符比较
-		if len([]rune(a)) == 1 && len([]rune(b)) == 1 {
-			if a == b {
-				return 1
-			}
-		}
+		// 单字符文本没有 bigram;能走到这里说明两者必不相等
 		return 0
 	}
 	inter := 0
@@ -29,11 +30,7 @@ func Similarity(a, b string) float64 {
 			inter++
 		}
 	}
-	union := len(setA) + len(setB) - inter
-	if union == 0 {
-		return 0
-	}
-	return float64(inter) / float64(union)
+	return float64(inter) / float64(len(setA)+len(setB)-inter)
 }
 
 func bigrams(s string) map[string]struct{} {
