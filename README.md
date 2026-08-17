@@ -47,9 +47,9 @@ go run ./cmd/betterocr invoice.png   # 首次运行:生成 betterocr.json 后退
 
 ```json
 {
-  "engines": ["qwen2.5-vl-7b", "qwen2.5-vl-7b", "glm-4v-9b"],
-  "arbiter": "qwen2.5-vl-72b",
-  "base_url": "https://api.siliconflow.cn/v1",
+  "engines": ["qwen3.7-plus", "kimi-k2.6", "paddleocr-vl-1.6", "mimo-v2.5-pro"],
+  "arbiter": "qwen3.8-max",
+  "base_url": "https://api.example.com/v1",
   "api_key": "sk-…",
   "timeout_seconds": 120,
   "serve_addr": "127.0.0.1:8787"

@@ -1,4 +1,4 @@
-.PHONY: build web test clean
+.PHONY: build web run test clean
 
 # 完整构建:前端 → go:embed → 单文件二进制 ./betterocr
 build: web
@@ -7,6 +7,10 @@ build: web
 # 仅构建前端(产物在 web/dist,由 go build 内嵌)
 web:
 	cd web && npm install && npm run build
+
+# 编译并运行
+run: build
+	./betterocr
 
 test:
 	go test ./...

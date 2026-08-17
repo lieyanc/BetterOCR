@@ -36,9 +36,9 @@ type Config struct {
 // Default 返回内置硬编码模板,与 README 示例保持一致。
 func Default() Config {
 	return Config{
-		Engines:        []string{"qwen2.5-vl-7b", "qwen2.5-vl-7b", "glm-4v-9b"},
-		Arbiter:        "qwen2.5-vl-72b",
-		BaseURL:        "https://api.siliconflow.cn/v1",
+		Engines:        []string{"qwen3.7-plus", "kimi-k2.6", "paddleocr-vl-1.6", "mimo-v2.5-pro"},
+		Arbiter:        "qwen3.8-max",
+		BaseURL:        "https://api.example.com/v1",
 		APIKey:         "",
 		TimeoutSeconds: 120,
 		ServeAddr:      "127.0.0.1:8787",

@@ -238,7 +238,7 @@ export default function App() {
                   id="base-url"
                   value={baseUrl}
                   onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder="https://api.siliconflow.cn/v1"
+                  placeholder="https://api.example.com/v1"
                 />
               </div>
               <div className="flex flex-col gap-1.5">
