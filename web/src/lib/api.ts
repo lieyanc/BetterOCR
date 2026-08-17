@@ -41,11 +41,26 @@ export interface Final {
   candidates: EngineResult[]
 }
 
-export interface ServerConfig {
-  engines: string[]
-  arbiter: string
+export type ModelAPI = "openai-chat" | "openai-responses" | "anthropic"
+
+export interface ProviderModel {
+  id: string
+  context: number
+  alias: string
+  api: ModelAPI
+}
+
+export interface Provider {
+  id: string
   base_url: string
   has_api_key: boolean
+  models: ProviderModel[]
+}
+
+export interface ServerConfig {
+  providers: Provider[]
+  engines: string[]
+  arbiter: string
   timeout_ms: number
 }
 
@@ -57,23 +72,23 @@ export async function fetchConfig(): Promise<ServerConfig> {
 
 export interface OCRRequest {
   image: File
-  engines: string
+  engines: string[]
   arbiter: string
-  baseUrl: string
-  apiKey: string
   signal?: AbortSignal
 }
 
 export async function runOCR(req: OCRRequest): Promise<Final> {
   const fd = new FormData()
   fd.append("image", req.image)
-  fd.append("engines", req.engines)
+  fd.append("engines", req.engines.join(","))
   // arbiter 始终提交:显式的空值表示"清空仲裁",而非回退服务端默认
   fd.append("arbiter", req.arbiter)
-  if (req.baseUrl) fd.append("base_url", req.baseUrl)
-  if (req.apiKey) fd.append("api_key", req.apiKey)
 
-  const res = await fetch("/api/ocr", { method: "POST", body: fd, signal: req.signal })
+  const res = await fetch("/api/ocr", {
+    method: "POST",
+    body: fd,
+    signal: req.signal,
+  })
   if (!res.ok) {
     let msg = `识别请求失败 (HTTP ${res.status})`
     try {

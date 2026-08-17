@@ -1,6 +1,5 @@
-// Package agents 提供基于 OpenAI 兼容 API 的 VLM 引擎与仲裁器实现。
-// 任何暴露 /chat/completions 的服务(OpenAI、SiliconFlow、DashScope、
-// vLLM、Ollama 等)都可直接接入。
+// Package agents provides VLM engines and arbiters for the OpenAI Chat,
+// OpenAI Responses, and Anthropic Messages APIs.
 package agents
 
 import (
@@ -15,39 +14,23 @@ import (
 
 	"github.com/lieyanc/BetterOCR/internal/agent"
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
+	"github.com/lieyanc/BetterOCR/internal/model"
 )
 
-// OpenAIConfig 是 OpenAI 兼容端点的连接配置。
-type OpenAIConfig struct {
-	// BaseURL 形如 https://api.openai.com/v1,末尾不带斜杠。
-	BaseURL string
-	// APIKey 为空时不发送 Authorization 头(本地 vLLM/Ollama 常见)。
-	APIKey string
-	// HTTPClient 为 nil 时使用 http.DefaultClient;超时由调用方 ctx 控制。
-	HTTPClient *http.Client
-}
-
-func (c OpenAIConfig) client() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return http.DefaultClient
-}
-
-// OpenAIVLM 用 OpenAI 兼容的视觉模型做基础 OCR 引擎。
-type OpenAIVLM struct {
+// VisionVLM uses a configured multimodal model as a base OCR engine.
+type VisionVLM struct {
 	AgentName string
-	Model     string
-	Config    OpenAIConfig
+	Model     model.Resolved
+	Client    *http.Client
 }
 
-// NewOpenAIVLM 创建一个基础 VLM 引擎。
-func NewOpenAIVLM(name, model string, cfg OpenAIConfig) *OpenAIVLM {
-	return &OpenAIVLM{AgentName: name, Model: model, Config: cfg}
+// NewVisionVLM creates a base VLM engine.
+func NewVisionVLM(name string, resolved model.Resolved, client *http.Client) *VisionVLM {
+	return &VisionVLM{AgentName: name, Model: resolved, Client: client}
 }
 
-// Name 实现 agent.Agent。
-func (o *OpenAIVLM) Name() string { return o.AgentName }
+// Name implements agent.Agent.
+func (v *VisionVLM) Name() string { return v.AgentName }
 
 const ocrSystem = `You are an OCR engine. Transcribe ALL text visible in the image, line by line, in natural reading order.
 
@@ -60,9 +43,9 @@ Rules:
 - "confidence" is your certainty in [0,1] that the line is transcribed exactly.
 - If the image contains no text, output [].`
 
-// Recognize 实现 agent.Agent。
-func (o *OpenAIVLM) Recognize(ctx context.Context, image []byte) (agent.Result, error) {
-	content, err := chatVision(ctx, o.Config, o.Model, ocrSystem, "Transcribe the image.", image)
+// Recognize implements agent.Agent.
+func (v *VisionVLM) Recognize(ctx context.Context, image []byte) (agent.Result, error) {
+	content, err := vision(ctx, v.Model, v.Client, ocrSystem, "Transcribe the image.", image)
 	if err != nil {
 		return agent.Result{}, err
 	}
@@ -87,19 +70,21 @@ func (o *OpenAIVLM) Recognize(ctx context.Context, image []byte) (agent.Result, 
 	return agent.Result{Lines: lines}, nil
 }
 
-// OpenAIEscalator 用更强的 OpenAI 兼容视觉模型裁定分歧行。
-type OpenAIEscalator struct {
-	Model  string
-	Config OpenAIConfig
+// VisionEscalator uses a configured multimodal model to resolve disputed rows.
+type VisionEscalator struct {
+	Model  model.Resolved
+	Client *http.Client
 }
 
-// NewOpenAIEscalator 创建仲裁器。
-func NewOpenAIEscalator(model string, cfg OpenAIConfig) *OpenAIEscalator {
-	return &OpenAIEscalator{Model: model, Config: cfg}
+// NewVisionEscalator creates a dispute arbiter.
+func NewVisionEscalator(resolved model.Resolved, client *http.Client) *VisionEscalator {
+	return &VisionEscalator{Model: resolved, Client: client}
 }
 
-// Name 实现 arbiter.Escalator。
-func (e *OpenAIEscalator) Name() string { return "arbiter:" + e.Model }
+// Name implements arbiter.Escalator.
+func (e *VisionEscalator) Name() string {
+	return "arbiter:" + e.Model.DisplayName() + " (" + e.Model.ProviderID + ")"
+}
 
 const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several fast OCR engines transcribed the same image; most lines agree, but the rows listed below are disputed. Look at the image and decide the correct text for each disputed row.
 
@@ -112,9 +97,9 @@ Rules:
 - If a disputed line does not actually exist in the image, return an empty string for "text".
 - "confidence" is your certainty in [0,1].`
 
-// Resolve 实现 arbiter.Escalator:把一张图的全部分歧打包成一次调用。
-func (e *OpenAIEscalator) Resolve(ctx context.Context, image []byte, disputes []arbiter.Dispute) ([]arbiter.Resolution, error) {
-	content, err := chatVision(ctx, e.Config, e.Model, escalatorSystem, disputesPrompt(disputes), image)
+// Resolve implements arbiter.Escalator and batches all disputed rows in one call.
+func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []arbiter.Dispute) ([]arbiter.Resolution, error) {
+	content, err := vision(ctx, e.Model, e.Client, escalatorSystem, disputesPrompt(disputes), image)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +122,6 @@ func (e *OpenAIEscalator) Resolve(ctx context.Context, image []byte, disputes []
 	return out, nil
 }
 
-// disputesPrompt 把分歧渲染成给仲裁模型看的文本。
 func disputesPrompt(disputes []arbiter.Dispute) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Disputed rows (%d):\n", len(disputes))
@@ -155,7 +139,25 @@ func disputesPrompt(disputes []arbiter.Dispute) string {
 	return sb.String()
 }
 
-// ---- OpenAI 兼容 /chat/completions 底层调用 ----
+func vision(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText string, image []byte) (string, error) {
+	mediaType := http.DetectContentType(image)
+	if !strings.HasPrefix(mediaType, "image/") {
+		return "", fmt.Errorf("输入不是可识别的图片格式: %s", mediaType)
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	switch resolved.API {
+	case model.APIOpenAIChat:
+		return openAIChat(ctx, resolved, client, system, userText, mediaType, image)
+	case model.APIOpenAIResponses:
+		return openAIResponses(ctx, resolved, client, system, userText, mediaType, image)
+	case model.APIAnthropic:
+		return anthropicMessages(ctx, resolved, client, system, userText, mediaType, image)
+	default:
+		return "", fmt.Errorf("模型 %s 使用了不受支持的 API %q", resolved.Ref, resolved.API)
+	}
+}
 
 type chatRequest struct {
 	Model     string        `json:"model"`
@@ -165,95 +167,271 @@ type chatRequest struct {
 
 type chatMessage struct {
 	Role    string `json:"role"`
-	Content any    `json:"content"` // string 或 []contentPart
+	Content any    `json:"content"`
 }
 
-type contentPart struct {
-	Type     string    `json:"type"`
-	Text     string    `json:"text,omitempty"`
-	ImageURL *imageURL `json:"image_url,omitempty"`
+type chatContentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *chatImageURL `json:"image_url,omitempty"`
 }
 
-type imageURL struct {
+type chatImageURL struct {
 	URL string `json:"url"`
 }
 
-type chatResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-// chatVision 发送一次带图请求,返回模型文本输出。
-func chatVision(ctx context.Context, cfg OpenAIConfig, model, system, userText string, image []byte) (string, error) {
-	mediaType := http.DetectContentType(image)
-	if !strings.HasPrefix(mediaType, "image/") {
-		return "", fmt.Errorf("输入不是可识别的图片格式: %s", mediaType)
-	}
-	dataURL := "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(image)
-
-	body, err := json.Marshal(chatRequest{
-		Model: model,
+func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte) (string, error) {
+	body := chatRequest{
+		Model: resolved.ID,
 		Messages: []chatMessage{
 			{Role: "system", Content: system},
-			{Role: "user", Content: []contentPart{
-				{Type: "image_url", ImageURL: &imageURL{URL: dataURL}},
+			{Role: "user", Content: []chatContentPart{
+				{Type: "image_url", ImageURL: &chatImageURL{URL: imageDataURL(mediaType, image)}},
 				{Type: "text", Text: userText},
 			}},
 		},
-		MaxTokens: 8192,
-	})
+		MaxTokens: maxOutputTokens(resolved.Context),
+	}
+	raw, err := postJSON(ctx, resolved, client, "/chat/completions", body, false)
 	if err != nil {
 		return "", err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(cfg.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", err
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return "", fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
 	}
-
-	resp, err := cfg.client().Do(req)
-	if err != nil {
-		return "", err
+	if len(response.Choices) == 0 {
+		return "", fmt.Errorf("模型 %s 未返回任何 choice", resolved.Ref)
 	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return "", err
+	text := textFromContent(response.Choices[0].Message.Content)
+	if text == "" {
+		return "", fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
 	}
-
-	var parsed chatResponse
-	// 先尝试解析结构化错误信息,拿不到再退回原始响应体。
-	_ = json.Unmarshal(respBody, &parsed)
-	if resp.StatusCode != http.StatusOK {
-		msg := strings.TrimSpace(string(respBody))
-		if parsed.Error != nil && parsed.Error.Message != "" {
-			msg = parsed.Error.Message
-		}
-		return "", fmt.Errorf("模型 %s 请求失败 (HTTP %d): %.300s", model, resp.StatusCode, msg)
-	}
-	if parsed.Error != nil && parsed.Error.Message != "" {
-		return "", fmt.Errorf("模型 %s 返回错误: %s", model, parsed.Error.Message)
-	}
-	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("模型 %s 未返回任何 choice", model)
-	}
-	return parsed.Choices[0].Message.Content, nil
+	return text, nil
 }
 
-// extractJSON 从模型输出中截取首个 '[' 到最后一个 ']' 的 JSON 数组,
-// 容忍模型偶尔加上的代码围栏或说明文字。
+type responsesRequest struct {
+	Model           string             `json:"model"`
+	Instructions    string             `json:"instructions"`
+	Input           []responsesMessage `json:"input"`
+	MaxOutputTokens int                `json:"max_output_tokens,omitempty"`
+}
+
+type responsesMessage struct {
+	Role    string                 `json:"role"`
+	Content []responsesContentPart `json:"content"`
+}
+
+type responsesContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte) (string, error) {
+	body := responsesRequest{
+		Model:        resolved.ID,
+		Instructions: system,
+		Input: []responsesMessage{{
+			Role: "user",
+			Content: []responsesContentPart{
+				{Type: "input_image", ImageURL: imageDataURL(mediaType, image)},
+				{Type: "input_text", Text: userText},
+			},
+		}},
+		MaxOutputTokens: maxOutputTokens(resolved.Context),
+	}
+	raw, err := postJSON(ctx, resolved, client, "/responses", body, false)
+	if err != nil {
+		return "", err
+	}
+	var response struct {
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return "", fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
+	}
+	if strings.TrimSpace(response.OutputText) != "" {
+		return response.OutputText, nil
+	}
+	var parts []string
+	for _, item := range response.Output {
+		for _, content := range item.Content {
+			if content.Type == "output_text" && content.Text != "" {
+				parts = append(parts, content.Text)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "", fmt.Errorf("模型 %s 未返回 output_text", resolved.Ref)
+	}
+	return strings.Join(parts, "\n"), nil
+}
+
+type anthropicRequest struct {
+	Model     string             `json:"model"`
+	System    string             `json:"system"`
+	Messages  []anthropicMessage `json:"messages"`
+	MaxTokens int                `json:"max_tokens"`
+}
+
+type anthropicMessage struct {
+	Role    string                 `json:"role"`
+	Content []anthropicContentPart `json:"content"`
+}
+
+type anthropicContentPart struct {
+	Type   string           `json:"type"`
+	Text   string           `json:"text,omitempty"`
+	Source *anthropicSource `json:"source,omitempty"`
+}
+
+type anthropicSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+func anthropicMessages(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte) (string, error) {
+	body := anthropicRequest{
+		Model:  resolved.ID,
+		System: system,
+		Messages: []anthropicMessage{{
+			Role: "user",
+			Content: []anthropicContentPart{
+				{Type: "image", Source: &anthropicSource{
+					Type: "base64", MediaType: mediaType, Data: base64.StdEncoding.EncodeToString(image),
+				}},
+				{Type: "text", Text: userText},
+			},
+		}},
+		MaxTokens: maxOutputTokens(resolved.Context),
+	}
+	raw, err := postJSON(ctx, resolved, client, "/messages", body, true)
+	if err != nil {
+		return "", err
+	}
+	var response struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return "", fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
+	}
+	var parts []string
+	for _, content := range response.Content {
+		if content.Type == "text" && content.Text != "" {
+			parts = append(parts, content.Text)
+		}
+	}
+	if len(parts) == 0 {
+		return "", fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
+	}
+	return strings.Join(parts, "\n"), nil
+}
+
+func postJSON(ctx context.Context, resolved model.Resolved, client *http.Client, endpoint string, body any, anthropic bool) ([]byte, error) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(resolved.BaseURL, "/")+endpoint, bytes.NewReader(encoded))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if anthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
+		if resolved.APIKey != "" {
+			req.Header.Set("x-api-key", resolved.APIKey)
+		}
+	} else if resolved.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+resolved.APIKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		message := strings.TrimSpace(string(responseBody))
+		parsed := parseAPIError(responseBody)
+		if parsed != "" {
+			message = parsed
+		}
+		return nil, fmt.Errorf("模型 %s 请求失败 (HTTP %d): %.300s", resolved.Ref, resp.StatusCode, message)
+	}
+	if message := parseAPIError(responseBody); message != "" {
+		return nil, fmt.Errorf("模型 %s 返回错误: %s", resolved.Ref, message)
+	}
+	return responseBody, nil
+}
+
+func parseAPIError(body []byte) string {
+	var parsed struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &parsed) == nil && parsed.Error != nil && parsed.Error.Message != "" {
+		return parsed.Error.Message
+	}
+	return ""
+}
+
+func imageDataURL(mediaType string, image []byte) string {
+	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(image)
+}
+
+func maxOutputTokens(contextWindow int) int {
+	const desired = 8192
+	if half := contextWindow / 2; half > 0 && half < desired {
+		return half
+	}
+	return desired
+}
+
+func textFromContent(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if (part.Type == "text" || part.Type == "output_text") && part.Text != "" {
+			texts = append(texts, part.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// extractJSON tolerates optional fences or prose surrounding a JSON array.
 func extractJSON(s string) ([]byte, error) {
 	start := strings.Index(s, "[")
 	end := strings.LastIndex(s, "]")

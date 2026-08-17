@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/lieyanc/BetterOCR/internal/model"
 )
 
 func TestSplitList(t *testing.T) {
@@ -30,20 +32,22 @@ func (c *captureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-func TestRunFallsBackToDefaultBaseURL(t *testing.T) {
+func TestRunUsesResolvedProviderEndpoint(t *testing.T) {
 	ct := &captureTransport{}
-	// PNG 魔数让 DetectContentType 通过,请求才会真正发出;
-	// 单引擎避免并发写 urls;BaseURL 留空应回退 DefaultBaseURL
+	// PNG 魔数让 DetectContentType 通过,请求才会真正发出。
 	pngMagic := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
 	_, err := Run(context.Background(), Config{
-		Engines:    []string{"m"},
+		Engines: []model.Resolved{{
+			Ref: "local/m", ProviderID: "local", BaseURL: "http://local.test/v1",
+			ID: "m", Context: 32768, Alias: "M", API: model.APIOpenAIChat,
+		}},
 		HTTPClient: &http.Client{Transport: ct},
 	}, pngMagic)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(ct.urls) == 0 || !strings.HasPrefix(ct.urls[0], DefaultBaseURL+"/") {
-		t.Errorf("请求 URL = %v, 应以 %s/ 开头", ct.urls, DefaultBaseURL)
+	if len(ct.urls) == 0 || ct.urls[0] != "http://local.test/v1/chat/completions" {
+		t.Errorf("请求 URL = %v", ct.urls)
 	}
 }
 

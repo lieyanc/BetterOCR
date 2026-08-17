@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lieyanc/BetterOCR/internal/config"
+	"github.com/lieyanc/BetterOCR/internal/model"
 	"github.com/lieyanc/BetterOCR/internal/pipeline"
 	"github.com/lieyanc/BetterOCR/web"
 )
@@ -18,15 +20,10 @@ import (
 // maxImageBytes 限制上传体积,防止误传大文件占满内存。
 const maxImageBytes = 32 << 20
 
-// Server 是 Web 模式的配置。零值可用,所有字段均可选。
+// Server is the web application configuration.
 type Server struct {
-	// DefaultEngines / DefaultArbiter / BaseURL 是页面预填的默认值,
-	// 每次请求可逐项覆盖。
-	DefaultEngines []string
-	DefaultArbiter string
-	BaseURL        string
-	// APIKey 是服务端默认密钥;只告知页面"是否已配置",绝不下发明文。
-	APIKey string
+	// Config contains the server-side provider catalog and credentials.
+	Config config.Config
 	// Timeout 是单次识别的端到端超时,零值取 2 分钟。
 	Timeout time.Duration
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
@@ -58,31 +55,44 @@ func (s *Server) timeout() time.Duration {
 	return 2 * time.Minute
 }
 
-// configResponse 是 GET /api/config 的响应,用于页面预填表单。
+// configResponse exposes selectable metadata but never provider API keys.
 type configResponse struct {
-	Engines   []string `json:"engines"`
-	Arbiter   string   `json:"arbiter"`
-	BaseURL   string   `json:"base_url"`
-	HasAPIKey bool     `json:"has_api_key"`
-	TimeoutMS int64    `json:"timeout_ms"`
+	Providers []providerResponse `json:"providers"`
+	Engines   []string           `json:"engines"`
+	Arbiter   string             `json:"arbiter"`
+	TimeoutMS int64              `json:"timeout_ms"`
+}
+
+type providerResponse struct {
+	ID        string             `json:"id"`
+	BaseURL   string             `json:"base_url"`
+	HasAPIKey bool               `json:"has_api_key"`
+	Models    []model.Definition `json:"models"`
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
-	engines := s.DefaultEngines
+	engines := s.Config.Engines
 	if engines == nil {
 		engines = []string{}
 	}
+	providers := make([]providerResponse, 0, len(s.Config.Providers))
+	for _, provider := range s.Config.Providers {
+		models := append([]model.Definition(nil), provider.Models...)
+		providers = append(providers, providerResponse{
+			ID: provider.ID, BaseURL: provider.BaseURL,
+			HasAPIKey: provider.APIKey != "", Models: models,
+		})
+	}
 	writeJSON(w, http.StatusOK, configResponse{
+		Providers: providers,
 		Engines:   engines,
-		Arbiter:   s.DefaultArbiter,
-		BaseURL:   s.BaseURL,
-		HasAPIKey: s.APIKey != "",
+		Arbiter:   s.Config.Arbiter,
 		TimeoutMS: s.timeout().Milliseconds(),
 	})
 }
 
-// handleOCR 接收 multipart 表单(image 文件 + engines/arbiter/base_url/api_key
-// 字段),跑一遍与 CLI 完全相同的流水线,返回 arbiter.Final JSON。
+// handleOCR accepts an image and configured model references. Connections and
+// credentials are resolved exclusively from the server-side configuration.
 func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxImageBytes)
 	if err := r.ParseMultipartForm(maxImageBytes); err != nil {
@@ -105,22 +115,34 @@ func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	engines := pipeline.SplitList(formOr(r, "engines", strings.Join(s.DefaultEngines, ",")))
-	if len(engines) == 0 {
+	engineRefs := pipeline.SplitList(formOr(r, "engines", strings.Join(s.Config.Engines, ",")))
+	if len(engineRefs) == 0 {
 		writeErr(w, http.StatusBadRequest, "未指定引擎模型(engines)")
 		return
 	}
-	cfg := pipeline.Config{
+	engines, err := s.Config.ResolveMany(engineRefs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var arbiterModel *model.Resolved
+	if arbiterRef := formOr(r, "arbiter", s.Config.Arbiter); arbiterRef != "" {
+		resolved, err := s.Config.Resolve(arbiterRef)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		arbiterModel = &resolved
+	}
+	runConfig := pipeline.Config{
 		Engines:    engines,
-		Arbiter:    formOr(r, "arbiter", s.DefaultArbiter),
-		BaseURL:    formOr(r, "base_url", s.BaseURL),
-		APIKey:     formOr(r, "api_key", s.APIKey),
+		Arbiter:    arbiterModel,
 		HTTPClient: s.HTTPClient,
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
 	defer cancel()
-	final, err := pipeline.Run(ctx, cfg, image)
+	final, err := pipeline.Run(ctx, runConfig, image)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

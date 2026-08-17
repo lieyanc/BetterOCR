@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertCircle,
+  ArrowRight,
+  Bot,
   Check,
   Copy,
   ImagePlus,
+  Layers3,
   Loader2,
   Moon,
   ScanText,
@@ -24,6 +27,7 @@ import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { ModelConfigDialog } from "@/components/model-config-dialog"
 import {
   Card,
   CardAction,
@@ -32,11 +36,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Progress } from "@/components/ui/progress"
-import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 
 const sourceMeta: Record<LineSource, { label: string; cls: string }> = {
   consensus: {
@@ -62,9 +68,13 @@ const confColor = (c: number) =>
       ? "text-amber-600 dark:text-amber-400"
       : "text-red-600 dark:text-red-400"
 
+const selectionStorageKey = "betterocr-model-selection"
+
 export default function App() {
   // —— 主题 ——
-  const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"))
+  const [dark, setDark] = useState(() =>
+    document.documentElement.classList.contains("dark"),
+  )
   const toggleTheme = () => {
     const next = !dark
     setDark(next)
@@ -79,25 +89,74 @@ export default function App() {
   const [result, setResult] = useState<Final | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  // —— 服务端默认配置 ——
+  // —— 服务端模型目录与本地选择 ——
   const [cfg, setCfg] = useState<ServerConfig | null>(null)
-  const [engines, setEngines] = useState("")
+  const [engines, setEngines] = useState<string[]>([])
   const [arbiter, setArbiter] = useState("")
-  const [baseUrl, setBaseUrl] = useState("")
-  const [apiKey, setApiKey] = useState("")
 
   useEffect(() => {
     fetchConfig()
       .then((c) => {
+        const validRefs = new Set(
+          c.providers.flatMap((provider) =>
+            provider.models.map((model) => `${provider.id}/${model.id}`),
+          ),
+        )
+        let nextEngines = c.engines
+        let nextArbiter = c.arbiter
+        try {
+          const saved = JSON.parse(
+            localStorage.getItem(selectionStorageKey) ?? "null",
+          ) as {
+            engines?: unknown
+            arbiter?: unknown
+          } | null
+          if (Array.isArray(saved?.engines)) {
+            const filtered = saved.engines.filter(
+              (ref): ref is string =>
+                typeof ref === "string" && validRefs.has(ref),
+            )
+            if (filtered.length > 0) nextEngines = filtered
+          }
+          if (
+            typeof saved?.arbiter === "string" &&
+            (saved.arbiter === "" || validRefs.has(saved.arbiter))
+          ) {
+            nextArbiter = saved.arbiter
+          }
+        } catch {
+          localStorage.removeItem(selectionStorageKey)
+        }
         setCfg(c)
-        setEngines(c.engines.join(", "))
-        setArbiter(c.arbiter)
-        setBaseUrl(c.base_url)
+        setEngines(nextEngines)
+        setArbiter(nextArbiter)
       })
-      .catch(() => {
-        // 拿不到默认值不影响手动填写
+      .catch((cause) => {
+        setError(cause instanceof Error ? cause.message : "加载模型配置失败")
       })
   }, [])
+
+  const modelIndex = useMemo(() => {
+    const index = new Map<string, { alias: string; provider: string }>()
+    for (const provider of cfg?.providers ?? []) {
+      for (const model of provider.models) {
+        index.set(`${provider.id}/${model.id}`, {
+          alias: model.alias,
+          provider: provider.id,
+        })
+      }
+    }
+    return index
+  }, [cfg])
+
+  const applyModelSelection = (nextEngines: string[], nextArbiter: string) => {
+    setEngines(nextEngines)
+    setArbiter(nextArbiter)
+    localStorage.setItem(
+      selectionStorageKey,
+      JSON.stringify({ engines: nextEngines, arbiter: nextArbiter }),
+    )
+  }
 
   // —— 图片选择:点击 / 拖拽 / 粘贴 ——
   const [file, setFile] = useState<File | null>(null)
@@ -135,12 +194,8 @@ export default function App() {
 
   const run = async () => {
     if (!file) return
-    const engineList = engines
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-    if (engineList.length === 0) {
-      setError("请至少填写一个引擎模型")
+    if (engines.length === 0) {
+      setError("请至少选择一个基础模型")
       return
     }
     setBusy(true)
@@ -148,21 +203,27 @@ export default function App() {
     setResult(null)
     setElapsed(0)
     const started = performance.now()
-    const timer = window.setInterval(() => setElapsed((performance.now() - started) / 1000), 100)
+    const timer = window.setInterval(
+      () => setElapsed((performance.now() - started) / 1000),
+      100,
+    )
     const ac = new AbortController()
     abortRef.current = ac
     try {
       const final = await runOCR({
         image: file,
-        engines: engineList.join(","),
-        arbiter: arbiter.trim(),
-        baseUrl: baseUrl.trim(),
-        apiKey: apiKey.trim(),
+        engines,
+        arbiter,
         signal: ac.signal,
       })
       setResult(final)
-      if (final.stats.engines > 0 && final.stats.failed_engines === final.stats.engines) {
-        setError("所有引擎均失败,请检查 Base URL / API Key / 模型名,细节见「引擎对比」")
+      if (
+        final.stats.engines > 0 &&
+        final.stats.failed_engines === final.stats.engines
+      ) {
+        setError(
+          "所有引擎均失败,请检查 Provider 连接与模型配置,细节见「引擎对比」",
+        )
       }
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
@@ -180,222 +241,205 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex h-14 max-w-6xl items-center gap-3 px-4 md:px-6">
+        <div className="mx-auto flex h-14 max-w-5xl items-center gap-3 px-4 md:px-6">
           <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
             <ScanText className="size-4.5" />
           </div>
-          <div className="flex flex-col gap-0.5">
-            <span className="text-sm font-semibold leading-none">BetterOCR</span>
-            <span className="text-xs text-muted-foreground">
+          <div className="min-w-0 flex-1 sm:flex-none">
+            <span className="text-sm font-semibold leading-none">
+              BetterOCR
+            </span>
+            <span className="hidden text-xs text-muted-foreground sm:block">
               多引擎融合 · 只有分歧行才动用强模型
             </span>
           </div>
-          <div className="ms-auto">
-            <Button variant="ghost" size="icon" onClick={toggleTheme} aria-label="切换明暗主题">
-              {dark ? <Sun /> : <Moon />}
-            </Button>
+          <div className="ms-auto flex items-center gap-1.5">
+            <ModelConfigDialog
+              config={cfg}
+              engines={engines}
+              arbiter={arbiter}
+              onApply={applyModelSelection}
+            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={toggleTheme}
+                  aria-label="切换明暗主题"
+                >
+                  {dark ? <Sun /> : <Moon />}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {dark ? "切换到浅色" : "切换到深色"}
+              </TooltipContent>
+            </Tooltip>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-6xl gap-6 p-4 md:p-6 lg:grid-cols-[330px_1fr]">
-        {/* —— 左栏:配置 —— */}
-        <div className="flex flex-col gap-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>引擎配置</CardTitle>
-              <CardDescription>任何 OpenAI 兼容端点(/chat/completions)</CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="engines">基础引擎</Label>
-                <Input
-                  id="engines"
-                  value={engines}
-                  onChange={(e) => setEngines(e.target.value)}
-                  placeholder="qwen2.5-vl-7b, qwen2.5-vl-7b, glm-4v-9b"
-                />
-                <p className="text-xs text-muted-foreground">
-                  逗号分隔;同一模型重复出现即多路采样
-                </p>
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="arbiter">仲裁模型</Label>
-                <Input
-                  id="arbiter"
-                  value={arbiter}
-                  onChange={(e) => setArbiter(e.target.value)}
-                  placeholder="qwen2.5-vl-72b"
-                />
-                <p className="text-xs text-muted-foreground">
-                  只处理分歧行,应显著强于基础引擎;留空则退化为本地择优
-                </p>
-              </div>
-              <Separator />
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="base-url">Base URL</Label>
-                <Input
-                  id="base-url"
-                  value={baseUrl}
-                  onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder="https://api.example.com/v1"
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="api-key">API Key</Label>
-                <Input
-                  id="api-key"
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder={
-                    cfg?.has_api_key ? "留空使用服务端配置的 api_key" : "sk-…(本地服务可留空)"
-                  }
-                />
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="gap-3 py-4">
-            <CardHeader className="px-4">
-              <CardTitle className="text-sm">工作原理</CardTitle>
-            </CardHeader>
-            <CardContent className="px-4">
-              <ol className="flex flex-col gap-2 text-xs leading-relaxed text-muted-foreground">
-                <li>
-                  <span className="font-medium text-foreground">1 · 并发识别</span>
-                  &nbsp;多个便宜 VLM 各自逐行转写
-                </li>
-                <li>
-                  <span className="font-medium text-foreground">2 · 行级对齐</span>
-                  &nbsp;Needleman-Wunsch 把各引擎的行对进同一行槽
-                </li>
-                <li>
-                  <span className="font-medium text-foreground">3 · 共识免费</span>
-                  &nbsp;严格多数一致的行直接通过,置信度按独立证据合成
-                </li>
-                <li>
-                  <span className="font-medium text-foreground">4 · 分歧仲裁</span>
-                  &nbsp;只有分歧行打包一次交给强模型看图裁定
-                </li>
-              </ol>
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* —— 右栏:图片与结果 —— */}
-        <div className="flex min-w-0 flex-col gap-4">
-          <Card
-            className={cn(
-              "border-dashed py-4 transition-colors",
-              dragging && "border-primary bg-primary/5",
-              !preview && "cursor-pointer hover:border-primary/50",
-            )}
-            onDragOver={(e) => {
-              e.preventDefault()
-              setDragging(true)
-            }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault()
-              setDragging(false)
-              acceptFile(e.dataTransfer.files?.[0])
-            }}
-            onClick={() => {
-              if (!preview) fileInput.current?.click()
-            }}
-          >
-            <CardContent className="flex min-h-48 items-center justify-center px-4">
-              {preview ? (
-                <div className="relative w-full">
-                  <img
-                    src={preview}
-                    alt="待识别图片"
-                    className="mx-auto max-h-[420px] rounded-md object-contain"
-                  />
-                  <div className="absolute right-2 top-2 flex gap-2">
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        fileInput.current?.click()
-                      }}
-                    >
-                      更换
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      size="icon"
-                      className="size-8"
-                      aria-label="清除图片"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        setFile(null)
-                        setResult(null)
-                      }}
-                    >
-                      <X />
-                    </Button>
-                  </div>
-                  <p className="mt-2 text-center text-xs text-muted-foreground">
-                    {file?.name} · {((file?.size ?? 0) / 1024).toFixed(0)} KB
-                  </p>
-                </div>
+      <main className="mx-auto flex max-w-5xl flex-col gap-4 p-4 md:p-6">
+        <div className="flex flex-wrap items-center gap-3 py-1">
+          <div className="flex min-w-0 basis-full items-center gap-2.5 sm:flex-1 sm:basis-auto">
+            <Layers3 className="size-4 shrink-0 text-muted-foreground" />
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span className="me-1 text-xs font-medium text-muted-foreground">
+                基础模型
+              </span>
+              {engines.length > 0 ? (
+                engines.map((ref, index) => (
+                  <Badge
+                    key={`${ref}-${index}`}
+                    variant="secondary"
+                    title={ref}
+                  >
+                    {modelIndex.get(ref)?.alias ?? ref}
+                  </Badge>
+                ))
               ) : (
-                <div className="flex flex-col items-center gap-2 py-8 text-muted-foreground">
-                  <ImagePlus className="size-10" />
-                  <p className="text-sm">拖拽、点击或 Ctrl+V 粘贴图片</p>
-                  <p className="text-xs">PNG / JPEG / WebP / GIF</p>
-                </div>
+                <span className="text-sm text-muted-foreground">
+                  {cfg ? "未选择" : "加载中"}
+                </span>
               )}
-            </CardContent>
-          </Card>
-          <input
-            ref={fileInput}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={(e) => {
-              acceptFile(e.target.files?.[0])
-              e.target.value = ""
-            }}
-          />
-
-          <div className="flex items-center gap-3">
-            <Button size="lg" className="min-w-36" disabled={busy || !file} onClick={run}>
-              {busy ? (
-                <>
-                  <Loader2 className="animate-spin" />
-                  识别中 {elapsed.toFixed(1)}s
-                </>
-              ) : (
-                <>
-                  <ScanText />
-                  开始识别
-                </>
-              )}
-            </Button>
-            {busy && (
-              <Button variant="outline" size="lg" onClick={() => abortRef.current?.abort()}>
-                取消
-              </Button>
-            )}
-            {result && !busy && (
-              <span className="text-sm text-muted-foreground">耗时 {elapsed.toFixed(1)}s</span>
-            )}
+            </div>
           </div>
-
-          {error && (
-            <Alert variant="destructive">
-              <AlertCircle />
-              <AlertTitle>出错了</AlertTitle>
-              <AlertDescription className="break-all">{error}</AlertDescription>
-            </Alert>
-          )}
-
-          {result && <ResultView final={result} />}
+          <ArrowRight className="hidden size-4 shrink-0 text-muted-foreground sm:block" />
+          <div className="flex min-w-0 basis-full items-center gap-2 sm:basis-auto">
+            <Bot className="size-4 shrink-0 text-muted-foreground" />
+            <span className="text-xs font-medium text-muted-foreground">
+              仲裁
+            </span>
+            <Badge variant="outline" title={arbiter || undefined}>
+              {arbiter
+                ? (modelIndex.get(arbiter)?.alias ?? arbiter)
+                : "本地兜底"}
+            </Badge>
+          </div>
         </div>
+
+        <Card
+          className={cn(
+            "border-dashed py-4 transition-colors",
+            dragging && "border-primary bg-primary/5",
+            !preview && "cursor-pointer hover:border-primary/50",
+          )}
+          onDragOver={(e) => {
+            e.preventDefault()
+            setDragging(true)
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault()
+            setDragging(false)
+            acceptFile(e.dataTransfer.files?.[0])
+          }}
+          onClick={() => {
+            if (!preview) fileInput.current?.click()
+          }}
+        >
+          <CardContent className="flex min-h-48 items-center justify-center px-4">
+            {preview ? (
+              <div className="relative w-full">
+                <img
+                  src={preview}
+                  alt="待识别图片"
+                  className="mx-auto max-h-[420px] rounded-md object-contain"
+                />
+                <div className="absolute right-2 top-2 flex gap-2">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      fileInput.current?.click()
+                    }}
+                  >
+                    <ImagePlus data-icon="inline-start" />
+                    更换
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="icon"
+                    className="size-8"
+                    aria-label="清除图片"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setFile(null)
+                      setResult(null)
+                    }}
+                  >
+                    <X />
+                  </Button>
+                </div>
+                <p className="mt-2 text-center text-xs text-muted-foreground">
+                  {file?.name} · {((file?.size ?? 0) / 1024).toFixed(0)} KB
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center gap-2 py-8 text-muted-foreground">
+                <ImagePlus className="size-10" />
+                <p className="text-sm">拖拽、点击或 Ctrl+V 粘贴图片</p>
+                <p className="text-xs">PNG / JPEG / WebP / GIF</p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+        <input
+          ref={fileInput}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={(e) => {
+            acceptFile(e.target.files?.[0])
+            e.target.value = ""
+          }}
+        />
+
+        <div className="flex items-center gap-3">
+          <Button
+            size="lg"
+            className="min-w-36"
+            disabled={busy || !file}
+            onClick={run}
+          >
+            {busy ? (
+              <>
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+                识别中 {elapsed.toFixed(1)}s
+              </>
+            ) : (
+              <>
+                <ScanText data-icon="inline-start" />
+                开始识别
+              </>
+            )}
+          </Button>
+          {busy && (
+            <Button
+              variant="outline"
+              size="lg"
+              onClick={() => abortRef.current?.abort()}
+            >
+              取消
+            </Button>
+          )}
+          {result && !busy && (
+            <span className="text-sm text-muted-foreground">
+              耗时 {elapsed.toFixed(1)}s
+            </span>
+          )}
+        </div>
+
+        {error && (
+          <Alert variant="destructive">
+            <AlertCircle />
+            <AlertTitle>出错了</AlertTitle>
+            <AlertDescription className="break-all">{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {result && <ResultView final={result} />}
       </main>
     </div>
   )

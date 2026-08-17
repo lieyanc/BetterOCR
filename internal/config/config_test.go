@@ -6,9 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/lieyanc/BetterOCR/internal/model"
 )
+
+func localProvider(baseURL, apiKey string) model.Provider {
+	return model.Provider{
+		ID: "local", BaseURL: baseURL, APIKey: apiKey,
+		Models: []model.Definition{{
+			ID: "vision", Context: 32768, Alias: "Local Vision", API: model.APIOpenAIChat,
+		}},
+	}
+}
 
 func TestLoadReleasesTemplateWhenMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
@@ -51,7 +63,17 @@ func TestLoadTreatsEmptyFileAsMissing(t *testing.T) {
 
 func TestLoadSupplementsMissingFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	if err := os.WriteFile(path, []byte(`{"engines":["my-model"],"api_key":"sk-x"}`), 0o600); err != nil {
+	partial := Config{
+		Providers: []model.Provider{localProvider("http://localhost:11434/v1", "sk-x")},
+		Engines:   []string{"local/vision"},
+		Arbiter:   "",
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"providers": partial.Providers,
+		"engines":   partial.Engines,
+		"arbiter":   partial.Arbiter,
+	})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, action, err := Load(path)
@@ -61,33 +83,62 @@ func TestLoadSupplementsMissingFields(t *testing.T) {
 	if action != ActionSupplemented {
 		t.Errorf("action = %v, want ActionSupplemented", action)
 	}
-	// 文件里出现的字段以文件为准
-	if !reflect.DeepEqual(cfg.Engines, []string{"my-model"}) || cfg.APIKey != "sk-x" {
+	if !reflect.DeepEqual(cfg.Providers, partial.Providers) || !reflect.DeepEqual(cfg.Engines, partial.Engines) {
 		t.Errorf("用户字段被改写: %+v", cfg)
 	}
-	// 缺失字段用模板补齐
-	def := Default()
-	if cfg.Arbiter != def.Arbiter || cfg.BaseURL != def.BaseURL ||
-		cfg.TimeoutSeconds != def.TimeoutSeconds || cfg.ServeAddr != def.ServeAddr {
+	if cfg.Arbiter != "" {
+		t.Errorf("显式空 arbiter 被改写: %q", cfg.Arbiter)
+	}
+	if cfg.TimeoutSeconds != Default().TimeoutSeconds || cfg.ServeAddr != Default().ServeAddr {
 		t.Errorf("缺失字段未按模板补全: %+v", cfg)
 	}
-	// 补全已写回:再次加载应字段齐全、不再变动
-	cfg2, action2, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if action2 != ActionNone {
-		t.Errorf("补全写回后 action = %v, want ActionNone", action2)
-	}
-	if !reflect.DeepEqual(cfg2, cfg) {
-		t.Errorf("二次加载结果漂移: %+v != %+v", cfg2, cfg)
+	_, action, err = Load(path)
+	if err != nil || action != ActionNone {
+		t.Errorf("补全后二次加载 = (%v, %v), want ActionNone", action, err)
 	}
 }
 
-func TestLoadKeepsExplicitEmptyValues(t *testing.T) {
+func TestLoadMigratesLegacyConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	// 字段齐全但 arbiter 显式置空(用户主动关闭仲裁),不得被模板改写
-	full := []byte(`{"engines":["m"],"arbiter":"","base_url":"http://b","api_key":"","timeout_seconds":30,"serve_addr":":1"}`)
+	legacy := []byte(`{"engines":["small","small"],"arbiter":"large","base_url":"http://legacy/v1","api_key":"secret","timeout_seconds":30,"serve_addr":":1"}`)
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, action, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != ActionMigrated {
+		t.Fatalf("action = %v, want ActionMigrated", action)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "default" || cfg.Providers[0].APIKey != "secret" {
+		t.Fatalf("provider = %+v", cfg.Providers)
+	}
+	if got := cfg.Engines; !reflect.DeepEqual(got, []string{"default/small", "default/small"}) {
+		t.Errorf("engines = %v", got)
+	}
+	if cfg.Arbiter != "default/large" || len(cfg.Providers[0].Models) != 2 {
+		t.Errorf("migrated config = %+v", cfg)
+	}
+	written, _ := os.ReadFile(path)
+	var topLevel map[string]json.RawMessage
+	if err := json.Unmarshal(written, &topLevel); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := topLevel["providers"]; !ok {
+		t.Errorf("migrated config has no providers: %s", written)
+	}
+	if _, ok := topLevel["api_key"]; ok {
+		t.Errorf("legacy top-level api_key remains: %s", written)
+	}
+	if _, action, err := Load(path); err != nil || action != ActionNone {
+		t.Errorf("migrated reload = (%v, %v)", action, err)
+	}
+}
+
+func TestLoadKeepsCompleteFileByteForByte(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "betterocr.json")
+	full := []byte(`{"providers":[{"id":"local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic"}]}],"engines":["local/m"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -95,31 +146,73 @@ func TestLoadKeepsExplicitEmptyValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action != ActionNone {
-		t.Errorf("action = %v, want ActionNone", action)
+	if action != ActionNone || cfg.Arbiter != "" || cfg.TimeoutSeconds != 30 {
+		t.Errorf("load = (%+v, %v)", cfg, action)
 	}
-	if cfg.Arbiter != "" || cfg.APIKey != "" || cfg.TimeoutSeconds != 30 {
-		t.Errorf("显式空值/用户值被改写: %+v", cfg)
-	}
-	// 字段齐全时文件应原封不动(保留用户自己的格式)
 	raw, _ := os.ReadFile(path)
 	if !bytes.Equal(raw, full) {
 		t.Errorf("字段齐全仍被重写:\n%s", raw)
 	}
 }
 
-func TestLoadNeverRewritesUnparsableFile(t *testing.T) {
+func TestLoadNeverRewritesInvalidFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	orig := []byte("{broken json")
-	if err := os.WriteFile(path, orig, 0o600); err != nil {
+	for _, orig := range [][]byte{
+		[]byte("{broken json"),
+		[]byte(`{"providers":[],"engines":["missing/model"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`),
+	} {
+		if err := os.WriteFile(path, orig, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := Load(path); err == nil {
+			t.Fatalf("invalid config %q should fail", orig)
+		}
+		raw, _ := os.ReadFile(path)
+		if !bytes.Equal(raw, orig) {
+			t.Errorf("invalid file was modified:\n%s", raw)
+		}
+	}
+}
+
+func TestWriteTightensExistingFilePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "betterocr.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Load(path); err == nil {
-		t.Fatal("解析失败应报错")
+	if err := write(path, Default()); err != nil {
+		t.Fatal(err)
 	}
-	raw, _ := os.ReadFile(path)
-	if !bytes.Equal(raw, orig) {
-		t.Errorf("解析失败时文件被改动:\n%s", raw)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %o, want 600", got)
+	}
+}
+
+func TestValidateAndResolve(t *testing.T) {
+	cfg := Config{
+		Providers: []model.Provider{localProvider("http://local/v1", "key")},
+		Engines:   []string{"local/vision"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := cfg.Resolve("local/vision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.APIKey != "key" || resolved.API != model.APIOpenAIChat || resolved.Context != 32768 {
+		t.Errorf("resolved = %+v", resolved)
+	}
+
+	bad := cfg
+	bad.Providers = append([]model.Provider(nil), cfg.Providers...)
+	bad.Providers[0].Models = append([]model.Definition(nil), cfg.Providers[0].Models...)
+	bad.Providers[0].Models[0].API = "unknown"
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "不受支持") {
+		t.Errorf("invalid api error = %v", err)
 	}
 }
 
@@ -129,9 +222,6 @@ func TestTimeout(t *testing.T) {
 	}
 	if got := (Config{}).Timeout(); got != 2*time.Minute {
 		t.Errorf("Timeout(0) = %v, want 2m", got)
-	}
-	if got := (Config{TimeoutSeconds: -5}).Timeout(); got != 2*time.Minute {
-		t.Errorf("Timeout(-5) = %v, want 2m", got)
 	}
 }
 

@@ -13,21 +13,15 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/agent"
 	"github.com/lieyanc/BetterOCR/internal/agents"
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
+	"github.com/lieyanc/BetterOCR/internal/model"
 )
-
-// DefaultBaseURL 是 base_url 未配置(或被显式清空)时的兜底端点。
-const DefaultBaseURL = "https://api.openai.com/v1"
 
 // Config 描述一次识别的全部参数。
 type Config struct {
-	// Engines 是基础 VLM 模型列表;同一模型重复出现即多路采样。
-	Engines []string
-	// Arbiter 是仲裁模型;为空则分歧行退化为本地择优。
-	Arbiter string
-	// BaseURL 是 OpenAI 兼容端点地址,为空时回退 DefaultBaseURL;
-	// APIKey 为空时不发送认证头。
-	BaseURL string
-	APIKey  string
+	// Engines are fully resolved provider models. Repeats enable multi-sampling.
+	Engines []model.Resolved
+	// Arbiter is nil when disputed rows should use the local fallback.
+	Arbiter *model.Resolved
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
 }
@@ -37,21 +31,17 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	if len(cfg.Engines) == 0 {
 		return arbiter.Final{}, errors.New("未配置任何引擎模型")
 	}
-	baseURL := cfg.BaseURL
-	if baseURL == "" {
-		baseURL = DefaultBaseURL
-	}
-	oc := agents.OpenAIConfig{BaseURL: baseURL, APIKey: cfg.APIKey, HTTPClient: cfg.HTTPClient}
 
 	reg := agent.NewRegistry()
-	for i, model := range cfg.Engines {
-		// 名称带序号,同一模型多路采样时互不冲突
-		reg.MustRegister(agents.NewOpenAIVLM(fmt.Sprintf("%s#%d", model, i+1), model, oc))
+	for i, resolved := range cfg.Engines {
+		// Provider and sequence keep names unique even when aliases are repeated.
+		name := fmt.Sprintf("%s · %s#%d", resolved.DisplayName(), resolved.ProviderID, i+1)
+		reg.MustRegister(agents.NewVisionVLM(name, resolved, cfg.HTTPClient))
 	}
 
 	arb := arbiter.New()
-	if cfg.Arbiter != "" {
-		arb.Escalator = agents.NewOpenAIEscalator(cfg.Arbiter, oc)
+	if cfg.Arbiter != nil {
+		arb.Escalator = agents.NewVisionEscalator(*cfg.Arbiter, cfg.HTTPClient)
 	}
 
 	results := agent.NewCoordinator(reg).RunConcurrent(ctx, image)

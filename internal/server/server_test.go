@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
+	"github.com/lieyanc/BetterOCR/internal/config"
+	"github.com/lieyanc/BetterOCR/internal/model"
 )
 
 // testPNG 在测试内生成一张最小合法 PNG,避免外部测试资产。
@@ -85,15 +87,29 @@ func postOCR(t *testing.T, h http.Handler, image []byte, fields map[string]strin
 	return rec
 }
 
+func serverConfig(baseURL, apiKey string) config.Config {
+	return config.Config{
+		Providers: []model.Provider{{
+			ID: "test", BaseURL: baseURL, APIKey: apiKey,
+			Models: []model.Definition{
+				{ID: "tiny-a", Context: 32768, Alias: "Tiny A", API: model.APIOpenAIChat},
+				{ID: "tiny-b", Context: 32768, Alias: "Tiny B", API: model.APIOpenAIChat},
+				{ID: "big", Context: 128000, Alias: "Big", API: model.APIOpenAIChat},
+			},
+		}},
+		Engines: []string{"test/tiny-a", "test/tiny-b"},
+		Arbiter: "test/big",
+	}
+}
+
 // TestOCREndToEnd 走完整链路:multipart 上传 → 双引擎并发 → 共识融合 → JSON。
 func TestOCREndToEnd(t *testing.T) {
 	upstream, auths := fakeUpstream(`[{"text":"hello world","confidence":0.9},{"text":"second line","confidence":0.8}]`)
 	defer upstream.Close()
 
-	srv := &Server{APIKey: "server-key", Timeout: 30 * time.Second}
+	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
 	rec := postOCR(t, srv.Handler(), testPNG(t), map[string]string{
-		"engines":  "tiny-a,tiny-b",
-		"base_url": upstream.URL,
+		"engines": "test/tiny-a,test/tiny-b",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
@@ -118,7 +134,7 @@ func TestOCREndToEnd(t *testing.T) {
 			t.Errorf("line %+v, want consensus", l)
 		}
 	}
-	// 未在请求里带 api_key,应回落到服务端默认密钥
+	// Provider 密钥只来自服务端配置。
 	for _, a := range auths() {
 		if a != "Bearer server-key" {
 			t.Errorf("Authorization = %q, want server key", a)
@@ -126,23 +142,33 @@ func TestOCREndToEnd(t *testing.T) {
 	}
 }
 
-// TestOCRRequestOverridesKey 验证请求内的 api_key 覆盖服务端默认值。
-func TestOCRRequestOverridesKey(t *testing.T) {
+// TestOCRRequestCannotOverrideProviderConnection verifies that browser fields
+// cannot redirect requests or replace server-side credentials.
+func TestOCRRequestCannotOverrideProviderConnection(t *testing.T) {
 	upstream, auths := fakeUpstream(`[{"text":"x","confidence":1}]`)
 	defer upstream.Close()
 
-	srv := &Server{APIKey: "server-key"}
+	srv := &Server{Config: serverConfig(upstream.URL, "server-key")}
 	rec := postOCR(t, srv.Handler(), testPNG(t), map[string]string{
-		"engines":  "tiny",
-		"base_url": upstream.URL,
+		"engines":  "test/tiny-a",
+		"arbiter":  "",
+		"base_url": "http://127.0.0.1:1",
 		"api_key":  "user-key",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
 	}
 	got := auths()
-	if len(got) != 1 || got[0] != "Bearer user-key" {
-		t.Errorf("auths = %v, want user key", got)
+	if len(got) != 1 || got[0] != "Bearer server-key" {
+		t.Errorf("auths = %v, want server key", got)
+	}
+}
+
+func TestOCRRejectsUnconfiguredModel(t *testing.T) {
+	srv := &Server{Config: serverConfig("http://127.0.0.1:1", "")}
+	rec := postOCR(t, srv.Handler(), testPNG(t), map[string]string{"engines": "other/model"})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "未配置模型") {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
 	}
 }
 
@@ -179,10 +205,8 @@ func TestOCRBadRequests(t *testing.T) {
 // TestConfigEndpoint 验证页面预填数据,且不泄露密钥明文。
 func TestConfigEndpoint(t *testing.T) {
 	srv := &Server{
-		DefaultEngines: []string{"m1", "m2"},
-		DefaultArbiter: "big",
-		BaseURL:        "http://example/v1",
-		APIKey:         "secret",
+		Config:  serverConfig("http://example/v1", "secret"),
+		Timeout: 45 * time.Second,
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
 	rec := httptest.NewRecorder()
@@ -198,11 +222,15 @@ func TestConfigEndpoint(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Engines) != 2 || cfg.Arbiter != "big" || cfg.BaseURL != "http://example/v1" || !cfg.HasAPIKey {
+	if len(cfg.Engines) != 2 || cfg.Arbiter != "test/big" || len(cfg.Providers) != 1 {
 		t.Errorf("config = %+v", cfg)
 	}
-	if cfg.TimeoutMS != (2 * time.Minute).Milliseconds() {
-		t.Errorf("timeout_ms = %d, want default 2m", cfg.TimeoutMS)
+	provider := cfg.Providers[0]
+	if provider.BaseURL != "http://example/v1" || !provider.HasAPIKey || len(provider.Models) != 3 {
+		t.Errorf("provider = %+v", provider)
+	}
+	if cfg.TimeoutMS != (45 * time.Second).Milliseconds() {
+		t.Errorf("timeout_ms = %d, want 45s", cfg.TimeoutMS)
 	}
 }
 
