@@ -142,7 +142,7 @@ export default function App() {
       for (const model of provider.models) {
         index.set(`${provider.id}/${model.id}`, {
           alias: model.alias,
-          provider: provider.id,
+          provider: provider.alias,
         })
       }
     }
@@ -288,15 +288,18 @@ export default function App() {
                 基础模型
               </span>
               {engines.length > 0 ? (
-                engines.map((ref, index) => (
-                  <Badge
-                    key={`${ref}-${index}`}
-                    variant="secondary"
-                    title={ref}
-                  >
-                    {modelIndex.get(ref)?.alias ?? ref}
-                  </Badge>
-                ))
+                engines.map((ref, index) => {
+                  const m = modelIndex.get(ref)
+                  return (
+                    <Badge
+                      key={`${ref}-${index}`}
+                      variant="secondary"
+                      title={ref}
+                    >
+                      {m ? `${m.provider} · ${m.alias}` : ref}
+                    </Badge>
+                  )
+                })
               ) : (
                 <span className="text-sm text-muted-foreground">
                   {cfg ? "未选择" : "加载中"}
@@ -312,7 +315,10 @@ export default function App() {
             </span>
             <Badge variant="outline" title={arbiter || undefined}>
               {arbiter
-                ? (modelIndex.get(arbiter)?.alias ?? arbiter)
+                ? (() => {
+                    const m = modelIndex.get(arbiter)
+                    return m ? `${m.provider} · ${m.alias}` : arbiter
+                  })()
                 : "本地兜底"}
             </Badge>
           </div>

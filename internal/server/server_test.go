@@ -92,9 +92,9 @@ func serverConfig(baseURL, apiKey string) config.Config {
 		Providers: []model.Provider{{
 			ID: "test", BaseURL: baseURL, APIKey: apiKey,
 			Models: []model.Definition{
-				{ID: "tiny-a", Context: 32768, Alias: "Tiny A", API: model.APIOpenAIChat},
-				{ID: "tiny-b", Context: 32768, Alias: "Tiny B", API: model.APIOpenAIChat},
-				{ID: "big", Context: 128000, Alias: "Big", API: model.APIOpenAIChat},
+				{ID: "tiny-a", Context: 32768, Alias: "Tiny A", API: model.APIOpenAIChatCompletions},
+				{ID: "tiny-b", Context: 32768, Alias: "Tiny B", API: model.APIOpenAIChatCompletions},
+				{ID: "big", Context: 128000, Alias: "Big", API: model.APIOpenAIChatCompletions},
 			},
 		}},
 		Engines: []string{"test/tiny-a", "test/tiny-b"},

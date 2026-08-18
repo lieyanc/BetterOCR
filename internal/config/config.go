@@ -1,6 +1,6 @@
 // Package config manages BetterOCR's JSON configuration file. Missing files
-// are initialized from an embedded template, and legacy single-provider files
-// are migrated without losing model selections or credentials.
+// are initialized from an embedded template, and incomplete files are
+// supplemented without losing model selections or credentials.
 package config
 
 import (
@@ -40,19 +40,21 @@ func Default() Config {
 		Providers: []model.Provider{
 			{
 				ID:      "openai",
+				Alias:   "OpenAI",
 				BaseURL: "https://api.openai.com/v1",
 				APIKey:  "",
 				Models: []model.Definition{
 					{ID: "gpt-4.1-mini", Context: 1048576, Alias: "GPT-4.1 mini", API: model.APIOpenAIResponses},
-					{ID: "gpt-4o-mini", Context: 128000, Alias: "GPT-4o mini", API: model.APIOpenAIChat},
+					{ID: "gpt-4o-mini", Context: 128000, Alias: "GPT-4o mini", API: model.APIOpenAIChatCompletions},
 				},
 			},
 			{
 				ID:      "anthropic",
+				Alias:   "Anthropic",
 				BaseURL: "https://api.anthropic.com/v1",
 				APIKey:  "",
 				Models: []model.Definition{
-					{ID: "claude-sonnet-4-20250514", Context: 200000, Alias: "Claude Sonnet 4", API: model.APIAnthropic},
+					{ID: "claude-sonnet-4-20250514", Context: 200000, Alias: "Claude Sonnet 4", API: model.APIAnthropicMessages},
 				},
 			},
 		},
@@ -81,14 +83,12 @@ const (
 	ActionReleased
 	// ActionSupplemented 表示文件缺少字段,已按模板补全并写回。
 	ActionSupplemented
-	// ActionMigrated 表示旧版单 Provider 配置已迁移到 providers 结构。
-	ActionMigrated
 )
 
 // Load 读取 path 处的 JSON 配置:
 //   - 文件不存在或为空 → 释放内置模板并返回模板值;
-//   - 旧版单 Provider 结构 → 原地迁移到 providers 模型目录;
-//   - 缺少字段 → 以模板补全缺失项并写回(文件中显式的空值视为用户决定,保留);
+//   - 缺少字段 → 以模板补全缺失项并写回(文件中显式的空值视为用户决定,
+//     保留;唯一例外是 provider 的空 alias,会补为模板名或 id);
 //   - 解析或引用校验失败 → 返回错误,绝不改动原文件。
 func Load(path string) (Config, Action, error) {
 	raw, err := os.ReadFile(path)
@@ -107,31 +107,26 @@ func Load(path string) (Config, Action, error) {
 	if err := json.Unmarshal(raw, &present); err != nil {
 		return Config{}, ActionNone, fmt.Errorf("解析 %s 失败(不会改动该文件): %w", path, err)
 	}
-	if _, hasProviders := present["providers"]; !hasProviders && hasLegacyFields(present) {
-		cfg, err := migrateLegacy(raw)
-		if err != nil {
-			return Config{}, ActionNone, fmt.Errorf("迁移 %s 失败(不会改动该文件): %w", path, err)
-		}
-		if err := cfg.Validate(); err != nil {
-			return Config{}, ActionNone, fmt.Errorf("配置 %s 无效(不会改动该文件): %w", path, err)
-		}
-		if err := write(path, cfg); err != nil {
-			return Config{}, ActionNone, fmt.Errorf("写回迁移配置 %s 失败: %w", path, err)
-		}
-		return cfg, ActionMigrated, nil
-	}
+	supplemented := false
 	// 以模板为底座覆盖解析:文件里出现的字段(含显式空值)以文件为准,
-	// 缺失的字段自然保留模板值。
+	// 缺失的字段自然保留模板值。数组字段(providers)按整体覆盖,否则
+	// Go 的按索引合并会让文件条目继承模板同位置条目的残留字段。
 	cfg := Default()
+	cfg.Providers = nil
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, ActionNone, fmt.Errorf("解析 %s 失败(不会改动该文件): %w", path, err)
+	}
+	if _, ok := present["providers"]; !ok {
+		cfg.Providers = Default().Providers
+	} else if supplementProviderAliases(cfg.Providers) {
+		supplemented = true
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, ActionNone, fmt.Errorf("配置 %s 无效(不会改动该文件): %w", path, err)
 	}
 
 	for _, key := range fieldKeys() {
-		if _, ok := present[key]; !ok {
+		if _, ok := present[key]; !ok || supplemented {
 			// 写回规范字段集;文件中的未知字段会在此时被清理
 			if err := write(path, cfg); err != nil {
 				return Config{}, ActionNone, fmt.Errorf("补全配置 %s 失败: %w", path, err)
@@ -140,6 +135,28 @@ func Load(path string) (Config, Action, error) {
 		}
 	}
 	return cfg, ActionNone, nil
+}
+
+// supplementProviderAliases 给 alias 为空(缺失或显式空)的 provider 补显示名:
+// 模板中有同 id 的 provider 就沿用模板 alias,否则回退 id 本身。
+// 返回是否有补全动作,供 Load 决定写回。
+func supplementProviderAliases(providers []model.Provider) bool {
+	changed := false
+	for i := range providers {
+		if strings.TrimSpace(providers[i].Alias) != "" {
+			continue
+		}
+		alias := strings.TrimSpace(providers[i].ID)
+		for _, tp := range Default().Providers {
+			if tp.ID == providers[i].ID && strings.TrimSpace(tp.Alias) != "" {
+				alias = strings.TrimSpace(tp.Alias)
+				break
+			}
+		}
+		providers[i].Alias = alias
+		changed = true
+	}
+	return changed
 }
 
 // Validate checks provider/model identity and all configured selections.
@@ -205,14 +222,15 @@ func (c Config) Resolve(ref string) (model.Resolved, error) {
 				continue
 			}
 			return model.Resolved{
-				Ref:        ref,
-				ProviderID: strings.TrimSpace(provider.ID),
-				BaseURL:    strings.TrimSpace(provider.BaseURL),
-				APIKey:     provider.APIKey,
-				ID:         strings.TrimSpace(definition.ID),
-				Context:    definition.Context,
-				Alias:      strings.TrimSpace(definition.Alias),
-				API:        definition.API,
+				Ref:           ref,
+				ProviderID:    strings.TrimSpace(provider.ID),
+				ProviderAlias: strings.TrimSpace(provider.Alias),
+				BaseURL:       strings.TrimSpace(provider.BaseURL),
+				APIKey:        provider.APIKey,
+				ID:            strings.TrimSpace(definition.ID),
+				Context:       definition.Context,
+				Alias:         strings.TrimSpace(definition.Alias),
+				API:           definition.API,
 			}, nil
 		}
 	}
@@ -230,73 +248,6 @@ func (c Config) ResolveMany(refs []string) ([]model.Resolved, error) {
 		out = append(out, resolved)
 	}
 	return out, nil
-}
-
-type legacyConfig struct {
-	Engines        []string `json:"engines"`
-	Arbiter        string   `json:"arbiter"`
-	BaseURL        string   `json:"base_url"`
-	APIKey         string   `json:"api_key"`
-	TimeoutSeconds int      `json:"timeout_seconds"`
-	ServeAddr      string   `json:"serve_addr"`
-}
-
-func hasLegacyFields(present map[string]json.RawMessage) bool {
-	for _, key := range []string{"base_url", "api_key"} {
-		if _, ok := present[key]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func migrateLegacy(raw []byte) (Config, error) {
-	defaults := Default()
-	legacy := legacyConfig{
-		BaseURL:        "https://api.example.com/v1",
-		TimeoutSeconds: defaults.TimeoutSeconds,
-		ServeAddr:      defaults.ServeAddr,
-	}
-	if err := json.Unmarshal(raw, &legacy); err != nil {
-		return Config{}, err
-	}
-	if strings.TrimSpace(legacy.BaseURL) == "" {
-		legacy.BaseURL = "https://api.openai.com/v1"
-	}
-	provider := model.Provider{ID: "default", BaseURL: legacy.BaseURL, APIKey: legacy.APIKey}
-	seen := make(map[string]struct{})
-	addModel := func(id string) {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			return
-		}
-		if _, exists := seen[id]; exists {
-			return
-		}
-		seen[id] = struct{}{}
-		provider.Models = append(provider.Models, model.Definition{
-			ID: id, Context: 128000, Alias: id, API: model.APIOpenAIChat,
-		})
-	}
-	engines := make([]string, 0, len(legacy.Engines))
-	for _, id := range legacy.Engines {
-		addModel(id)
-		if strings.TrimSpace(id) != "" {
-			engines = append(engines, model.Reference(provider.ID, id))
-		}
-	}
-	addModel(legacy.Arbiter)
-	arbiter := ""
-	if strings.TrimSpace(legacy.Arbiter) != "" {
-		arbiter = model.Reference(provider.ID, legacy.Arbiter)
-	}
-	return Config{
-		Providers:      []model.Provider{provider},
-		Engines:        engines,
-		Arbiter:        arbiter,
-		TimeoutSeconds: legacy.TimeoutSeconds,
-		ServeAddr:      legacy.ServeAddr,
-	}, nil
 }
 
 // fieldKeys 从 Config 的 json tag 提取全部字段名,避免手抄清单与结构体漂移。

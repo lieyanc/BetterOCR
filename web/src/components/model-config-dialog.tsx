@@ -38,9 +38,9 @@ import {
 const noArbiter = "__none__"
 
 const apiLabels: Record<ModelAPI, string> = {
-  "openai-chat": "OpenAI Chat",
+  "openai-chat-completions": "OpenAI Chat Completions",
   "openai-responses": "OpenAI Responses",
-  anthropic: "Anthropic",
+  "anthropic-messages": "Anthropic Messages",
 }
 
 function formatContext(context: number) {
@@ -103,7 +103,7 @@ export function ModelConfigDialog({
             {config?.providers.map((provider) => (
               <section key={provider.id} className="flex flex-col gap-2.5">
                 <div className="flex min-w-0 flex-wrap items-center gap-2">
-                  <h3 className="text-sm font-semibold">{provider.id}</h3>
+                  <h3 className="text-sm font-semibold">{provider.alias}</h3>
                   <Badge
                     variant={provider.has_api_key ? "secondary" : "outline"}
                   >
@@ -112,9 +112,9 @@ export function ModelConfigDialog({
                   </Badge>
                   <span
                     className="min-w-0 basis-full truncate text-left text-xs text-muted-foreground sm:flex-1 sm:basis-auto sm:text-right"
-                    title={provider.base_url}
+                    title={provider.id === provider.alias ? provider.base_url : `${provider.id} · ${provider.base_url}`}
                   >
-                    {provider.base_url}
+                    {provider.id === provider.alias ? provider.base_url : `${provider.id} · ${provider.base_url}`}
                   </span>
                 </div>
                 <FieldGroup data-slot="checkbox-group" className="gap-2">
@@ -184,13 +184,13 @@ export function ModelConfigDialog({
               </SelectGroup>
               {config?.providers.map((provider) => (
                 <SelectGroup key={provider.id}>
-                  <SelectLabel>{provider.id}</SelectLabel>
+                  <SelectLabel>{provider.alias}</SelectLabel>
                   {provider.models.map((model) => (
                     <SelectItem
                       key={`${provider.id}/${model.id}`}
                       value={`${provider.id}/${model.id}`}
                     >
-                      {model.alias} · {apiLabels[model.api]}
+                      {provider.alias} · {model.alias} · {apiLabels[model.api]}
                     </SelectItem>
                   ))}
                 </SelectGroup>

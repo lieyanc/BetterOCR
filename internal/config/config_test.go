@@ -17,7 +17,7 @@ func localProvider(baseURL, apiKey string) model.Provider {
 	return model.Provider{
 		ID: "local", BaseURL: baseURL, APIKey: apiKey,
 		Models: []model.Definition{{
-			ID: "vision", Context: 32768, Alias: "Local Vision", API: model.APIOpenAIChat,
+			ID: "vision", Context: 32768, Alias: "Local Vision", API: model.APIOpenAIChatCompletions,
 		}},
 	}
 }
@@ -83,7 +83,10 @@ func TestLoadSupplementsMissingFields(t *testing.T) {
 	if action != ActionSupplemented {
 		t.Errorf("action = %v, want ActionSupplemented", action)
 	}
-	if !reflect.DeepEqual(cfg.Providers, partial.Providers) || !reflect.DeepEqual(cfg.Engines, partial.Engines) {
+	// alias 为空会被补全为 id(local 不在模板中,回退 id 本身)
+	want := append([]model.Provider(nil), partial.Providers...)
+	want[0].Alias = "local"
+	if !reflect.DeepEqual(cfg.Providers, want) || !reflect.DeepEqual(cfg.Engines, partial.Engines) {
 		t.Errorf("用户字段被改写: %+v", cfg)
 	}
 	if cfg.Arbiter != "" {
@@ -98,47 +101,58 @@ func TestLoadSupplementsMissingFields(t *testing.T) {
 	}
 }
 
-func TestLoadMigratesLegacyConfig(t *testing.T) {
+func TestLoadSupplementsProviderAliases(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	legacy := []byte(`{"engines":["small","small"],"arbiter":"large","base_url":"http://legacy/v1","api_key":"secret","timeout_seconds":30,"serve_addr":":1"}`)
-	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+	// 模板同 id(openai)沿用模板 alias;未知 id 回退 id 本身
+	full := []byte(`{"providers":[{"id":"openai","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]},{"id":"custom","base_url":"http://c/v1","api_key":"","models":[{"id":"n","context":4096,"alias":"N","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`)
+	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, action, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action != ActionMigrated {
-		t.Fatalf("action = %v, want ActionMigrated", action)
+	if action != ActionSupplemented {
+		t.Fatalf("action = %v, want ActionSupplemented", action)
 	}
-	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "default" || cfg.Providers[0].APIKey != "secret" {
-		t.Fatalf("provider = %+v", cfg.Providers)
+	if cfg.Providers[0].Alias != "OpenAI" {
+		t.Errorf("模板同 id 的 alias = %q, want OpenAI", cfg.Providers[0].Alias)
 	}
-	if got := cfg.Engines; !reflect.DeepEqual(got, []string{"default/small", "default/small"}) {
-		t.Errorf("engines = %v", got)
+	if cfg.Providers[1].Alias != "custom" {
+		t.Errorf("未知 id 的 alias = %q, want custom", cfg.Providers[1].Alias)
 	}
-	if cfg.Arbiter != "default/large" || len(cfg.Providers[0].Models) != 2 {
-		t.Errorf("migrated config = %+v", cfg)
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), `"alias": "OpenAI"`) {
+		t.Errorf("补全的 alias 未落盘:\n%s", raw)
 	}
-	written, _ := os.ReadFile(path)
-	var topLevel map[string]json.RawMessage
-	if err := json.Unmarshal(written, &topLevel); err != nil {
+	// 二次加载:alias 已齐全,不再写回
+	if _, action, err := Load(path); err != nil || action != ActionNone {
+		t.Errorf("补全后二次加载 = (%v, %v), want ActionNone", action, err)
+	}
+}
+
+func TestLoadKeepsExplicitProviderAlias(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "betterocr.json")
+	full := []byte(`{"providers":[{"id":"openai","alias":"My OpenAI","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`)
+	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := topLevel["providers"]; !ok {
-		t.Errorf("migrated config has no providers: %s", written)
+	cfg, action, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := topLevel["api_key"]; ok {
-		t.Errorf("legacy top-level api_key remains: %s", written)
+	if action != ActionNone {
+		t.Errorf("显式 alias 触发写回: action = %v", action)
 	}
-	if _, action, err := Load(path); err != nil || action != ActionNone {
-		t.Errorf("migrated reload = (%v, %v)", action, err)
+	if cfg.Providers[0].Alias != "My OpenAI" {
+		t.Errorf("显式 alias 被改写: %q", cfg.Providers[0].Alias)
 	}
 }
 
 func TestLoadKeepsCompleteFileByteForByte(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	full := []byte(`{"providers":[{"id":"local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic"}]}],"engines":["local/m"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`)
+	// 顶层字段与 provider alias 均齐全 → 原样使用,逐字节不变
+	full := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +217,7 @@ func TestValidateAndResolve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.APIKey != "key" || resolved.API != model.APIOpenAIChat || resolved.Context != 32768 {
+	if resolved.APIKey != "key" || resolved.API != model.APIOpenAIChatCompletions || resolved.Context != 32768 {
 		t.Errorf("resolved = %+v", resolved)
 	}
 

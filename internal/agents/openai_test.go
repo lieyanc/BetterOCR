@@ -52,7 +52,7 @@ func TestVLMRecognizeAcrossAPIs(t *testing.T) {
 		checkBody func(*testing.T, map[string]any)
 	}{
 		{
-			name: "openai chat", api: model.APIOpenAIChat, wantPath: "/chat/completions",
+			name: "openai chat", api: model.APIOpenAIChatCompletions, wantPath: "/chat/completions",
 			response: map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}},
 			checkAuth: func(t *testing.T, r *http.Request) {
 				if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
@@ -83,7 +83,7 @@ func TestVLMRecognizeAcrossAPIs(t *testing.T) {
 			},
 		},
 		{
-			name: "anthropic", api: model.APIAnthropic, wantPath: "/messages",
+			name: "anthropic", api: model.APIAnthropicMessages, wantPath: "/messages",
 			response: map[string]any{"content": []any{map[string]any{"type": "text", "text": content}}},
 			checkAuth: func(t *testing.T, r *http.Request) {
 				if got := r.Header.Get("x-api-key"); got != "test-key" {
@@ -150,7 +150,7 @@ func TestVLMNoKeySendsNoAuthHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	vlm := NewVisionVLM("local#1", resolved(model.APIOpenAIChat, srv.URL, ""), nil)
+	vlm := NewVisionVLM("local#1", resolved(model.APIOpenAIChatCompletions, srv.URL, ""), nil)
 	if _, err := vlm.Recognize(context.Background(), testPNG(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestVLMHTTPErrorPropagates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	vlm := NewVisionVLM("t#1", resolved(model.APIAnthropic, srv.URL, ""), nil)
+	vlm := NewVisionVLM("t#1", resolved(model.APIAnthropicMessages, srv.URL, ""), nil)
 	_, err := vlm.Recognize(context.Background(), testPNG(t))
 	if err == nil || !strings.Contains(err.Error(), "quota exceeded") || !strings.Contains(err.Error(), "429") {
 		t.Errorf("err = %v, want HTTP 429 with server message", err)
@@ -176,7 +176,7 @@ func TestVLMAPIErrorInSuccessfulHTTPPropagates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	vlm := NewVisionVLM("t#1", resolved(model.APIOpenAIChat, srv.URL, ""), nil)
+	vlm := NewVisionVLM("t#1", resolved(model.APIOpenAIChatCompletions, srv.URL, ""), nil)
 	_, err := vlm.Recognize(context.Background(), testPNG(t))
 	if err == nil || !strings.Contains(err.Error(), "model unavailable") {
 		t.Errorf("err = %v", err)

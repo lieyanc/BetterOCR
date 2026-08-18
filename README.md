@@ -51,6 +51,7 @@ go run ./cmd/betterocr invoice.png   # 首次运行:生成 betterocr.json 后退
 	"providers": [
 	  {
 		"id": "openai",
+		"alias": "OpenAI",
 		"base_url": "https://api.openai.com/v1",
 		"api_key": "sk-…",
 		"models": [
@@ -64,12 +65,13 @@ go run ./cmd/betterocr invoice.png   # 首次运行:生成 betterocr.json 后退
 			"id": "gpt-4o-mini",
 			"context": 128000,
 			"alias": "GPT-4o mini",
-			"api": "openai-chat"
+			"api": "openai-chat-completions"
 		  }
 		]
 	  },
 	  {
 		"id": "anthropic",
+		"alias": "Anthropic",
 		"base_url": "https://api.anthropic.com/v1",
 		"api_key": "sk-ant-…",
 		"models": [
@@ -77,7 +79,7 @@ go run ./cmd/betterocr invoice.png   # 首次运行:生成 betterocr.json 后退
 			"id": "claude-sonnet-4-20250514",
 			"context": 200000,
 			"alias": "Claude Sonnet 4",
-			"api": "anthropic"
+			"api": "anthropic-messages"
 		  }
 		]
 	  }
@@ -100,8 +102,8 @@ go run ./cmd/betterocr -pretty invoice.png
 利用采样随机性制造独立证据,是最便宜的引擎组合方式。
 
 配置文件缺少字段时,启动会按内置模板自动补全并写回;显式空值视为用户
-决定,不会被改写;无法解析的文件绝不会被改动。旧版顶层
-`base_url` / `api_key` 配置会自动迁移为 `default` Provider,原模型与密钥均保留。
+决定,不会被改写(唯一例外:provider 的空 `alias` 会补为模板名或 `id`);
+无法解析的文件绝不会被改动。
 
 ## Web 界面(单文件二进制)
 
@@ -111,7 +113,7 @@ go run ./cmd/betterocr -pretty invoice.png
 ```bash
 make build    # = cd web && npm install && npm run build,再 go build
 
-./betterocr -serve    # 监听配置中的 serve_addr,默认 127.0.0.1:8787
+./betterocr           # 不带图片参数即进入 Web 模式(-serve 可省略),监听配置中的 serve_addr,默认 127.0.0.1:8787
 ```
 
 浏览器打开 http://127.0.0.1:8787:拖拽 / 点击 / Ctrl+V 粘贴图片。顶部的
@@ -123,7 +125,7 @@ make build    # = cd web && npm install && npm run build,再 go build
   请求也不能覆盖端点或密钥。
 - 监听地址(`serve_addr`)请保持 127.0.0.1;要暴露到公网需自行加认证层。
 - 前端开发:`cd web && npm run dev`(Vite 把 /api 代理到 127.0.0.1:8787)。
-- 未构建前端时 `go build` 依然可用,`-serve` 会返回一页构建指引。
+- 未构建前端时 `go build` 依然可用,Web 模式会返回一页构建指引。
 
 ## 输出
 
@@ -159,22 +161,23 @@ make build    # = cd web && npm install && npm run build,再 go build
 | 命令行参数 | 说明                                                           |
 |------------|----------------------------------------------------------------|
 | `-config`  | 配置文件路径,默认 `betterocr.json`;不存在时自动释放内置模板  |
-| `-serve`   | 以 Web 模式启动,监听配置中的 `serve_addr`                     |
+| `-serve`   | 以 Web 模式启动,监听配置中的 `serve_addr`;不带图片参数时默认即 Web 模式,可省略 |
 | `-pretty`  | 美化 JSON 输出(CLI 模式)                                     |
 
 | 配置字段          | 说明                                                        |
 |-------------------|-------------------------------------------------------------|
-| `providers`       | Provider 数组;每项包含唯一 `id`、`base_url`、`api_key` 和 `models` |
+| `providers`       | Provider 数组;每项包含唯一 `id`、可选 `alias`、`base_url`、`api_key` 和 `models` |
+| `providers[].alias` | Web 菜单和识别结果使用的 Provider 显示名称;留空会自动补为模板名或 `id` |
 | `models[].id`     | 上游 API 使用的真实模型 ID                                 |
 | `models[].context`| 上下文窗口;输出上限为 `min(8192, context/2)`               |
 | `models[].alias`  | Web 菜单和识别结果使用的显示名称                           |
-| `models[].api`    | `openai-chat`、`openai-responses` 或 `anthropic`           |
+| `models[].api`    | `openai-chat-completions`、`openai-responses` 或 `anthropic-messages` |
 | `engines`         | 基础模型引用数组;重复即多路采样(CLI 模式必填)              |
 | `arbiter`         | 仲裁模型引用;置空则分歧行退化为本地择优                    |
 | `timeout_seconds` | 单次识别的端到端超时秒数,非正数按 120 处理                 |
 | `serve_addr`      | Web 模式监听地址,如 `127.0.0.1:8787`                       |
 
-启动时的配置文件处理:不存在 → 释放内置模板;旧结构 → 自动迁移;缺字段 →
+启动时的配置文件处理:不存在 → 释放内置模板;缺字段 →
 按模板补全写回;解析或引用校验失败 → 报错且绝不改动原文件。不读取任何环境变量。
 
 单引擎失败不影响其他引擎;全部失败时退出码 1,细节在 `candidates[].err`。

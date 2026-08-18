@@ -35,7 +35,7 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	reg := agent.NewRegistry()
 	for i, resolved := range cfg.Engines {
 		// Provider and sequence keep names unique even when aliases are repeated.
-		name := fmt.Sprintf("%s · %s#%d", resolved.DisplayName(), resolved.ProviderID, i+1)
+		name := fmt.Sprintf("%s · %s#%d", resolved.DisplayName(), resolved.ProviderName(), i+1)
 		reg.MustRegister(agents.NewVisionVLM(name, resolved, cfg.HTTPClient))
 	}
 

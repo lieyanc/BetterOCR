@@ -8,15 +8,15 @@ import "strings"
 type API string
 
 const (
-	APIOpenAIChat      API = "openai-chat"
-	APIOpenAIResponses API = "openai-responses"
-	APIAnthropic       API = "anthropic"
+	APIOpenAIChatCompletions API = "openai-chat-completions"
+	APIOpenAIResponses       API = "openai-responses"
+	APIAnthropicMessages     API = "anthropic-messages"
 )
 
 // Valid reports whether the API protocol is supported.
 func (a API) Valid() bool {
 	switch a {
-	case APIOpenAIChat, APIOpenAIResponses, APIAnthropic:
+	case APIOpenAIChatCompletions, APIOpenAIResponses, APIAnthropicMessages:
 		return true
 	default:
 		return false
@@ -34,27 +34,45 @@ type Definition struct {
 // Provider owns connection credentials and the models available through it.
 type Provider struct {
 	ID      string       `json:"id"`
+	Alias   string       `json:"alias,omitempty"`
 	BaseURL string       `json:"base_url"`
 	APIKey  string       `json:"api_key"`
 	Models  []Definition `json:"models"`
 }
 
+// DisplayName returns the configured friendly name, falling back to the ID.
+func (p Provider) DisplayName() string {
+	if strings.TrimSpace(p.Alias) != "" {
+		return p.Alias
+	}
+	return p.ID
+}
+
 // Resolved is a model definition combined with its provider connection.
 // It is passed internally only and is never serialized to the browser.
 type Resolved struct {
-	Ref        string
-	ProviderID string
-	BaseURL    string
-	APIKey     string
-	ID         string
-	Context    int
-	Alias      string
-	API        API
+	Ref           string
+	ProviderID    string
+	ProviderAlias string
+	BaseURL       string
+	APIKey        string
+	ID            string
+	Context       int
+	Alias         string
+	API           API
 }
 
 // Reference returns the stable selector used in engines and arbiter fields.
 func Reference(providerID, modelID string) string {
 	return strings.TrimSpace(providerID) + "/" + strings.TrimSpace(modelID)
+}
+
+// ProviderName returns the provider's friendly name, falling back to its ID.
+func (m Resolved) ProviderName() string {
+	if strings.TrimSpace(m.ProviderAlias) != "" {
+		return m.ProviderAlias
+	}
+	return m.ProviderID
 }
 
 // DisplayName returns the configured friendly name, falling back to the ID.

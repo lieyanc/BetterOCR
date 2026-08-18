@@ -25,13 +25,13 @@ import (
 func main() {
 	var (
 		configPath = flag.String("config", config.DefaultPath, "JSON 配置文件路径;不存在时自动释放内置模板,缺字段时按模板补全写回")
-		serveMode  = flag.Bool("serve", false, "以 Web 模式启动,监听配置中的 serve_addr;前端已内嵌在二进制中")
+		serveMode  = flag.Bool("serve", false, "以 Web 模式启动,监听配置中的 serve_addr;不带图片参数时也是 Web 模式,此旗标可省略")
 		pretty     = flag.Bool("pretty", false, "美化 JSON 输出(CLI 模式)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
-			"用法: betterocr [-config betterocr.json] [-pretty] image.png\n"+
-				"      betterocr [-config betterocr.json] -serve\n\n"+
+			"用法: betterocr [-config betterocr.json] image.png\n"+
+				"      betterocr [-config betterocr.json] [-serve]  # 不带图片参数时默认进入 Web 模式\n\n"+
 				"Provider、模型目录、默认选择、超时与监听地址全部来自 JSON 配置文件;\n"+
 				"首次运行自动生成模板,不读取任何环境变量。\n\n")
 		flag.PrintDefaults()
@@ -45,25 +45,20 @@ func main() {
 	switch action {
 	case config.ActionReleased:
 		fmt.Fprintf(os.Stderr, "已生成默认配置文件 %s(内置模板),请按需修改 providers、engines 等字段\n", *configPath)
-		if !*serveMode {
-			// 模板值直接识别几乎必然失败,提示编辑后退出
+		if !*serveMode && flag.NArg() > 0 {
+			// 模板值直接识别几乎必然失败,提示编辑后退出;Web 模式仍可启动,
+			// 但页面只能点选模型,密钥等仍需编辑配置文件后重启生效
 			fmt.Fprintln(os.Stderr, "请编辑配置后重新运行")
 			os.Exit(1)
 		}
 	case config.ActionSupplemented:
 		fmt.Fprintf(os.Stderr, "配置文件 %s 缺少字段,已按内置模板补全\n", *configPath)
-	case config.ActionMigrated:
-		fmt.Fprintf(os.Stderr, "配置文件 %s 已从单 Provider 结构迁移到 providers 模型目录\n", *configPath)
 	}
 
-	if *serveMode {
+	// 默认 Web 模式:不带任何位置参数时进入 Web 模式,-serve 显式声明效果相同
+	if *serveMode || flag.NArg() == 0 {
 		runServe(cfg)
 		return
-	}
-
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
 	}
 	image, err := os.ReadFile(flag.Arg(0))
 	if err != nil {

@@ -65,6 +65,7 @@ type configResponse struct {
 
 type providerResponse struct {
 	ID        string             `json:"id"`
+	Alias     string             `json:"alias"`
 	BaseURL   string             `json:"base_url"`
 	HasAPIKey bool               `json:"has_api_key"`
 	Models    []model.Definition `json:"models"`
@@ -79,7 +80,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 	for _, provider := range s.Config.Providers {
 		models := append([]model.Definition(nil), provider.Models...)
 		providers = append(providers, providerResponse{
-			ID: provider.ID, BaseURL: provider.BaseURL,
+			ID: provider.ID, Alias: provider.DisplayName(), BaseURL: provider.BaseURL,
 			HasAPIKey: provider.APIKey != "", Models: models,
 		})
 	}

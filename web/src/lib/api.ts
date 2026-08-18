@@ -41,7 +41,7 @@ export interface Final {
   candidates: EngineResult[]
 }
 
-export type ModelAPI = "openai-chat" | "openai-responses" | "anthropic"
+export type ModelAPI = "openai-chat-completions" | "openai-responses" | "anthropic-messages"
 
 export interface ProviderModel {
   id: string
@@ -52,6 +52,7 @@ export interface ProviderModel {
 
 export interface Provider {
   id: string
+  alias: string
   base_url: string
   has_api_key: boolean
   models: ProviderModel[]

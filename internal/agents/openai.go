@@ -83,7 +83,7 @@ func NewVisionEscalator(resolved model.Resolved, client *http.Client) *VisionEsc
 
 // Name implements arbiter.Escalator.
 func (e *VisionEscalator) Name() string {
-	return "arbiter:" + e.Model.DisplayName() + " (" + e.Model.ProviderID + ")"
+	return "arbiter:" + e.Model.DisplayName() + " (" + e.Model.ProviderName() + ")"
 }
 
 const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several fast OCR engines transcribed the same image; most lines agree, but the rows listed below are disputed. Look at the image and decide the correct text for each disputed row.
@@ -148,11 +148,11 @@ func vision(ctx context.Context, resolved model.Resolved, client *http.Client, s
 		client = http.DefaultClient
 	}
 	switch resolved.API {
-	case model.APIOpenAIChat:
+	case model.APIOpenAIChatCompletions:
 		return openAIChat(ctx, resolved, client, system, userText, mediaType, image)
 	case model.APIOpenAIResponses:
 		return openAIResponses(ctx, resolved, client, system, userText, mediaType, image)
-	case model.APIAnthropic:
+	case model.APIAnthropicMessages:
 		return anthropicMessages(ctx, resolved, client, system, userText, mediaType, image)
 	default:
 		return "", fmt.Errorf("模型 %s 使用了不受支持的 API %q", resolved.Ref, resolved.API)

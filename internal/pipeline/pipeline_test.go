@@ -39,7 +39,7 @@ func TestRunUsesResolvedProviderEndpoint(t *testing.T) {
 	_, err := Run(context.Background(), Config{
 		Engines: []model.Resolved{{
 			Ref: "local/m", ProviderID: "local", BaseURL: "http://local.test/v1",
-			ID: "m", Context: 32768, Alias: "M", API: model.APIOpenAIChat,
+			ID: "m", Context: 32768, Alias: "M", API: model.APIOpenAIChatCompletions,
 		}},
 		HTTPClient: &http.Client{Transport: ct},
 	}, pngMagic)
