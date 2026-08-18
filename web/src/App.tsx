@@ -21,6 +21,7 @@ import {
   type Final,
   type FinalLine,
   type LineSource,
+  type OCRDelta,
   type ServerConfig,
 } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -87,6 +88,7 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0)
   const [error, setError] = useState("")
   const [result, setResult] = useState<Final | null>(null)
+  const [liveOutputs, setLiveOutputs] = useState<OCRDelta[]>([])
   const abortRef = useRef<AbortController | null>(null)
 
   // —— 服务端模型目录与本地选择 ——
@@ -201,6 +203,7 @@ export default function App() {
     setBusy(true)
     setError("")
     setResult(null)
+    setLiveOutputs([])
     setElapsed(0)
     const started = performance.now()
     const timer = window.setInterval(
@@ -210,12 +213,26 @@ export default function App() {
     const ac = new AbortController()
     abortRef.current = ac
     try {
-      const final = await runOCR({
-        image: file,
-        engines,
-        arbiter,
-        signal: ac.signal,
-      })
+      const final = await runOCR(
+        {
+          image: file,
+          engines,
+          arbiter,
+          signal: ac.signal,
+        },
+        (delta) => {
+          setLiveOutputs((current) => {
+            const index = current.findIndex(
+              (item) =>
+                item.stage === delta.stage && item.agent === delta.agent,
+            )
+            if (index < 0) return [...current, delta]
+            return current.map((item, i) =>
+              i === index ? { ...item, text: item.text + delta.text } : item,
+            )
+          })
+        },
+      )
       setResult(final)
       if (
         final.stats.engines > 0 &&
@@ -445,9 +462,76 @@ export default function App() {
           </Alert>
         )}
 
+        {busy && <LiveOutputView outputs={liveOutputs} />}
         {result && <ResultView final={result} />}
       </main>
     </div>
+  )
+}
+
+function LiveOutputView({ outputs }: { outputs: OCRDelta[] }) {
+  return (
+    <section className="flex flex-col gap-3" aria-label="模型实时输出">
+      <div className="flex items-center gap-2">
+        <Loader2 className="size-4 animate-spin text-muted-foreground" />
+        <h2 className="text-sm font-semibold">实时输出</h2>
+        <Badge variant="secondary" className="tabular-nums">
+          {outputs.length} 路
+        </Badge>
+      </div>
+      {outputs.length === 0 ? (
+        <div className="flex min-h-28 items-center justify-center rounded-md border border-dashed text-sm text-muted-foreground">
+          等待模型响应
+        </div>
+      ) : (
+        <div className="grid gap-3 xl:grid-cols-2">
+          {outputs.map((output) => (
+            <LiveOutputCard
+              key={`${output.stage}\u0000${output.agent}`}
+              output={output}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function LiveOutputCard({ output }: { output: OCRDelta }) {
+  const textRef = useRef<HTMLPreElement>(null)
+  useEffect(() => {
+    const element = textRef.current
+    if (element) element.scrollTop = element.scrollHeight
+  }, [output.text])
+
+  return (
+    <Card className="gap-3 py-4">
+      <CardHeader className="px-4">
+        <CardTitle className="truncate text-sm font-medium" title={output.agent}>
+          {output.agent}
+        </CardTitle>
+        <CardAction>
+          <Badge
+            variant="outline"
+            className={
+              output.stage === "arbiter"
+                ? sourceMeta.escalated.cls
+                : "border-sky-500/25 bg-sky-500/10 text-sky-700 dark:text-sky-400"
+            }
+          >
+            {output.stage === "arbiter" ? "仲裁" : "基础模型"}
+          </Badge>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="px-4">
+        <pre
+          ref={textRef}
+          className="h-40 overflow-auto whitespace-pre-wrap break-words font-sans text-sm leading-6"
+        >
+          {output.text}
+        </pre>
+      </CardContent>
+    </Card>
   )
 }
 

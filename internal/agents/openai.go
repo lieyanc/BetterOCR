@@ -3,10 +3,12 @@
 package agents
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +25,8 @@ type VisionVLM struct {
 	AgentName string
 	Model     model.Resolved
 	Client    *http.Client
+	// OnDelta receives streamed text fragments as the model produces them.
+	OnDelta func(string)
 }
 
 // NewVisionVLM creates a base VLM engine.
@@ -50,7 +54,7 @@ Rules:
 // 它会成为只有一个引擎产出的孤行,在融合层进入仲裁,由仲裁器看图判定
 // "不存在于图中"而丢弃。让架构处理噪声,比让正则去猜可靠。
 func (v *VisionVLM) Recognize(ctx context.Context, image []byte) (agent.Result, error) {
-	content, err := vision(ctx, v.Model, v.Client, ocrSystem, "Transcribe the image.", image)
+	content, err := vision(ctx, v.Model, v.Client, ocrSystem, "Transcribe the image.", image, v.OnDelta)
 	if err != nil {
 		return agent.Result{}, err
 	}
@@ -61,6 +65,8 @@ func (v *VisionVLM) Recognize(ctx context.Context, image []byte) (agent.Result, 
 type VisionEscalator struct {
 	Model  model.Resolved
 	Client *http.Client
+	// OnDelta receives streamed arbitration text fragments.
+	OnDelta func(string)
 }
 
 // NewVisionEscalator creates a dispute arbiter.
@@ -87,7 +93,7 @@ Rules:
 
 // Resolve implements arbiter.Escalator and batches all disputed rows in one call.
 func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []arbiter.Dispute) ([]arbiter.Resolution, error) {
-	content, err := vision(ctx, e.Model, e.Client, escalatorSystem, disputesPrompt(disputes), image)
+	content, err := vision(ctx, e.Model, e.Client, escalatorSystem, disputesPrompt(disputes), image, e.OnDelta)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +157,7 @@ func disputesPrompt(disputes []arbiter.Dispute) string {
 	return sb.String()
 }
 
-func vision(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText string, image []byte) (string, error) {
+func vision(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText string, image []byte, onDelta func(string)) (string, error) {
 	mediaType := http.DetectContentType(image)
 	if !strings.HasPrefix(mediaType, "image/") {
 		return "", fmt.Errorf("输入不是可识别的图片格式: %s", mediaType)
@@ -161,11 +167,11 @@ func vision(ctx context.Context, resolved model.Resolved, client *http.Client, s
 	}
 	switch resolved.API {
 	case model.APIOpenAIChatCompletions:
-		return openAIChat(ctx, resolved, client, system, userText, mediaType, image)
+		return openAIChat(ctx, resolved, client, system, userText, mediaType, image, onDelta)
 	case model.APIOpenAIResponses:
-		return openAIResponses(ctx, resolved, client, system, userText, mediaType, image)
+		return openAIResponses(ctx, resolved, client, system, userText, mediaType, image, onDelta)
 	case model.APIAnthropicMessages:
-		return anthropicMessages(ctx, resolved, client, system, userText, mediaType, image)
+		return anthropicMessages(ctx, resolved, client, system, userText, mediaType, image, onDelta)
 	default:
 		return "", fmt.Errorf("模型 %s 使用了不受支持的 API %q", resolved.Ref, resolved.API)
 	}
@@ -175,6 +181,7 @@ type chatRequest struct {
 	Model     string        `json:"model"`
 	Messages  []chatMessage `json:"messages"`
 	MaxTokens int           `json:"max_tokens,omitempty"`
+	Stream    bool          `json:"stream"`
 }
 
 type chatMessage struct {
@@ -192,7 +199,7 @@ type chatImageURL struct {
 	URL string `json:"url"`
 }
 
-func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte) (string, error) {
+func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte, onDelta func(string)) (string, error) {
 	body := chatRequest{
 		Model: resolved.ID,
 		Messages: []chatMessage{
@@ -203,10 +210,14 @@ func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Clien
 			}},
 		},
 		MaxTokens: maxOutputTokens(resolved.Context),
+		Stream:    true,
 	}
-	raw, err := postJSON(ctx, resolved, client, "/chat/completions", body, false)
+	raw, streamed, err := postJSONStream(ctx, resolved, client, "/chat/completions", body, false, onDelta, chatDelta)
 	if err != nil {
 		return "", err
+	}
+	if streamed != "" {
+		return streamed, nil
 	}
 	var response struct {
 		Choices []struct {
@@ -225,6 +236,7 @@ func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Clien
 	if text == "" {
 		return "", fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
 	}
+	emitDelta(onDelta, text)
 	return text, nil
 }
 
@@ -233,6 +245,7 @@ type responsesRequest struct {
 	Instructions    string             `json:"instructions"`
 	Input           []responsesMessage `json:"input"`
 	MaxOutputTokens int                `json:"max_output_tokens,omitempty"`
+	Stream          bool               `json:"stream"`
 }
 
 type responsesMessage struct {
@@ -246,7 +259,7 @@ type responsesContentPart struct {
 	ImageURL string `json:"image_url,omitempty"`
 }
 
-func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte) (string, error) {
+func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte, onDelta func(string)) (string, error) {
 	body := responsesRequest{
 		Model:        resolved.ID,
 		Instructions: system,
@@ -258,10 +271,14 @@ func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.
 			},
 		}},
 		MaxOutputTokens: maxOutputTokens(resolved.Context),
+		Stream:          true,
 	}
-	raw, err := postJSON(ctx, resolved, client, "/responses", body, false)
+	raw, streamed, err := postJSONStream(ctx, resolved, client, "/responses", body, false, onDelta, responsesDelta)
 	if err != nil {
 		return "", err
+	}
+	if streamed != "" {
+		return streamed, nil
 	}
 	var response struct {
 		OutputText string `json:"output_text"`
@@ -276,6 +293,7 @@ func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.
 		return "", fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
 	}
 	if strings.TrimSpace(response.OutputText) != "" {
+		emitDelta(onDelta, response.OutputText)
 		return response.OutputText, nil
 	}
 	var parts []string
@@ -289,7 +307,9 @@ func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.
 	if len(parts) == 0 {
 		return "", fmt.Errorf("模型 %s 未返回 output_text", resolved.Ref)
 	}
-	return strings.Join(parts, "\n"), nil
+	text := strings.Join(parts, "\n")
+	emitDelta(onDelta, text)
+	return text, nil
 }
 
 type anthropicRequest struct {
@@ -297,6 +317,7 @@ type anthropicRequest struct {
 	System    string             `json:"system"`
 	Messages  []anthropicMessage `json:"messages"`
 	MaxTokens int                `json:"max_tokens"`
+	Stream    bool               `json:"stream"`
 }
 
 type anthropicMessage struct {
@@ -316,7 +337,7 @@ type anthropicSource struct {
 	Data      string `json:"data"`
 }
 
-func anthropicMessages(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte) (string, error) {
+func anthropicMessages(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte, onDelta func(string)) (string, error) {
 	body := anthropicRequest{
 		Model:  resolved.ID,
 		System: system,
@@ -330,10 +351,14 @@ func anthropicMessages(ctx context.Context, resolved model.Resolved, client *htt
 			},
 		}},
 		MaxTokens: maxOutputTokens(resolved.Context),
+		Stream:    true,
 	}
-	raw, err := postJSON(ctx, resolved, client, "/messages", body, true)
+	raw, streamed, err := postJSONStream(ctx, resolved, client, "/messages", body, true, onDelta, anthropicDelta)
 	if err != nil {
 		return "", err
+	}
+	if streamed != "" {
+		return streamed, nil
 	}
 	var response struct {
 		Content []struct {
@@ -353,18 +378,22 @@ func anthropicMessages(ctx context.Context, resolved model.Resolved, client *htt
 	if len(parts) == 0 {
 		return "", fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
 	}
-	return strings.Join(parts, "\n"), nil
+	text := strings.Join(parts, "\n")
+	emitDelta(onDelta, text)
+	return text, nil
 }
 
-func postJSON(ctx context.Context, resolved model.Resolved, client *http.Client, endpoint string, body any, anthropic bool) ([]byte, error) {
+type sseDelta func(event string, data []byte) (string, error)
+
+func postJSONStream(ctx context.Context, resolved model.Resolved, client *http.Client, endpoint string, body any, anthropic bool, onDelta func(string), extract sseDelta) ([]byte, string, error) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(resolved.BaseURL, "/")+endpoint, bytes.NewReader(encoded))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if anthropic {
@@ -377,37 +406,204 @@ func postJSON(ctx context.Context, resolved model.Resolved, client *http.Client,
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		defer resp.Body.Close()
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		if readErr != nil {
+			return nil, "", readErr
+		}
 		message := strings.TrimSpace(string(responseBody))
-		parsed := parseAPIError(responseBody)
-		if parsed != "" {
+		if parsed := parseAPIError(responseBody); parsed != "" {
 			message = parsed
 		}
-		return nil, fmt.Errorf("模型 %s 请求失败 (HTTP %d): %.300s", resolved.Ref, resp.StatusCode, message)
+		return nil, "", fmt.Errorf("模型 %s 请求失败 (HTTP %d): %.300s", resolved.Ref, resp.StatusCode, message)
 	}
-	if message := parseAPIError(responseBody); message != "" {
-		return nil, fmt.Errorf("模型 %s 返回错误: %s", resolved.Ref, message)
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		text, err := readSSEText(resp, resolved, onDelta, extract)
+		return nil, text, err
 	}
-	return responseBody, nil
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	if message := parseAPIError(raw); message != "" {
+		return nil, "", fmt.Errorf("模型 %s 返回错误: %s", resolved.Ref, message)
+	}
+	return raw, "", nil
+}
+
+func readSSEText(resp *http.Response, resolved model.Resolved, onDelta func(string), extract sseDelta) (string, error) {
+	defer resp.Body.Close()
+	var out strings.Builder
+	err := scanSSE(resp.Body, func(event string, data []byte) error {
+		if string(data) == "[DONE]" {
+			return nil
+		}
+		delta, err := extract(event, data)
+		if err != nil {
+			return fmt.Errorf("模型 %s 返回了无效流事件: %w", resolved.Ref, err)
+		}
+		if delta != "" {
+			out.WriteString(delta)
+			emitDelta(onDelta, delta)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if out.Len() == 0 {
+		return "", fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
+	}
+	return out.String(), nil
+}
+
+func scanSSE(r io.Reader, visit func(event string, data []byte) error) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	var event string
+	var data []string
+	dispatch := func() error {
+		if len(data) == 0 {
+			event = ""
+			return nil
+		}
+		err := visit(event, []byte(strings.Join(data, "\n")))
+		event, data = "", nil
+		return err
+	}
+	for scanner.Scan() {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if line == "" {
+			if err := dispatch(); err != nil {
+				return err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, value, _ := strings.Cut(line, ":")
+		value = strings.TrimPrefix(value, " ")
+		switch field {
+		case "event":
+			event = value
+		case "data":
+			data = append(data, value)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return dispatch()
+}
+
+func chatDelta(_ string, data []byte) (string, error) {
+	if message := parseAPIError(data); message != "" {
+		return "", errors.New(message)
+	}
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return "", err
+	}
+	if len(chunk.Choices) == 0 {
+		return "", nil
+	}
+	return textFromContent(chunk.Choices[0].Delta.Content), nil
+}
+
+func responsesDelta(event string, data []byte) (string, error) {
+	if message := parseAPIError(data); message != "" {
+		return "", errors.New(message)
+	}
+	var chunk struct {
+		Type  string `json:"type"`
+		Delta string `json:"delta"`
+	}
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return "", err
+	}
+	if chunk.Type == "response.error" || chunk.Type == "response.failed" ||
+		event == "response.error" || event == "response.failed" {
+		return "", errors.New("Responses API 流返回错误")
+	}
+	if chunk.Type == "response.output_text.delta" || event == "response.output_text.delta" {
+		return chunk.Delta, nil
+	}
+	return "", nil
+}
+
+func anthropicDelta(event string, data []byte) (string, error) {
+	if message := parseAPIError(data); message != "" {
+		return "", errors.New(message)
+	}
+	var chunk struct {
+		Type  string `json:"type"`
+		Delta struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return "", err
+	}
+	if chunk.Type == "error" || event == "error" {
+		return "", errors.New("Anthropic 流返回错误")
+	}
+	if chunk.Type == "content_block_delta" && chunk.Delta.Type == "text_delta" {
+		return chunk.Delta.Text, nil
+	}
+	return "", nil
 }
 
 func parseAPIError(body []byte) string {
 	var parsed struct {
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
+		Type     string          `json:"type"`
+		Message  string          `json:"message"`
+		Error    json.RawMessage `json:"error"`
+		Response *struct {
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
 	}
-	if json.Unmarshal(body, &parsed) == nil && parsed.Error != nil && parsed.Error.Message != "" {
-		return parsed.Error.Message
+	if json.Unmarshal(body, &parsed) != nil {
+		return ""
+	}
+	if len(parsed.Error) > 0 && string(parsed.Error) != "null" {
+		var detail struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(parsed.Error, &detail) == nil && detail.Message != "" {
+			return detail.Message
+		}
+		var message string
+		if json.Unmarshal(parsed.Error, &message) == nil && message != "" {
+			return message
+		}
+	}
+	if parsed.Response != nil && parsed.Response.Error != nil && parsed.Response.Error.Message != "" {
+		return parsed.Response.Error.Message
+	}
+	if (parsed.Type == "error" || strings.HasSuffix(parsed.Type, ".failed")) && parsed.Message != "" {
+		return parsed.Message
 	}
 	return ""
+}
+
+func emitDelta(onDelta func(string), delta string) {
+	if onDelta != nil && delta != "" {
+		onDelta(delta)
+	}
 }
 
 func imageDataURL(mediaType string, image []byte) string {

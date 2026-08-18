@@ -18,6 +18,7 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
 	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/model"
+	"github.com/lieyanc/BetterOCR/internal/pipeline"
 )
 
 // testPNG 在测试内生成一张最小合法 PNG,避免外部测试资产。
@@ -30,6 +31,67 @@ func testPNG(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+func TestOCRStreamEmitsDeltasThenResult(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if !request.Stream {
+			t.Error("upstream request did not enable streaming")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
+	body, contentType := multipartBody(t, testPNG(t), map[string]string{
+		"engines": "test/tiny-a,test/tiny-b",
+		"arbiter": "",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/ocr/stream", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "application/x-ndjson") {
+		t.Errorf("Content-Type = %q", got)
+	}
+	var events []streamEvent
+	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
+		var event streamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("invalid stream line %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	if len(events) < 4 || events[0].Type != "start" {
+		t.Fatalf("events = %+v", events)
+	}
+	var deltaText strings.Builder
+	for _, event := range events[1 : len(events)-1] {
+		if event.Type != "delta" || event.Stage != pipeline.StageEngine || event.Agent == "" {
+			t.Errorf("unexpected progress event: %+v", event)
+		}
+		deltaText.WriteString(event.Text)
+	}
+	if !strings.Contains(deltaText.String(), "hello") || !strings.Contains(deltaText.String(), " world") {
+		t.Errorf("streamed text = %q", deltaText.String())
+	}
+	last := events[len(events)-1]
+	if last.Type != "result" || last.Result == nil || last.Result.Text != "hello world" {
+		t.Errorf("last event = %+v", last)
+	}
 }
 
 // fakeUpstream 模拟 OpenAI 兼容端点,记录每次请求的 Authorization 头。

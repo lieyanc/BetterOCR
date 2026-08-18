@@ -119,9 +119,13 @@ make build    # = cd web && npm install && npm run build,再 go build
 
 浏览器打开 http://127.0.0.1:8787:拖拽 / 点击 / Ctrl+V 粘贴图片。顶部的
 「模型配置」菜单按 Provider 展示已配置模型,可点选多个基础模型和一个仲裁
-模型;结果按 文本 / 逐行(来源与置信度标注)/ 引擎对比 / JSON 四个视图展示。
+模型;识别时会实时显示各基础模型与仲裁模型的串流输出,完成后结果按 文本 /
+逐行(来源与置信度标注)/ 引擎对比 / JSON 四个视图展示。
 
 - Web 模式下 `engines` / `arbiter` 是页面默认选择;浏览器会在本机记住点选结果。
+- 三种模型 API 默认都发送 `stream: true`;兼容端点若忽略该参数并返回普通 JSON,
+  仍可正常解析。`POST /api/ocr/stream` 以 NDJSON 输出 `delta` 与最终 `result` 事件,
+  原 `POST /api/ocr` 保留为一次性 JSON 响应。
 - API 只接受配置文件中存在的模型引用;Provider 密钥绝不下发到浏览器,
   请求也不能覆盖端点或密钥。
 - 监听地址(`serve_addr`)请保持 127.0.0.1;要暴露到公网需自行加认证层。

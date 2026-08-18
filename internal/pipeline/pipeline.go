@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/lieyanc/BetterOCR/internal/agent"
 	"github.com/lieyanc/BetterOCR/internal/agents"
@@ -24,7 +25,22 @@ type Config struct {
 	Arbiter *model.Resolved
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
+	// OnDelta receives serialized model text fragments while engines and the
+	// optional arbiter are running. Nil disables progress reporting.
+	OnDelta func(Delta)
 }
+
+// Delta is one streamed text fragment from a model call.
+type Delta struct {
+	Stage string `json:"stage"`
+	Agent string `json:"agent"`
+	Text  string `json:"text"`
+}
+
+const (
+	StageEngine  = "engine"
+	StageArbiter = "arbiter"
+)
 
 // Run 执行一次完整识别:并发引擎 → 行级对齐 → 共识/仲裁融合。
 func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
@@ -33,15 +49,34 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	}
 
 	reg := agent.NewRegistry()
+	var progressMu sync.Mutex
+	emit := func(delta Delta) {
+		if cfg.OnDelta == nil || delta.Text == "" {
+			return
+		}
+		// Engine calls run concurrently, so callbacks writing one response must
+		// never overlap.
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		cfg.OnDelta(delta)
+	}
 	for i, resolved := range cfg.Engines {
 		// Provider and sequence keep names unique even when aliases are repeated.
 		name := fmt.Sprintf("%s · %s#%d", resolved.DisplayName(), resolved.ProviderName(), i+1)
-		reg.MustRegister(agents.NewVisionVLM(name, resolved, cfg.HTTPClient))
+		vlm := agents.NewVisionVLM(name, resolved, cfg.HTTPClient)
+		vlm.OnDelta = func(text string) {
+			emit(Delta{Stage: StageEngine, Agent: name, Text: text})
+		}
+		reg.MustRegister(vlm)
 	}
 
 	arb := arbiter.New()
 	if cfg.Arbiter != nil {
-		arb.Escalator = agents.NewVisionEscalator(*cfg.Arbiter, cfg.HTTPClient)
+		escalator := agents.NewVisionEscalator(*cfg.Arbiter, cfg.HTTPClient)
+		escalator.OnDelta = func(text string) {
+			emit(Delta{Stage: StageArbiter, Agent: escalator.Name(), Text: text})
+		}
+		arb.Escalator = escalator
 	}
 
 	results := agent.NewCoordinator(reg).RunConcurrent(ctx, image)

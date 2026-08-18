@@ -119,6 +119,9 @@ func TestVLMRecognizeAcrossAPIs(t *testing.T) {
 					t.Fatal(err)
 				}
 				tt.checkBody(t, body)
+				if body["stream"] != true {
+					t.Errorf("stream = %v, want true", body["stream"])
+				}
 				_ = json.NewEncoder(w).Encode(tt.response)
 			}))
 			defer srv.Close()
@@ -133,6 +136,68 @@ func TestVLMRecognizeAcrossAPIs(t *testing.T) {
 			}
 			if len(result.Lines) != 2 || result.Lines[0] != "你好,世界" || result.Lines[1] != "second line" {
 				t.Errorf("lines = %q", result.Lines)
+			}
+		})
+	}
+}
+
+func TestVLMStreamingAcrossAPIs(t *testing.T) {
+	tests := []struct {
+		name   string
+		api    model.API
+		events string
+	}{
+		{
+			name: "openai chat", api: model.APIOpenAIChatCompletions,
+			events: "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"content\":\" line\\nsecond line\"}}]}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name: "openai responses", api: model.APIOpenAIResponses,
+			events: "event: response.output_text.delta\n" +
+				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n" +
+				"event: response.output_text.delta\n" +
+				"data: {\"type\":\"response.output_text.delta\",\"delta\":\" line\\nsecond line\"}\n\n" +
+				"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+		},
+		{
+			name: "anthropic", api: model.APIAnthropicMessages,
+			events: "event: content_block_delta\n" +
+				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n" +
+				"event: content_block_delta\n" +
+				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" line\\nsecond line\"}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["stream"] != true {
+					t.Errorf("stream = %v, want true", body["stream"])
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(tt.events))
+			}))
+			defer srv.Close()
+
+			vlm := NewVisionVLM("vision#1", resolved(tt.api, srv.URL, ""), nil)
+			var deltas []string
+			vlm.OnDelta = func(delta string) { deltas = append(deltas, delta) }
+			result, err := vlm.Recognize(context.Background(), testPNG(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(result.Lines, []string{"first line", "second line"}) {
+				t.Errorf("lines = %q", result.Lines)
+			}
+			if !reflect.DeepEqual(deltas, []string{"first", " line\nsecond line"}) {
+				t.Errorf("deltas = %q", deltas)
 			}
 		})
 	}

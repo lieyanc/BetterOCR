@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/lieyanc/BetterOCR/internal/arbiter"
 	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/model"
 	"github.com/lieyanc/BetterOCR/internal/pipeline"
@@ -39,6 +41,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("POST /api/ocr", s.handleOCR)
+	mux.HandleFunc("POST /api/ocr/stream", s.handleOCRStream)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "未知接口: "+r.URL.Path)
 	})
@@ -95,50 +98,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 // handleOCR accepts an image and configured model references. Connections and
 // credentials are resolved exclusively from the server-side configuration.
 func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxImageBytes)
-	if err := r.ParseMultipartForm(maxImageBytes); err != nil {
-		writeErr(w, http.StatusBadRequest, "解析上传表单失败: "+err.Error())
+	image, runConfig, ok := s.parseOCRRequest(w, r)
+	if !ok {
 		return
-	}
-	file, _, err := r.FormFile("image")
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "缺少图片文件字段 image")
-		return
-	}
-	defer file.Close()
-	image, err := io.ReadAll(file)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "读取图片失败: "+err.Error())
-		return
-	}
-	if ct := http.DetectContentType(image); !strings.HasPrefix(ct, "image/") {
-		writeErr(w, http.StatusBadRequest, "上传内容不是可识别的图片格式: "+ct)
-		return
-	}
-
-	engineRefs := pipeline.SplitList(formOr(r, "engines", strings.Join(s.Config.Engines, ",")))
-	if len(engineRefs) == 0 {
-		writeErr(w, http.StatusBadRequest, "未指定引擎模型(engines)")
-		return
-	}
-	engines, err := s.Config.ResolveMany(engineRefs)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	var arbiterModel *model.Resolved
-	if arbiterRef := formOr(r, "arbiter", s.Config.Arbiter); arbiterRef != "" {
-		resolved, err := s.Config.Resolve(arbiterRef)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		arbiterModel = &resolved
-	}
-	runConfig := pipeline.Config{
-		Engines:    engines,
-		Arbiter:    arbiterModel,
-		HTTPClient: s.HTTPClient,
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
@@ -149,6 +111,116 @@ func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, final)
+}
+
+type streamEvent struct {
+	Type   string         `json:"type"`
+	Stage  string         `json:"stage,omitempty"`
+	Agent  string         `json:"agent,omitempty"`
+	Text   string         `json:"text,omitempty"`
+	Result *arbiter.Final `json:"result,omitempty"`
+	Error  string         `json:"error,omitempty"`
+}
+
+// handleOCRStream emits newline-delimited JSON fragments as each upstream
+// model generates text, followed by one result event with the fused output.
+func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
+	image, runConfig, ok := s.parseOCRRequest(w, r)
+	if !ok {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	encoder := json.NewEncoder(w)
+	controller := http.NewResponseController(w)
+	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
+	defer cancel()
+	var eventMu sync.Mutex
+	streamOK := true
+	writeEvent := func(event streamEvent) {
+		eventMu.Lock()
+		defer eventMu.Unlock()
+		if !streamOK {
+			return
+		}
+		if err := encoder.Encode(event); err != nil {
+			streamOK = false
+			cancel()
+			return
+		}
+		if err := controller.Flush(); err != nil {
+			streamOK = false
+			cancel()
+			return
+		}
+		if event.Type == "result" || event.Type == "error" {
+			streamOK = false
+		}
+	}
+
+	writeEvent(streamEvent{Type: "start"})
+	runConfig.OnDelta = func(delta pipeline.Delta) {
+		writeEvent(streamEvent{
+			Type: "delta", Stage: delta.Stage, Agent: delta.Agent, Text: delta.Text,
+		})
+	}
+	final, err := pipeline.Run(ctx, runConfig, image)
+	if err != nil {
+		writeEvent(streamEvent{Type: "error", Error: err.Error()})
+		return
+	}
+	writeEvent(streamEvent{Type: "result", Result: &final})
+}
+
+func (s *Server) parseOCRRequest(w http.ResponseWriter, r *http.Request) ([]byte, pipeline.Config, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxImageBytes)
+	if err := r.ParseMultipartForm(maxImageBytes); err != nil {
+		writeErr(w, http.StatusBadRequest, "解析上传表单失败: "+err.Error())
+		return nil, pipeline.Config{}, false
+	}
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "缺少图片文件字段 image")
+		return nil, pipeline.Config{}, false
+	}
+	defer file.Close()
+	image, err := io.ReadAll(file)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "读取图片失败: "+err.Error())
+		return nil, pipeline.Config{}, false
+	}
+	if ct := http.DetectContentType(image); !strings.HasPrefix(ct, "image/") {
+		writeErr(w, http.StatusBadRequest, "上传内容不是可识别的图片格式: "+ct)
+		return nil, pipeline.Config{}, false
+	}
+
+	engineRefs := pipeline.SplitList(formOr(r, "engines", strings.Join(s.Config.Engines, ",")))
+	if len(engineRefs) == 0 {
+		writeErr(w, http.StatusBadRequest, "未指定引擎模型(engines)")
+		return nil, pipeline.Config{}, false
+	}
+	engines, err := s.Config.ResolveMany(engineRefs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return nil, pipeline.Config{}, false
+	}
+	var arbiterModel *model.Resolved
+	if arbiterRef := formOr(r, "arbiter", s.Config.Arbiter); arbiterRef != "" {
+		resolved, err := s.Config.Resolve(arbiterRef)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return nil, pipeline.Config{}, false
+		}
+		arbiterModel = &resolved
+	}
+	return image, pipeline.Config{
+		Engines:    engines,
+		Arbiter:    arbiterModel,
+		HTTPClient: s.HTTPClient,
+	}, true
 }
 
 // formOr 返回表单字段值;字段未出现时用默认值。
