@@ -104,7 +104,7 @@ func serverConfig(baseURL, apiKey string) config.Config {
 
 // TestOCREndToEnd 走完整链路:multipart 上传 → 双引擎并发 → 共识融合 → JSON。
 func TestOCREndToEnd(t *testing.T) {
-	upstream, auths := fakeUpstream(`[{"text":"hello world","confidence":0.9},{"text":"second line","confidence":0.8}]`)
+	upstream, auths := fakeUpstream("hello world\nsecond line")
 	defer upstream.Close()
 
 	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
@@ -122,9 +122,9 @@ func TestOCREndToEnd(t *testing.T) {
 	if final.Text != "hello world\nsecond line" {
 		t.Errorf("text = %q", final.Text)
 	}
-	// 两引擎一致:每行 1-(0.1*0.1)=0.99 与 1-(0.2*0.2)=0.96,均值 0.975
-	if final.Confidence != 0.975 {
-		t.Errorf("confidence = %v, want 0.975", final.Confidence)
+	// 两个引擎逐字一致,两行都是 2/2 共识;置信度由结构信号推导,不来自模型
+	if final.Confidence != 0.9239 {
+		t.Errorf("confidence = %v, want 0.9239 (2-of-2 consensus)", final.Confidence)
 	}
 	if s := final.Stats; s.Engines != 2 || s.ConsensusRows != 2 || s.FailedEngines != 0 {
 		t.Errorf("stats = %+v", s)
@@ -145,7 +145,7 @@ func TestOCREndToEnd(t *testing.T) {
 // TestOCRRequestCannotOverrideProviderConnection verifies that browser fields
 // cannot redirect requests or replace server-side credentials.
 func TestOCRRequestCannotOverrideProviderConnection(t *testing.T) {
-	upstream, auths := fakeUpstream(`[{"text":"x","confidence":1}]`)
+	upstream, auths := fakeUpstream("x")
 	defer upstream.Close()
 
 	srv := &Server{Config: serverConfig(upstream.URL, "server-key")}
@@ -268,5 +268,71 @@ func TestStaticHandlerUnbuilt(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "npm") {
 		t.Errorf("unbuilt = %d %q", rec.Code, rec.Body)
+	}
+}
+
+// TestOCREscalationEndToEnd 走一遍真正有分歧的链路:两个引擎读出不同的第二行,
+// 仲裁模型按 "#<row> <text>" 纯文本格式裁定。这是唯一一处能同时验证
+// 引擎的按行输出、分歧提示词与仲裁回包格式在真实 HTTP 上串得起来的测试。
+func TestOCREscalationEndToEnd(t *testing.T) {
+	var mu sync.Mutex
+	var arbiterPrompt string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		content := map[string]string{
+			"tiny-a": "shared first line\ninv0ice 042",
+			"tiny-b": "shared first line\ninvoice O42",
+			"big":    "#1 invoice 042", // 仲裁器只回分歧行
+		}[req.Model]
+		if req.Model == "big" {
+			mu.Lock()
+			arbiterPrompt = string(req.Messages[len(req.Messages)-1].Content)
+			mu.Unlock()
+		}
+		body, _ := json.Marshal(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		})
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+
+	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
+	rec := postOCR(t, srv.Handler(), testPNG(t), map[string]string{
+		"engines": "test/tiny-a,test/tiny-b",
+		"arbiter": "test/big",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+
+	var final arbiter.Final
+	if err := json.Unmarshal(rec.Body.Bytes(), &final); err != nil {
+		t.Fatal(err)
+	}
+	if final.Text != "shared first line\ninvoice 042" {
+		t.Errorf("text = %q", final.Text)
+	}
+	if s := final.Stats; s.Rows != 2 || s.ConsensusRows != 1 || s.EscalatedRows != 1 || s.EscalationErr != "" {
+		t.Errorf("stats = %+v, want 1 consensus + 1 escalated", s)
+	}
+	// 仲裁裁定不同于任何候选(两家都读错了),没有旁证 → solo 档
+	if l := final.Lines[1]; l.Source != arbiter.SourceEscalated || l.Confidence != 0.80 {
+		t.Errorf("escalated line = %+v, want solo-tier confidence", l)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, want := range []string{"#1", "shared first line", "inv0ice 042", "invoice O42"} {
+		if !strings.Contains(arbiterPrompt, want) {
+			t.Errorf("arbiter prompt missing %q, got %s", want, arbiterPrompt)
+		}
 	}
 }

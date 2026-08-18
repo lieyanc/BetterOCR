@@ -1,13 +1,9 @@
 // 与 Go 端 JSON 结构一一对应(见 internal/agent、internal/arbiter、internal/server)。
 
-export interface Line {
-  text: string
-  confidence: number
-}
-
 export interface EngineResult {
   agent: string
-  lines?: Line[]
+  /** 引擎的原始识别行,只有文本——置信度由融合层从结构信号推导 */
+  lines?: string[]
   latency_ms: number
   err?: string
 }

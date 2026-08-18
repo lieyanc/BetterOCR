@@ -10,7 +10,7 @@ import (
 // fakeAgent 是仅测试用的 Agent 假实现。
 type fakeAgent struct {
 	name      string
-	lines     []Line
+	lines     []string
 	delay     time.Duration
 	ignoreCtx bool // 模拟不尊重 ctx 的实现
 	fail      error
@@ -73,7 +73,7 @@ func TestRegisterDuplicate(t *testing.T) {
 
 func TestRunConcurrentCollects(t *testing.T) {
 	reg := NewRegistry()
-	reg.MustRegister(&fakeAgent{name: "ok", lines: []Line{{Text: "hi", Confidence: 0.9}}})
+	reg.MustRegister(&fakeAgent{name: "ok", lines: []string{"hi"}})
 	reg.MustRegister(&fakeAgent{name: "sad", fail: errors.New("nope")})
 
 	results := NewCoordinator(reg).RunConcurrent(context.Background(), nil)
@@ -93,7 +93,7 @@ func TestRunConcurrentCollects(t *testing.T) {
 // 即使某个 Agent 不尊重 ctx 也不阻塞流水线。
 func TestRunConcurrentEarlyReturn(t *testing.T) {
 	reg := NewRegistry()
-	reg.MustRegister(&fakeAgent{name: "fast", lines: []Line{{Text: "quick", Confidence: 1}}})
+	reg.MustRegister(&fakeAgent{name: "fast", lines: []string{"quick"}})
 	reg.MustRegister(&fakeAgent{name: "stuck", delay: 2 * time.Second, ignoreCtx: true})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)

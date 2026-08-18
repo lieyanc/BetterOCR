@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/lieyanc/BetterOCR/internal/agent"
@@ -34,40 +35,26 @@ func (v *VisionVLM) Name() string { return v.AgentName }
 
 const ocrSystem = `You are an OCR engine. Transcribe ALL text visible in the image, line by line, in natural reading order.
 
-Output ONLY a JSON array, no markdown fences, no commentary. One element per text line:
-[{"text": "...", "confidence": 0.95}, ...]
+Output the transcription as plain text: one output line per line of text in the image. Nothing else.
 
 Rules:
 - Preserve characters exactly as printed: case, punctuation, digits, full-width/half-width forms.
 - Do not merge separate lines and do not split a single line.
-- "confidence" is your certainty in [0,1] that the line is transcribed exactly.
-- If the image contains no text, output [].`
+- Do not add line numbers, bullets, markdown, code fences, or any commentary.
+- If the image contains no text, output nothing at all.`
 
 // Recognize implements agent.Agent.
+//
+// 纯文本输出没有"解析失败"这一说,代价是模型的寒暄(比如开头一句
+// "Here is the transcription:")会混进行里。这里不做启发式拦截——拦不准。
+// 它会成为只有一个引擎产出的孤行,在融合层进入仲裁,由仲裁器看图判定
+// "不存在于图中"而丢弃。让架构处理噪声,比让正则去猜可靠。
 func (v *VisionVLM) Recognize(ctx context.Context, image []byte) (agent.Result, error) {
 	content, err := vision(ctx, v.Model, v.Client, ocrSystem, "Transcribe the image.", image)
 	if err != nil {
 		return agent.Result{}, err
 	}
-	raw, err := extractJSON(content)
-	if err != nil {
-		return agent.Result{}, err
-	}
-	var parsed []struct {
-		Text       string  `json:"text"`
-		Confidence float64 `json:"confidence"`
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return agent.Result{}, fmt.Errorf("解析模型输出失败: %w", err)
-	}
-	lines := make([]agent.Line, 0, len(parsed))
-	for _, p := range parsed {
-		if strings.TrimSpace(p.Text) == "" {
-			continue
-		}
-		lines = append(lines, agent.Line{Text: p.Text, Confidence: p.Confidence})
-	}
-	return agent.Result{Lines: lines}, nil
+	return agent.Result{Lines: splitLines(content)}, nil
 }
 
 // VisionEscalator uses a configured multimodal model to resolve disputed rows.
@@ -88,14 +75,15 @@ func (e *VisionEscalator) Name() string {
 
 const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several fast OCR engines transcribed the same image; most lines agree, but the rows listed below are disputed. Look at the image and decide the correct text for each disputed row.
 
-Output ONLY a JSON array, no markdown fences, no commentary:
-[{"row": 3, "text": "the correct text", "confidence": 0.98}, ...]
+Output one plain-text line per disputed row, in exactly this form:
+
+#<row> <the correct text>
 
 Rules:
-- Return exactly one element per disputed row, keeping the given row numbers.
-- Read the actual image; do not simply pick the most popular candidate.
-- If a disputed line does not actually exist in the image, return an empty string for "text".
-- "confidence" is your certainty in [0,1].`
+- Emit exactly one line per disputed row, reusing the row numbers given below.
+- Read the actual image; do not simply pick the most common candidate.
+- If a disputed row does not actually exist in the image, emit "#<row>" with nothing after it.
+- Do not add commentary, markdown, or code fences.`
 
 // Resolve implements arbiter.Escalator and batches all disputed rows in one call.
 func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []arbiter.Dispute) ([]arbiter.Resolution, error) {
@@ -103,39 +91,63 @@ func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []
 	if err != nil {
 		return nil, err
 	}
-	raw, err := extractJSON(content)
-	if err != nil {
-		return nil, err
+	var out []arbiter.Resolution
+	for _, line := range strings.Split(stripFences(content), "\n") {
+		if row, text, ok := parseRowLine(line); ok {
+			out = append(out, arbiter.Resolution{Row: row, Text: text})
+		}
 	}
-	var parsed []struct {
-		Row        int     `json:"row"`
-		Text       string  `json:"text"`
-		Confidence float64 `json:"confidence"`
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("解析仲裁输出失败: %w", err)
-	}
-	out := make([]arbiter.Resolution, 0, len(parsed))
-	for _, p := range parsed {
-		out = append(out, arbiter.Resolution{Row: p.Row, Text: p.Text, Confidence: p.Confidence})
+	// 一行都认不出来是真失败,必须报错:静默返回空会让所有分歧行悄悄
+	// 走本地兜底,而 Stats.EscalationErr 是空的——问题被藏起来了。
+	if len(out) == 0 {
+		return nil, fmt.Errorf("仲裁输出中没有 \"#<row> <text>\" 形式的行: %.200s", content)
 	}
 	return out, nil
+}
+
+// parseRowLine 解析一行 "#<row> <text>"。行号后必须紧跟空白或直接结束,
+// 以免把正文里的 "#1234.5" 误读成行号;认不出的行(寒暄、空行)直接忽略。
+// "#<row>" 后面为空表示仲裁器判定该行不存在于图中。
+func parseRowLine(s string) (int, string, bool) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "#") {
+		return 0, "", false
+	}
+	rest := s[1:]
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	if digits == 0 {
+		return 0, "", false
+	}
+	row, err := strconv.Atoi(rest[:digits])
+	if err != nil {
+		return 0, "", false
+	}
+	text := rest[digits:]
+	if text != "" && text[0] != ' ' && text[0] != '\t' {
+		return 0, "", false
+	}
+	return row, strings.TrimSpace(text), true
 }
 
 func disputesPrompt(disputes []arbiter.Dispute) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Disputed rows (%d):\n", len(disputes))
 	for _, d := range disputes {
-		fmt.Fprintf(&sb, "\nrow %d", d.Row)
+		fmt.Fprintf(&sb, "\n#%d", d.Row)
 		if d.Before != "" || d.After != "" {
 			fmt.Fprintf(&sb, " (between %q and %q)", d.Before, d.After)
 		}
 		sb.WriteString(":\n")
+		// 候选只列文本,不列任何"票数"或"置信度"——上面刚要求它看图判断,
+		// 再递上一个人气指标就是在给它反向锚点。
 		for _, c := range d.Candidates {
-			fmt.Fprintf(&sb, "  - engine %q (confidence %.2f): %q\n", c.Agent, c.Confidence, c.Text)
+			fmt.Fprintf(&sb, "  - engine %q read: %q\n", c.Agent, c.Text)
 		}
 	}
-	sb.WriteString("\nReturn the corrected text for each row as specified.")
+	sb.WriteString("\nReturn one \"#<row> <text>\" line per disputed row.")
 	return sb.String()
 }
 
@@ -431,12 +443,32 @@ func textFromContent(raw json.RawMessage) string {
 	return strings.Join(texts, "\n")
 }
 
-// extractJSON tolerates optional fences or prose surrounding a JSON array.
-func extractJSON(s string) ([]byte, error) {
-	start := strings.Index(s, "[")
-	end := strings.LastIndex(s, "]")
-	if start < 0 || end <= start {
-		return nil, fmt.Errorf("模型输出中未找到 JSON 数组: %.200s", s)
+// splitLines 把模型的纯文本输出切成行:去掉整体包裹的 markdown 围栏,
+// 丢弃空行,每行去首尾空白。留白不是识别分歧,不值得进入对齐。
+func splitLines(s string) []string {
+	raw := strings.Split(stripFences(s), "\n")
+	lines := make([]string, 0, len(raw))
+	for _, line := range raw {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
 	}
-	return []byte(s[start : end+1]), nil
+	return lines
+}
+
+// stripFences 去掉整体包裹输出的 markdown 代码围栏(```、```text 等)。
+func stripFences(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	i := strings.IndexByte(s, '\n')
+	if i < 0 {
+		return ""
+	}
+	s = s[i+1:]
+	if j := strings.LastIndex(s, "```"); j >= 0 {
+		s = s[:j]
+	}
+	return strings.TrimSpace(s)
 }

@@ -9,30 +9,24 @@ import (
 	"time"
 )
 
-// Line 是识别结果中的一行文本。行是融合的最小单元:
-// 只有行级结构才能让仲裁发生在低于整篇文本的粒度上,
-// 融合准确率才有机会超过最好的单个引擎。
-type Line struct {
-	// Text 是该行的原始识别文本。
-	Text string `json:"text"`
-	// Confidence 是引擎对该行的自报置信度,范围 [0,1]。
-	// 不同引擎的置信度刻度不可比,仲裁器只在同引擎内部使用它。
-	Confidence float64 `json:"confidence"`
-}
-
 // Result 是单个 Agent 的一次识别结果。
 type Result struct {
 	// Agent 是产出该结果的 Agent 名称,由 Coordinator 填写。
 	Agent string `json:"agent"`
-	// Lines 是按阅读顺序排列的识别行。
-	Lines []Line `json:"lines,omitempty"`
+	// Lines 是按阅读顺序排列的识别行,一个元素对应图中一条物理行。
+	// 行是融合的最小单元:只有行级结构才能让仲裁发生在低于整篇文本的
+	// 粒度上,融合准确率才有机会超过最好的单个引擎。
+	//
+	// 这里只有文本,不带任何引擎自报的指标。可信度由融合层从结构信号
+	// (多少引擎逐字一致、多少持异议)推导,见 internal/arbiter。
+	Lines []string `json:"lines,omitempty"`
 	// LatencyMS 是本次识别耗时(毫秒)。
 	LatencyMS int64 `json:"latency_ms"`
 	// Err 为非空时表示该 Agent 识别失败,此时 Lines 无效。
 	Err string `json:"err,omitempty"`
 }
 
-// Agent 是一个 OCR 引擎的抽象。实现方应尽量按行返回带置信度的结果。
+// Agent 是一个 OCR 引擎的抽象。实现方应按图中的物理行切分返回文本。
 type Agent interface {
 	// Name 返回 Agent 唯一名称,如 "tesseract"、"claude-haiku-4-5#1"。
 	Name() string

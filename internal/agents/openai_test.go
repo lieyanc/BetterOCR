@@ -9,6 +9,7 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -42,7 +43,8 @@ func chatContent(content string) []byte {
 }
 
 func TestVLMRecognizeAcrossAPIs(t *testing.T) {
-	const content = "Sure! ```json\n[{\"text\":\"你好,世界\",\"confidence\":0.91},{\"text\":\"   \",\"confidence\":0.5},{\"text\":\"second line\",\"confidence\":0.82}]\n```"
+	// 带围栏、含空行的纯文本输出:围栏应被剥掉,空行不成行
+	const content = "```\n你好,世界\n   \n second line \n```"
 	tests := []struct {
 		name      string
 		api       model.API
@@ -129,8 +131,8 @@ func TestVLMRecognizeAcrossAPIs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(result.Lines) != 2 || result.Lines[0].Text != "你好,世界" || result.Lines[1].Confidence != 0.82 {
-				t.Errorf("lines = %+v", result.Lines)
+			if len(result.Lines) != 2 || result.Lines[0] != "你好,世界" || result.Lines[1] != "second line" {
+				t.Errorf("lines = %q", result.Lines)
 			}
 		})
 	}
@@ -146,7 +148,7 @@ func TestVLMNoKeySendsNoAuthHeader(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Errorf("Authorization = %q", got)
 		}
-		_, _ = w.Write(chatContent(`[{"text":"x","confidence":1}]`))
+		_, _ = w.Write(chatContent("x"))
 	}))
 	defer srv.Close()
 
@@ -197,8 +199,9 @@ func TestEscalatorResolve(t *testing.T) {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(r.Body)
 		gotBody = buf.String()
+		// 夹带寒暄与围栏,以及一行判定"图中不存在"的空裁定
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"output_text": "```json\n[{\"row\":3,\"text\":\"fixed line\",\"confidence\":0.97}]\n```",
+			"output_text": "Sure, here you go:\n```\n#3 fixed line\n#4\n```",
 		})
 	}))
 	defer srv.Close()
@@ -210,43 +213,88 @@ func TestEscalatorResolve(t *testing.T) {
 	rs, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{{
 		Row: 3, Before: "ctx above", After: "ctx below",
 		Candidates: []arbiter.Candidate{
-			{Agent: "a#1", Text: "f1xed line", Confidence: 0.7},
-			{Agent: "b#1", Text: "fixed 1ine", Confidence: 0.8},
+			{Agent: "a#1", Text: "f1xed line"},
+			{Agent: "b#1", Text: "fixed 1ine"},
 		},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"row 3", "ctx above", "ctx below", "f1xed line", "fixed 1ine", "data:image/png;base64,"} {
+	for _, want := range []string{"#3", "ctx above", "ctx below", "f1xed line", "fixed 1ine", "data:image/png;base64,"} {
 		if !strings.Contains(gotBody, want) {
 			t.Errorf("request body missing %q", want)
 		}
 	}
-	if len(rs) != 1 || rs[0] != (arbiter.Resolution{Row: 3, Text: "fixed line", Confidence: 0.97}) {
-		t.Errorf("resolutions = %+v", rs)
+	// 候选清单不得夹带票数/置信度之类的人气信号,否则与"看图判断"的要求自相矛盾
+	if strings.Contains(gotBody, "confidence") {
+		t.Error("dispute prompt must not hand the arbiter a confidence signal")
+	}
+	want := []arbiter.Resolution{{Row: 3, Text: "fixed line"}, {Row: 4, Text: ""}}
+	if !reflect.DeepEqual(rs, want) {
+		t.Errorf("resolutions = %+v, want %+v", rs, want)
 	}
 }
 
-func TestExtractJSON(t *testing.T) {
-	cases := []struct {
-		in, want string
-		wantErr  bool
-	}{
-		{in: "```json\n[1,2]\n```", want: "[1,2]"},
-		{in: "prefix [\"a\"] suffix", want: "[\"a\"]"},
-		{in: "no array here", wantErr: true},
-		{in: "]] then [[", wantErr: true},
+// TestEscalatorRejectsUnparseableOutput 锁定失败必须显式:一行都认不出来时
+// 报错,让 Stats.EscalationErr 记录下来,而不是静默返回空让分歧行悄悄兜底。
+func TestEscalatorRejectsUnparseableOutput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"output_text": "I could not read the image clearly.",
+		})
+	}))
+	defer srv.Close()
+
+	esc := NewVisionEscalator(resolved(model.APIOpenAIResponses, srv.URL, ""), nil)
+	_, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{{Row: 0}})
+	if err == nil || !strings.Contains(err.Error(), "#<row>") {
+		t.Errorf("err = %v, want a parse failure mentioning the expected form", err)
 	}
-	for _, test := range cases {
-		got, err := extractJSON(test.in)
-		if test.wantErr {
-			if err == nil {
-				t.Errorf("extractJSON(%q) = %q, want error", test.in, got)
+}
+
+func TestSplitLines(t *testing.T) {
+	cases := []struct {
+		name, in string
+		want     []string
+	}{
+		{name: "plain", in: "alpha\nbravo", want: []string{"alpha", "bravo"}},
+		{name: "fenced", in: "```text\nalpha\nbravo\n```", want: []string{"alpha", "bravo"}},
+		{name: "blank and padded", in: "  alpha  \n\n\t\nbravo\n", want: []string{"alpha", "bravo"}},
+		{name: "no text in image", in: "", want: []string{}},
+		{name: "inner backticks kept", in: "a ``` b", want: []string{"a ``` b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := splitLines(tc.in); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("splitLines(%q) = %q, want %q", tc.in, got, tc.want)
 			}
-			continue
-		}
-		if err != nil || string(got) != test.want {
-			t.Errorf("extractJSON(%q) = %q, %v; want %q", test.in, got, err, test.want)
+		})
+	}
+}
+
+func TestParseRowLine(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantRow  int
+		wantText string
+		wantOK   bool
+	}{
+		{in: "#3 fixed line", wantRow: 3, wantText: "fixed line", wantOK: true},
+		{in: "  #12\ttab separated  ", wantRow: 12, wantText: "tab separated", wantOK: true},
+		{in: "#0", wantRow: 0, wantText: "", wantOK: true}, // 判定该行不存在于图中
+		{in: "#7   ", wantRow: 7, wantText: "", wantOK: true},
+		// 没有分隔空白时不猜行号:整行忽略,好过把 "#1234.5 元" 读成 row 1234
+		{in: "#1234.5 元", wantOK: false},
+		{in: "row 3: text", wantOK: false},
+		{in: "#", wantOK: false},
+		{in: "", wantOK: false},
+		{in: "Sure, here you go:", wantOK: false},
+	}
+	for _, tc := range cases {
+		row, text, ok := parseRowLine(tc.in)
+		if ok != tc.wantOK || (ok && (row != tc.wantRow || text != tc.wantText)) {
+			t.Errorf("parseRowLine(%q) = %d, %q, %v; want %d, %q, %v",
+				tc.in, row, text, ok, tc.wantRow, tc.wantText, tc.wantOK)
 		}
 	}
 }

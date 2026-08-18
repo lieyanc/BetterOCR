@@ -8,18 +8,14 @@ import (
 )
 
 func mkres(name string, texts ...string) agent.Result {
-	lines := make([]agent.Line, len(texts))
-	for i, s := range texts {
-		lines[i] = agent.Line{Text: s, Confidence: 0.9}
-	}
-	return agent.Result{Agent: name, Lines: lines}
+	return agent.Result{Agent: name, Lines: texts}
 }
 
 func rowTexts(rows []*row) [][]string {
 	out := make([][]string, len(rows))
 	for i, r := range rows {
 		for _, c := range r.cands {
-			out[i] = append(out[i], c.line.Text)
+			out[i] = append(out[i], c.text)
 		}
 	}
 	return out
@@ -96,12 +92,29 @@ func TestAlignDissimilarSeparateAndDeterministic(t *testing.T) {
 }
 
 func TestRowRepDeterministic(t *testing.T) {
-	r := &row{cands: []cand{
-		{agent: "b", line: agent.Line{Text: "x", Confidence: 0.9}},
-		{agent: "a", line: agent.Line{Text: "y", Confidence: 0.9}},
-	}}
-	// 平局按引擎名字典序
+	// 两个毫不相干的候选,medoid 得分都是 0 —— 平局须按引擎名字典序,
+	// 且与 cands 的排列顺序无关。
+	r := &row{cands: []cand{{agent: "b", text: "x"}, {agent: "a", text: "y"}}}
 	if got := r.rep(); got.agent != "a" {
 		t.Errorf("rep tie-break = %q, want %q", got.agent, "a")
+	}
+}
+
+// TestRowRepPicksMedoid 是这一版的核心改动:代表候选由候选彼此的接近程度
+// 决定,而不是任何自报指标。少数派 c 无论如何都不该代表这个行槽。
+func TestRowRepPicksMedoid(t *testing.T) {
+	r := &row{cands: []cand{
+		{agent: "a", text: "Hello, BetterOCR!"},
+		{agent: "b", text: "Hello, BetterOCR!"},
+		{agent: "c", text: "no relation at all"},
+	}}
+	if got := r.rep(); got.text != "Hello, BetterOCR!" {
+		t.Errorf("rep = %+v, want the majority-shaped candidate", got)
+	}
+
+	// 与顺序无关:把离群值放到最前面,结果不变。
+	shuffled := &row{cands: []cand{r.cands[2], r.cands[0], r.cands[1]}}
+	if got := shuffled.rep(); got.text != "Hello, BetterOCR!" {
+		t.Errorf("rep = %+v, want order-independent medoid", got)
 	}
 }

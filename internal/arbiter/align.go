@@ -2,10 +2,10 @@ package arbiter
 
 import "github.com/lieyanc/BetterOCR/internal/agent"
 
-// cand 是某个行槽上来自单个引擎的候选。
+// cand 是某个行槽上来自单个引擎的候选。每个引擎在一个行槽上至多一条。
 type cand struct {
 	agent string
-	line  agent.Line
+	text  string
 }
 
 // row 是对齐后的一个"行槽",汇集各引擎对同一物理行的候选。
@@ -13,13 +13,25 @@ type row struct {
 	cands []cand
 }
 
-// rep 返回该行的代表候选:置信度最高者,平局按引擎名字典序,保证确定性。
+// rep 返回该行槽的代表候选:medoid——与组内其他候选相似度之和最高的那条。
+//
+// medoid 只用候选彼此的关系推导"谁最不像离群值",不依赖任何引擎自报指标。
+// 三个引擎里两个读作 "Hello" 一个读作 "He110" 时,medoid 必是前者;
+// 换成自报置信度择优,则完全取决于哪个模型更爱写 0.98。
+// 只有两个候选时二者相似度相同,退化为字典序——那时本就没有可用信号。
+//
+// 平局按引擎名字典序,保证结果与 cands 的排列顺序无关、可复现。
 func (r *row) rep() cand {
-	best := r.cands[0]
-	for _, c := range r.cands[1:] {
-		if c.line.Confidence > best.line.Confidence ||
-			(c.line.Confidence == best.line.Confidence && c.agent < best.agent) {
-			best = c
+	best, bestScore := r.cands[0], -1.0
+	for _, c := range r.cands {
+		score := 0.0
+		for _, other := range r.cands {
+			if other.agent != c.agent {
+				score += Similarity(c.text, other.text)
+			}
+		}
+		if score > bestScore || (score == bestScore && c.agent < best.agent) {
+			best, bestScore = c, score
 		}
 	}
 	return best
@@ -47,6 +59,12 @@ const (
 // 阈值的行对才值得配对,边界情况宁可分成两行留给仲裁。
 func mergeResult(rows []*row, res agent.Result, threshold float64) []*row {
 	m, n := len(rows), len(res.Lines)
+	// 行槽锚点在 DP 之前一次性算好:rep 是候选数的平方级开销,
+	// 放进 DP 内层会被重复求值 m×n 次。
+	anchors := make([]string, m)
+	for i, r := range rows {
+		anchors[i] = r.rep().text
+	}
 	dp := make([][]float64, m+1)
 	move := make([][]int8, m+1)
 	for i := range dp {
@@ -61,7 +79,7 @@ func mergeResult(rows []*row, res agent.Result, threshold float64) []*row {
 	}
 	for i := 1; i <= m; i++ {
 		for j := 1; j <= n; j++ {
-			diag := dp[i-1][j-1] + Similarity(rows[i-1].rep().line.Text, res.Lines[j-1].Text) - threshold
+			diag := dp[i-1][j-1] + Similarity(anchors[i-1], res.Lines[j-1]) - threshold
 			up := dp[i-1][j]
 			left := dp[i][j-1]
 			// 固定优先级保证确定性:严格更优才配对。
@@ -98,7 +116,7 @@ func mergeResult(rows []*row, res agent.Result, threshold float64) []*row {
 	for k := len(ops) - 1; k >= 0; k-- {
 		switch ops[k] {
 		case moveDiag:
-			rows[ri].cands = append(rows[ri].cands, cand{agent: res.Agent, line: res.Lines[li]})
+			rows[ri].cands = append(rows[ri].cands, cand{agent: res.Agent, text: res.Lines[li]})
 			out = append(out, rows[ri])
 			ri++
 			li++
@@ -106,7 +124,7 @@ func mergeResult(rows []*row, res agent.Result, threshold float64) []*row {
 			out = append(out, rows[ri])
 			ri++
 		case moveLeft:
-			out = append(out, &row{cands: []cand{{agent: res.Agent, line: res.Lines[li]}}})
+			out = append(out, &row{cands: []cand{{agent: res.Agent, text: res.Lines[li]}}})
 			li++
 		}
 	}

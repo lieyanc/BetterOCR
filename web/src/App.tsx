@@ -600,10 +600,7 @@ function EngineCard({ result }: { result: EngineResult }) {
             {lines.map((l, i) => (
               <li key={i} className="flex items-baseline gap-2">
                 <span className="shrink-0 tabular-nums text-muted-foreground">{i + 1}.</span>
-                <span className="min-w-0 flex-1 break-words">{l.text}</span>
-                <span className="shrink-0 tabular-nums text-muted-foreground">
-                  {pct(l.confidence)}
-                </span>
+                <span className="min-w-0 flex-1 break-words">{l}</span>
               </li>
             ))}
           </ol>
