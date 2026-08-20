@@ -117,6 +117,7 @@ type streamEvent struct {
 	Type   string         `json:"type"`
 	Stage  string         `json:"stage,omitempty"`
 	Agent  string         `json:"agent,omitempty"`
+	Kind   string         `json:"kind,omitempty"`
 	Text   string         `json:"text,omitempty"`
 	Result *arbiter.Final `json:"result,omitempty"`
 	Error  string         `json:"error,omitempty"`
@@ -164,7 +165,7 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 	writeEvent(streamEvent{Type: "start"})
 	runConfig.OnDelta = func(delta pipeline.Delta) {
 		writeEvent(streamEvent{
-			Type: "delta", Stage: delta.Stage, Agent: delta.Agent, Text: delta.Text,
+			Type: "delta", Stage: delta.Stage, Agent: delta.Agent, Kind: delta.Kind, Text: delta.Text,
 		})
 	}
 	final, err := pipeline.Run(ctx, runConfig, image)

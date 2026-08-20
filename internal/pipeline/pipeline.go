@@ -34,6 +34,7 @@ type Config struct {
 type Delta struct {
 	Stage string `json:"stage"`
 	Agent string `json:"agent"`
+	Kind  string `json:"kind"`
 	Text  string `json:"text"`
 }
 
@@ -64,8 +65,8 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 		// Provider and sequence keep names unique even when aliases are repeated.
 		name := fmt.Sprintf("%s · %s#%d", resolved.DisplayName(), resolved.ProviderName(), i+1)
 		vlm := agents.NewVisionVLM(name, resolved, cfg.HTTPClient)
-		vlm.OnDelta = func(text string) {
-			emit(Delta{Stage: StageEngine, Agent: name, Text: text})
+		vlm.OnDelta = func(delta agents.StreamDelta) {
+			emit(Delta{Stage: StageEngine, Agent: name, Kind: string(delta.Kind), Text: delta.Text})
 		}
 		reg.MustRegister(vlm)
 	}
@@ -73,8 +74,8 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	arb := arbiter.New()
 	if cfg.Arbiter != nil {
 		escalator := agents.NewVisionEscalator(*cfg.Arbiter, cfg.HTTPClient)
-		escalator.OnDelta = func(text string) {
-			emit(Delta{Stage: StageArbiter, Agent: escalator.Name(), Text: text})
+		escalator.OnDelta = func(delta agents.StreamDelta) {
+			emit(Delta{Stage: StageArbiter, Agent: escalator.Name(), Kind: string(delta.Kind), Text: delta.Text})
 		}
 		arb.Escalator = escalator
 	}

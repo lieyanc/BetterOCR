@@ -77,6 +77,7 @@ export interface OCRRequest {
 export interface OCRDelta {
   stage: "engine" | "arbiter"
   agent: string
+  kind: "thinking" | "output"
   text: string
 }
 
@@ -84,6 +85,7 @@ interface OCRStreamEvent {
   type: "start" | "delta" | "result" | "error"
   stage?: OCRDelta["stage"]
   agent?: string
+  kind?: OCRDelta["kind"]
   text?: string
   result?: Final
   error?: string
@@ -126,7 +128,12 @@ export async function runOCR(
     switch (event.type) {
       case "delta":
         if (event.stage && event.agent && event.text) {
-          onDelta?.({ stage: event.stage, agent: event.agent, text: event.text })
+          onDelta?.({
+            stage: event.stage,
+            agent: event.agent,
+            kind: event.kind ?? "output",
+            text: event.text,
+          })
         }
         break
       case "result":

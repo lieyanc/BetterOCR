@@ -15,6 +15,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/lieyanc/BetterOCR/internal/agents"
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
 	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/model"
@@ -45,7 +46,9 @@ func TestOCRStreamEmitsDeltasThenResult(t *testing.T) {
 			t.Error("upstream request did not enable streaming")
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect\"}}]}\n\n"))
 		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" carefully\"}}]}\n\n"))
 		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
@@ -78,19 +81,42 @@ func TestOCRStreamEmitsDeltasThenResult(t *testing.T) {
 	if len(events) < 4 || events[0].Type != "start" {
 		t.Fatalf("events = %+v", events)
 	}
-	var deltaText strings.Builder
+	thinkingByAgent := make(map[string]*strings.Builder)
+	outputByAgent := make(map[string]*strings.Builder)
 	for _, event := range events[1 : len(events)-1] {
 		if event.Type != "delta" || event.Stage != pipeline.StageEngine || event.Agent == "" {
 			t.Errorf("unexpected progress event: %+v", event)
 		}
-		deltaText.WriteString(event.Text)
+		if thinkingByAgent[event.Agent] == nil {
+			thinkingByAgent[event.Agent] = &strings.Builder{}
+			outputByAgent[event.Agent] = &strings.Builder{}
+		}
+		switch event.Kind {
+		case string(agents.StreamThinking):
+			thinkingByAgent[event.Agent].WriteString(event.Text)
+		case string(agents.StreamOutput):
+			outputByAgent[event.Agent].WriteString(event.Text)
+		default:
+			t.Errorf("unexpected delta kind: %+v", event)
+		}
 	}
-	if !strings.Contains(deltaText.String(), "hello") || !strings.Contains(deltaText.String(), " world") {
-		t.Errorf("streamed text = %q", deltaText.String())
+	if len(thinkingByAgent) != 2 {
+		t.Fatalf("thinking grouped into %d agents, want 2", len(thinkingByAgent))
+	}
+	for agent, thinking := range thinkingByAgent {
+		if thinking.String() != "inspect carefully" {
+			t.Errorf("%s thinking = %q", agent, thinking.String())
+		}
+		if outputByAgent[agent].String() != "hello world" {
+			t.Errorf("%s output = %q", agent, outputByAgent[agent].String())
+		}
 	}
 	last := events[len(events)-1]
 	if last.Type != "result" || last.Result == nil || last.Result.Text != "hello world" {
 		t.Errorf("last event = %+v", last)
+	}
+	if strings.Contains(last.Result.Text, "inspect") {
+		t.Errorf("thinking leaked into final result: %q", last.Result.Text)
 	}
 }
 

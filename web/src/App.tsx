@@ -3,6 +3,7 @@ import {
   AlertCircle,
   ArrowRight,
   Bot,
+  BrainCircuit,
   Check,
   Copy,
   ImagePlus,
@@ -71,6 +72,13 @@ const confColor = (c: number) =>
 
 const selectionStorageKey = "betterocr-model-selection"
 
+interface LiveOutput {
+  stage: OCRDelta["stage"]
+  agent: string
+  thinking: string
+  answer: string
+}
+
 export default function App() {
   // —— 主题 ——
   const [dark, setDark] = useState(() =>
@@ -88,7 +96,7 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0)
   const [error, setError] = useState("")
   const [result, setResult] = useState<Final | null>(null)
-  const [liveOutputs, setLiveOutputs] = useState<OCRDelta[]>([])
+  const [liveOutputs, setLiveOutputs] = useState<LiveOutput[]>([])
   const abortRef = useRef<AbortController | null>(null)
 
   // —— 服务端模型目录与本地选择 ——
@@ -226,9 +234,27 @@ export default function App() {
               (item) =>
                 item.stage === delta.stage && item.agent === delta.agent,
             )
-            if (index < 0) return [...current, delta]
+            if (index < 0) {
+              return [
+                ...current,
+                {
+                  stage: delta.stage,
+                  agent: delta.agent,
+                  thinking: delta.kind === "thinking" ? delta.text : "",
+                  answer: delta.kind === "output" ? delta.text : "",
+                },
+              ]
+            }
             return current.map((item, i) =>
-              i === index ? { ...item, text: item.text + delta.text } : item,
+              i === index
+                ? {
+                    ...item,
+                    thinking:
+                      item.thinking + (delta.kind === "thinking" ? delta.text : ""),
+                    answer:
+                      item.answer + (delta.kind === "output" ? delta.text : ""),
+                  }
+                : item,
             )
           })
         },
@@ -469,7 +495,7 @@ export default function App() {
   )
 }
 
-function LiveOutputView({ outputs }: { outputs: OCRDelta[] }) {
+function LiveOutputView({ outputs }: { outputs: LiveOutput[] }) {
   return (
     <section className="flex flex-col gap-3" aria-label="模型实时输出">
       <div className="flex items-center gap-2">
@@ -497,12 +523,15 @@ function LiveOutputView({ outputs }: { outputs: OCRDelta[] }) {
   )
 }
 
-function LiveOutputCard({ output }: { output: OCRDelta }) {
-  const textRef = useRef<HTMLPreElement>(null)
+function LiveOutputCard({ output }: { output: LiveOutput }) {
+  const thinkingRef = useRef<HTMLPreElement>(null)
+  const answerRef = useRef<HTMLPreElement>(null)
   useEffect(() => {
-    const element = textRef.current
-    if (element) element.scrollTop = element.scrollHeight
-  }, [output.text])
+    const thinking = thinkingRef.current
+    const answer = answerRef.current
+    if (thinking) thinking.scrollTop = thinking.scrollHeight
+    if (answer) answer.scrollTop = answer.scrollHeight
+  }, [output.thinking, output.answer])
 
   return (
     <Card className="gap-3 py-4">
@@ -510,26 +539,40 @@ function LiveOutputCard({ output }: { output: OCRDelta }) {
         <CardTitle className="truncate text-sm font-medium" title={output.agent}>
           {output.agent}
         </CardTitle>
-        <CardAction>
-          <Badge
-            variant="outline"
-            className={
-              output.stage === "arbiter"
-                ? sourceMeta.escalated.cls
-                : "border-sky-500/25 bg-sky-500/10 text-sky-700 dark:text-sky-400"
-            }
-          >
+        <CardAction className="flex items-center gap-1.5">
+          {output.thinking && (
+            <Badge variant="outline">
+              <BrainCircuit data-icon="inline-start" />
+              思考
+            </Badge>
+          )}
+          <Badge variant={output.stage === "arbiter" ? "default" : "secondary"}>
             {output.stage === "arbiter" ? "仲裁" : "基础模型"}
           </Badge>
         </CardAction>
       </CardHeader>
-      <CardContent className="px-4">
-        <pre
-          ref={textRef}
-          className="h-40 overflow-auto whitespace-pre-wrap break-words font-sans text-sm leading-6"
-        >
-          {output.text}
-        </pre>
+      <CardContent className="grid gap-3 px-4">
+        <section className="grid gap-1.5">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+            <BrainCircuit className="size-3.5" />
+            思考过程
+          </div>
+          <pre
+            ref={thinkingRef}
+            className="h-24 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 p-3 font-sans text-xs leading-5 text-muted-foreground"
+          >
+            {output.thinking || "未提供思考过程"}
+          </pre>
+        </section>
+        <section className="grid gap-1.5">
+          <div className="text-xs font-medium text-muted-foreground">主输出</div>
+          <pre
+            ref={answerRef}
+            className="h-32 overflow-auto whitespace-pre-wrap break-words rounded-md border p-3 font-sans text-sm leading-6"
+          >
+            {output.answer || "等待主输出"}
+          </pre>
+        </section>
       </CardContent>
     </Card>
   )

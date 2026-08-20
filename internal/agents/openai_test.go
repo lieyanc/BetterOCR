@@ -149,14 +149,20 @@ func TestVLMStreamingAcrossAPIs(t *testing.T) {
 	}{
 		{
 			name: "openai chat", api: model.APIOpenAIChatCompletions,
-			events: "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n" +
+			events: "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect\"}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" carefully\"}}]}\n\n" +
 				"data: {\"choices\":[{\"delta\":{\"content\":\" line\\nsecond line\"}}]}\n\n" +
 				"data: [DONE]\n\n",
 		},
 		{
 			name: "openai responses", api: model.APIOpenAIResponses,
-			events: "event: response.output_text.delta\n" +
+			events: "event: response.reasoning_summary_text.delta\n" +
+				"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"inspect\"}\n\n" +
+				"event: response.output_text.delta\n" +
 				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n" +
+				"event: response.reasoning_text.delta\n" +
+				"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\" carefully\"}\n\n" +
 				"event: response.output_text.delta\n" +
 				"data: {\"type\":\"response.output_text.delta\",\"delta\":\" line\\nsecond line\"}\n\n" +
 				"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
@@ -164,7 +170,11 @@ func TestVLMStreamingAcrossAPIs(t *testing.T) {
 		{
 			name: "anthropic", api: model.APIAnthropicMessages,
 			events: "event: content_block_delta\n" +
+				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"inspect\"}}\n\n" +
+				"event: content_block_delta\n" +
 				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n" +
+				"event: content_block_delta\n" +
+				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" carefully\"}}\n\n" +
 				"event: content_block_delta\n" +
 				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" line\\nsecond line\"}}\n\n" +
 				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
@@ -187,8 +197,8 @@ func TestVLMStreamingAcrossAPIs(t *testing.T) {
 			defer srv.Close()
 
 			vlm := NewVisionVLM("vision#1", resolved(tt.api, srv.URL, ""), nil)
-			var deltas []string
-			vlm.OnDelta = func(delta string) { deltas = append(deltas, delta) }
+			var deltas []StreamDelta
+			vlm.OnDelta = func(delta StreamDelta) { deltas = append(deltas, delta) }
 			result, err := vlm.Recognize(context.Background(), testPNG(t))
 			if err != nil {
 				t.Fatal(err)
@@ -196,8 +206,71 @@ func TestVLMStreamingAcrossAPIs(t *testing.T) {
 			if !reflect.DeepEqual(result.Lines, []string{"first line", "second line"}) {
 				t.Errorf("lines = %q", result.Lines)
 			}
-			if !reflect.DeepEqual(deltas, []string{"first", " line\nsecond line"}) {
+			wantDeltas := []StreamDelta{
+				{Kind: StreamThinking, Text: "inspect"},
+				{Kind: StreamOutput, Text: "first"},
+				{Kind: StreamThinking, Text: " carefully"},
+				{Kind: StreamOutput, Text: " line\nsecond line"},
+			}
+			if !reflect.DeepEqual(deltas, wantDeltas) {
 				t.Errorf("deltas = %q", deltas)
+			}
+		})
+	}
+}
+
+func TestVLMJSONSeparatesThinkingFromOutput(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      model.API
+		response any
+	}{
+		{
+			name: "openai chat", api: model.APIOpenAIChatCompletions,
+			response: map[string]any{"choices": []any{map[string]any{"message": map[string]any{
+				"reasoning_content": "inspect carefully", "content": "first line\nsecond line",
+			}}}},
+		},
+		{
+			name: "openai responses", api: model.APIOpenAIResponses,
+			response: map[string]any{"output": []any{map[string]any{
+				"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "inspect carefully"}},
+			}, map[string]any{
+				"type": "message", "content": []any{map[string]any{"type": "output_text", "text": "first line\nsecond line"}},
+			}}},
+		},
+		{
+			name: "anthropic", api: model.APIAnthropicMessages,
+			response: map[string]any{"content": []any{
+				map[string]any{"type": "thinking", "thinking": "inspect carefully"},
+				map[string]any{"type": "text", "text": "first line\nsecond line"},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(tt.response)
+			}))
+			defer srv.Close()
+
+			vlm := NewVisionVLM("vision#1", resolved(tt.api, srv.URL, ""), nil)
+			var deltas []StreamDelta
+			vlm.OnDelta = func(delta StreamDelta) { deltas = append(deltas, delta) }
+			result, err := vlm.Recognize(context.Background(), testPNG(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(result.Lines, []string{"first line", "second line"}) {
+				t.Errorf("lines = %q", result.Lines)
+			}
+			want := []StreamDelta{
+				{Kind: StreamThinking, Text: "inspect carefully"},
+				{Kind: StreamOutput, Text: "first line\nsecond line"},
+			}
+			if !reflect.DeepEqual(deltas, want) {
+				t.Errorf("deltas = %#v, want %#v", deltas, want)
 			}
 		})
 	}
