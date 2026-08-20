@@ -2,29 +2,36 @@
 
 export interface EngineResult {
   agent: string
-  /** 引擎的原始识别行,只有文本——置信度由融合层从结构信号推导 */
-  lines?: string[]
+  /** 模型返回的完整 OCR 文本,不要求遵循物理行 */
+  text?: string
   latency_ms: number
   err?: string
 }
 
-export type LineSource = "consensus" | "escalated" | "fallback"
+export interface Candidate {
+  agent: string
+  text: string
+}
 
-export interface FinalLine {
+export type SegmentSource = "consensus" | "escalated" | "fallback" | "user"
+
+export interface FinalSegment {
   text: string
   confidence: number
-  source: LineSource
+  source: SegmentSource
   from: string[]
+  disputed?: boolean
+  candidates?: Candidate[]
 }
 
 export interface Stats {
   engines: number
   failed_engines: number
-  rows: number
-  consensus_rows: number
-  escalated_rows: number
-  fallback_rows: number
-  dropped_rows?: number
+  segments: number
+  consensus_segments: number
+  escalated_segments: number
+  fallback_segments: number
+  dropped_segments?: number
   escalator?: string
   escalation_err?: string
 }
@@ -32,7 +39,7 @@ export interface Stats {
 export interface Final {
   text: string
   confidence: number
-  lines: FinalLine[]
+  segments: FinalSegment[]
   stats: Stats
   candidates: EngineResult[]
 }
@@ -71,6 +78,7 @@ export interface OCRRequest {
   image: File
   engines: string[]
   arbiter: string
+  autoArbitrate: boolean
   signal?: AbortSignal
 }
 
@@ -81,6 +89,20 @@ export interface OCRDelta {
   text: string
 }
 
+export interface Dispute {
+  segment: number
+  before?: string
+  after?: string
+  candidates: Candidate[]
+}
+
+export interface Resolution {
+  segment: number
+  text: string
+  confidence: number
+  from?: string[]
+}
+
 interface OCRStreamEvent {
   type: "start" | "delta" | "result" | "error"
   stage?: OCRDelta["stage"]
@@ -88,6 +110,7 @@ interface OCRStreamEvent {
   kind?: OCRDelta["kind"]
   text?: string
   result?: Final
+  resolutions?: Resolution[]
   error?: string
 }
 
@@ -98,29 +121,67 @@ export async function runOCR(
   const fd = new FormData()
   fd.append("image", req.image)
   fd.append("engines", req.engines.join(","))
-  // arbiter 始终提交:显式的空值表示"清空仲裁",而非回退服务端默认
+  // 显式空值表示清空仲裁模型,而不是回退服务端默认。
   fd.append("arbiter", req.arbiter)
+  fd.append("auto_arbitrate", String(req.autoArbitrate))
 
   const res = await fetch("/api/ocr/stream", {
     method: "POST",
     body: fd,
     signal: req.signal,
   })
-  if (!res.ok) {
-    let msg = `识别请求失败 (HTTP ${res.status})`
-    try {
-      const data = (await res.json()) as { error?: string }
-      if (data.error) msg = data.error
-    } catch {
-      // 非 JSON 错误体,保留默认消息
-    }
-    throw new Error(msg)
+  await assertOK(res, "识别")
+  return consumeStream<Final>(res, onDelta, (event) => event.result)
+}
+
+export interface ArbitrationRequest {
+  image: File
+  arbiter: string
+  disputes: Dispute[]
+  signal?: AbortSignal
+}
+
+export async function runArbitration(
+  req: ArbitrationRequest,
+  onDelta?: (delta: OCRDelta) => void,
+): Promise<Resolution[]> {
+  const fd = new FormData()
+  fd.append("image", req.image)
+  fd.append("arbiter", req.arbiter)
+  fd.append("disputes", JSON.stringify(req.disputes))
+
+  const res = await fetch("/api/arbitrate/stream", {
+    method: "POST",
+    body: fd,
+    signal: req.signal,
+  })
+  await assertOK(res, "仲裁")
+  return consumeStream<Resolution[]>(res, onDelta, (event) => event.resolutions)
+}
+
+async function assertOK(response: Response, action: string) {
+  if (response.ok) return
+  let message = `${action}请求失败 (HTTP ${response.status})`
+  try {
+    const data = (await response.json()) as { error?: string }
+    if (data.error) message = data.error
+  } catch {
+    // 非 JSON 错误体,保留默认消息。
   }
-  if (!res.body) throw new Error("浏览器未提供流式响应体")
-  const reader = res.body.getReader()
+  throw new Error(message)
+}
+
+async function consumeStream<T>(
+  response: Response,
+  onDelta: ((delta: OCRDelta) => void) | undefined,
+  readResult: (event: OCRStreamEvent) => T | undefined,
+): Promise<T> {
+  if (!response.body) throw new Error("浏览器未提供流式响应体")
+  const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
-  let result: Final | undefined
+  let result: T | undefined
+  let completed = false
 
   const consume = (line: string) => {
     if (!line.trim()) return
@@ -137,7 +198,8 @@ export async function runOCR(
         }
         break
       case "result":
-        result = event.result
+        result = readResult(event)
+        completed = result !== undefined
         break
       case "error":
         throw new Error(event.error || "模型流异常结束")
@@ -153,6 +215,6 @@ export async function runOCR(
     if (done) break
   }
   consume(buffer)
-  if (!result) throw new Error("模型流未返回最终结果")
+  if (!completed || result === undefined) throw new Error("模型流未返回最终结果")
   return result
 }

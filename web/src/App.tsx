@@ -4,8 +4,6 @@ import {
   ArrowRight,
   Bot,
   BrainCircuit,
-  Check,
-  Copy,
   ImagePlus,
   Layers3,
   Loader2,
@@ -18,10 +16,7 @@ import {
 import {
   fetchConfig,
   runOCR,
-  type EngineResult,
   type Final,
-  type FinalLine,
-  type LineSource,
   type OCRDelta,
   type ServerConfig,
 } from "@/lib/api"
@@ -29,46 +24,22 @@ import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Field, FieldLabel } from "@/components/ui/field"
 import { ModelConfigDialog } from "@/components/model-config-dialog"
+import { ResultWorkbench } from "@/components/result-workbench"
 import {
   Card,
   CardAction,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Progress } from "@/components/ui/progress"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-
-const sourceMeta: Record<LineSource, { label: string; cls: string }> = {
-  consensus: {
-    label: "共识",
-    cls: "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
-  },
-  escalated: {
-    label: "仲裁",
-    cls: "border-violet-500/25 bg-violet-500/10 text-violet-700 dark:text-violet-400",
-  },
-  fallback: {
-    label: "兜底",
-    cls: "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-500",
-  },
-}
-
-const pct = (c: number) => `${(c * 100).toFixed(1)}%`
-
-const confColor = (c: number) =>
-  c >= 0.9
-    ? "text-emerald-600 dark:text-emerald-400"
-    : c >= 0.7
-      ? "text-amber-600 dark:text-amber-400"
-      : "text-red-600 dark:text-red-400"
 
 const selectionStorageKey = "betterocr-model-selection"
 
@@ -103,6 +74,7 @@ export default function App() {
   const [cfg, setCfg] = useState<ServerConfig | null>(null)
   const [engines, setEngines] = useState<string[]>([])
   const [arbiter, setArbiter] = useState("")
+  const [autoArbitrate, setAutoArbitrate] = useState(true)
 
   useEffect(() => {
     fetchConfig()
@@ -226,6 +198,7 @@ export default function App() {
           image: file,
           engines,
           arbiter,
+          autoArbitrate,
           signal: ac.signal,
         },
         (delta) => {
@@ -247,13 +220,9 @@ export default function App() {
             }
             return current.map((item, i) =>
               i === index
-                ? {
-                    ...item,
-                    thinking:
-                      item.thinking + (delta.kind === "thinking" ? delta.text : ""),
-                    answer:
-                      item.answer + (delta.kind === "output" ? delta.text : ""),
-                  }
+                ? delta.kind === "thinking"
+                  ? { ...item, thinking: item.thinking + delta.text }
+                  : { ...item, answer: item.answer + delta.text }
                 : item,
             )
           })
@@ -293,7 +262,7 @@ export default function App() {
               BetterOCR
             </span>
             <span className="hidden text-xs text-muted-foreground sm:block">
-              多引擎融合 · 只有分歧行才动用强模型
+              全文识别 · 中文句段动态融合
             </span>
           </div>
           <div className="ms-auto flex items-center gap-1.5">
@@ -389,16 +358,23 @@ export default function App() {
         >
           <CardContent className="flex min-h-48 items-center justify-center px-4">
             {preview ? (
-              <div className="relative w-full">
+              <div className="flex min-w-0 w-full flex-col gap-3">
                 <img
                   src={preview}
                   alt="待识别图片"
                   className="mx-auto max-h-[420px] rounded-md object-contain"
                 />
-                <div className="absolute right-2 top-2 flex gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <p
+                    className="min-w-0 flex-1 truncate text-center text-xs text-muted-foreground"
+                    title={file?.name}
+                  >
+                    {file?.name} · {((file?.size ?? 0) / 1024).toFixed(0)} KB
+                  </p>
                   <Button
                     variant="secondary"
                     size="sm"
+                    className="shrink-0"
                     onClick={(e) => {
                       e.stopPropagation()
                       fileInput.current?.click()
@@ -410,7 +386,7 @@ export default function App() {
                   <Button
                     variant="secondary"
                     size="icon"
-                    className="size-8"
+                    className="size-8 shrink-0"
                     aria-label="清除图片"
                     onClick={(e) => {
                       e.stopPropagation()
@@ -421,9 +397,6 @@ export default function App() {
                     <X />
                   </Button>
                 </div>
-                <p className="mt-2 text-center text-xs text-muted-foreground">
-                  {file?.name} · {((file?.size ?? 0) / 1024).toFixed(0)} KB
-                </p>
               </div>
             ) : (
               <div className="flex flex-col items-center gap-2 py-8 text-muted-foreground">
@@ -445,7 +418,7 @@ export default function App() {
           }}
         />
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <Button
             size="lg"
             className="min-w-36"
@@ -478,6 +451,17 @@ export default function App() {
               耗时 {elapsed.toFixed(1)}s
             </span>
           )}
+          <Field orientation="horizontal" className="ms-auto w-auto">
+            <Checkbox
+              id="auto-arbitrate"
+              checked={Boolean(arbiter) && autoArbitrate}
+              disabled={!arbiter || busy}
+              onCheckedChange={(checked) => setAutoArbitrate(checked === true)}
+            />
+            <FieldLabel htmlFor="auto-arbitrate" className="whitespace-nowrap">
+              自动仲裁
+            </FieldLabel>
+          </Field>
         </div>
 
         {error && (
@@ -489,7 +473,9 @@ export default function App() {
         )}
 
         {busy && <LiveOutputView outputs={liveOutputs} />}
-        {result && <ResultView final={result} />}
+        {result && file && (
+          <ResultWorkbench final={result} image={file} arbiter={arbiter} />
+        )}
       </main>
     </div>
   )
@@ -575,187 +561,5 @@ function LiveOutputCard({ output }: { output: LiveOutput }) {
         </section>
       </CardContent>
     </Card>
-  )
-}
-
-function ResultView({ final }: { final: Final }) {
-  const s = final.stats
-  const json = JSON.stringify(final, null, 2)
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>识别结果</CardTitle>
-        <CardDescription className="flex flex-wrap items-center gap-1.5 pt-1">
-          <Badge variant="secondary">{s.engines} 引擎</Badge>
-          <Badge variant="outline" className={sourceMeta.consensus.cls}>
-            共识 {s.consensus_rows}
-          </Badge>
-          {s.escalated_rows > 0 && (
-            <Badge variant="outline" className={sourceMeta.escalated.cls}>
-              仲裁 {s.escalated_rows}
-            </Badge>
-          )}
-          {s.fallback_rows > 0 && (
-            <Badge variant="outline" className={sourceMeta.fallback.cls}>
-              兜底 {s.fallback_rows}
-            </Badge>
-          )}
-          {(s.dropped_rows ?? 0) > 0 && <Badge variant="outline">丢弃 {s.dropped_rows}</Badge>}
-          {s.failed_engines > 0 && <Badge variant="destructive">失败 {s.failed_engines}</Badge>}
-          {s.escalator && (
-            <Badge variant="outline" className="max-w-48 truncate" title={s.escalator}>
-              {s.escalator}
-            </Badge>
-          )}
-        </CardDescription>
-        <CardAction className="flex w-32 flex-col items-end gap-1.5">
-          <span className="text-2xl font-semibold leading-none tabular-nums">
-            {pct(final.confidence)}
-          </span>
-          <Progress value={final.confidence * 100} />
-          <span className="text-xs text-muted-foreground">总置信度</span>
-        </CardAction>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-3">
-        {s.escalation_err && (
-          <Alert>
-            <AlertCircle />
-            <AlertTitle>仲裁调用失败,分歧行已本地兜底</AlertTitle>
-            <AlertDescription className="break-all">{s.escalation_err}</AlertDescription>
-          </Alert>
-        )}
-        <Tabs defaultValue="text">
-          <TabsList>
-            <TabsTrigger value="text">文本</TabsTrigger>
-            <TabsTrigger value="lines">逐行({final.lines.length})</TabsTrigger>
-            <TabsTrigger value="engines">引擎对比</TabsTrigger>
-            <TabsTrigger value="json">JSON</TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="text">
-            <div className="relative">
-              <pre className="max-h-[480px] min-h-24 overflow-auto whitespace-pre-wrap rounded-lg border bg-muted/40 p-4 font-sans text-sm leading-7">
-                {final.text || "(未识别到文本)"}
-              </pre>
-              <CopyButton text={final.text} className="absolute right-2 top-2" />
-            </div>
-          </TabsContent>
-
-          <TabsContent value="lines">
-            {final.lines.length === 0 ? (
-              <p className="rounded-lg border p-6 text-center text-sm text-muted-foreground">
-                没有产出任何行
-              </p>
-            ) : (
-              <div className="overflow-hidden rounded-lg border">
-                {final.lines.map((l, i) => (
-                  <LineRow key={i} line={l} index={i} />
-                ))}
-              </div>
-            )}
-          </TabsContent>
-
-          <TabsContent value="engines">
-            <div className="grid gap-3 xl:grid-cols-2">
-              {final.candidates.map((c) => (
-                <EngineCard key={c.agent} result={c} />
-              ))}
-            </div>
-          </TabsContent>
-
-          <TabsContent value="json">
-            <div className="relative">
-              <pre className="max-h-[480px] overflow-auto rounded-lg border bg-muted/40 p-4 font-mono text-xs leading-5">
-                {json}
-              </pre>
-              <CopyButton text={json} className="absolute right-2 top-2" />
-            </div>
-          </TabsContent>
-        </Tabs>
-      </CardContent>
-    </Card>
-  )
-}
-
-function LineRow({ line, index }: { line: FinalLine; index: number }) {
-  const meta = sourceMeta[line.source]
-  return (
-    <div className="flex items-start gap-3 border-b px-3 py-2 text-sm last:border-b-0 hover:bg-muted/40">
-      <span className="mt-0.5 w-6 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-        {index + 1}
-      </span>
-      <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{line.text}</span>
-      <div className="flex shrink-0 items-center gap-2">
-        <span
-          className="hidden max-w-44 truncate text-xs text-muted-foreground md:inline"
-          title={line.from.join(", ")}
-        >
-          {line.from.join(" · ")}
-        </span>
-        <span className={cn("text-xs tabular-nums", confColor(line.confidence))}>
-          {pct(line.confidence)}
-        </span>
-        <Badge variant="outline" className={meta.cls}>
-          {meta.label}
-        </Badge>
-      </div>
-    </div>
-  )
-}
-
-function EngineCard({ result }: { result: EngineResult }) {
-  const lines = result.lines ?? []
-  return (
-    <Card className="gap-3 py-4">
-      <CardHeader className="px-4">
-        <CardTitle className="truncate text-sm font-medium" title={result.agent}>
-          {result.agent}
-        </CardTitle>
-        <CardAction>
-          <Badge variant={result.err ? "destructive" : "secondary"}>
-            {result.err ? "失败" : `${(result.latency_ms / 1000).toFixed(1)}s`}
-          </Badge>
-        </CardAction>
-      </CardHeader>
-      <CardContent className="px-4">
-        {result.err ? (
-          <p className="break-all text-xs text-destructive">{result.err}</p>
-        ) : lines.length === 0 ? (
-          <p className="text-xs text-muted-foreground">(无输出行)</p>
-        ) : (
-          <ol className="flex max-h-64 flex-col gap-1 overflow-auto text-xs">
-            {lines.map((l, i) => (
-              <li key={i} className="flex items-baseline gap-2">
-                <span className="shrink-0 tabular-nums text-muted-foreground">{i + 1}.</span>
-                <span className="min-w-0 flex-1 break-words">{l}</span>
-              </li>
-            ))}
-          </ol>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-function CopyButton({ text, className }: { text: string; className?: string }) {
-  const [copied, setCopied] = useState(false)
-  return (
-    <Button
-      variant="secondary"
-      size="icon"
-      className={cn("size-8", className)}
-      aria-label="复制"
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(text)
-        } catch {
-          // 非安全上下文(如局域网 http)下剪贴板不可用,静默忽略
-        }
-        setCopied(true)
-        window.setTimeout(() => setCopied(false), 1500)
-      }}
-    >
-      {copied ? <Check className="text-emerald-500" /> : <Copy />}
-    </Button>
   )
 }
