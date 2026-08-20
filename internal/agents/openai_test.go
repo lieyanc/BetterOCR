@@ -43,7 +43,7 @@ func chatContent(content string) []byte {
 }
 
 func TestVLMRecognizeAcrossAPIs(t *testing.T) {
-	// 带围栏、含空行的纯文本输出:围栏应被剥掉,空行不成行
+	// 带围栏、含空行的纯文本输出:只剥整体围栏,正文完整保留。
 	const content = "```\n你好,世界\n   \n second line \n```"
 	tests := []struct {
 		name      string
@@ -134,8 +134,8 @@ func TestVLMRecognizeAcrossAPIs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(result.Lines) != 2 || result.Lines[0] != "你好,世界" || result.Lines[1] != "second line" {
-				t.Errorf("lines = %q", result.Lines)
+			if result.Text != "你好,世界\n   \n second line" {
+				t.Errorf("text = %q", result.Text)
 			}
 		})
 	}
@@ -149,20 +149,17 @@ func TestVLMStreamingAcrossAPIs(t *testing.T) {
 	}{
 		{
 			name: "openai chat", api: model.APIOpenAIChatCompletions,
-			events: "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect\"}}]}\n\n" +
+			events: "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"checking\"}}]}\n\n" +
 				"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n" +
-				"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" carefully\"}}]}\n\n" +
 				"data: {\"choices\":[{\"delta\":{\"content\":\" line\\nsecond line\"}}]}\n\n" +
 				"data: [DONE]\n\n",
 		},
 		{
 			name: "openai responses", api: model.APIOpenAIResponses,
 			events: "event: response.reasoning_summary_text.delta\n" +
-				"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"inspect\"}\n\n" +
+				"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"checking\"}\n\n" +
 				"event: response.output_text.delta\n" +
 				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n" +
-				"event: response.reasoning_text.delta\n" +
-				"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\" carefully\"}\n\n" +
 				"event: response.output_text.delta\n" +
 				"data: {\"type\":\"response.output_text.delta\",\"delta\":\" line\\nsecond line\"}\n\n" +
 				"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
@@ -170,11 +167,9 @@ func TestVLMStreamingAcrossAPIs(t *testing.T) {
 		{
 			name: "anthropic", api: model.APIAnthropicMessages,
 			events: "event: content_block_delta\n" +
-				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"inspect\"}}\n\n" +
+				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"checking\"}}\n\n" +
 				"event: content_block_delta\n" +
 				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n" +
-				"event: content_block_delta\n" +
-				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" carefully\"}}\n\n" +
 				"event: content_block_delta\n" +
 				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" line\\nsecond line\"}}\n\n" +
 				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
@@ -203,23 +198,22 @@ func TestVLMStreamingAcrossAPIs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(result.Lines, []string{"first line", "second line"}) {
-				t.Errorf("lines = %q", result.Lines)
+			if result.Text != "first line\nsecond line" {
+				t.Errorf("text = %q", result.Text)
 			}
-			wantDeltas := []StreamDelta{
-				{Kind: StreamThinking, Text: "inspect"},
+			want := []StreamDelta{
+				{Kind: StreamThinking, Text: "checking"},
 				{Kind: StreamOutput, Text: "first"},
-				{Kind: StreamThinking, Text: " carefully"},
 				{Kind: StreamOutput, Text: " line\nsecond line"},
 			}
-			if !reflect.DeepEqual(deltas, wantDeltas) {
-				t.Errorf("deltas = %q", deltas)
+			if !reflect.DeepEqual(deltas, want) {
+				t.Errorf("deltas = %+v, want %+v", deltas, want)
 			}
 		})
 	}
 }
 
-func TestVLMJSONSeparatesThinkingFromOutput(t *testing.T) {
+func TestVLMJSONFallbackSeparatesThinkingAcrossAPIs(t *testing.T) {
 	tests := []struct {
 		name     string
 		api      model.API
@@ -228,22 +222,21 @@ func TestVLMJSONSeparatesThinkingFromOutput(t *testing.T) {
 		{
 			name: "openai chat", api: model.APIOpenAIChatCompletions,
 			response: map[string]any{"choices": []any{map[string]any{"message": map[string]any{
-				"reasoning_content": "inspect carefully", "content": "first line\nsecond line",
+				"reasoning_content": "checking", "content": "answer",
 			}}}},
 		},
 		{
 			name: "openai responses", api: model.APIOpenAIResponses,
-			response: map[string]any{"output": []any{map[string]any{
-				"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "inspect carefully"}},
-			}, map[string]any{
-				"type": "message", "content": []any{map[string]any{"type": "output_text", "text": "first line\nsecond line"}},
-			}}},
+			response: map[string]any{"output": []any{
+				map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "checking"}}},
+				map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": "answer"}}},
+			}},
 		},
 		{
 			name: "anthropic", api: model.APIAnthropicMessages,
 			response: map[string]any{"content": []any{
-				map[string]any{"type": "thinking", "thinking": "inspect carefully"},
-				map[string]any{"type": "text", "text": "first line\nsecond line"},
+				map[string]any{"type": "thinking", "thinking": "checking"},
+				map[string]any{"type": "text", "text": "answer"},
 			}},
 		},
 	}
@@ -262,15 +255,15 @@ func TestVLMJSONSeparatesThinkingFromOutput(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(result.Lines, []string{"first line", "second line"}) {
-				t.Errorf("lines = %q", result.Lines)
+			if result.Text != "answer" {
+				t.Errorf("text = %q", result.Text)
 			}
 			want := []StreamDelta{
-				{Kind: StreamThinking, Text: "inspect carefully"},
-				{Kind: StreamOutput, Text: "first line\nsecond line"},
+				{Kind: StreamThinking, Text: "checking"},
+				{Kind: StreamOutput, Text: "answer"},
 			}
 			if !reflect.DeepEqual(deltas, want) {
-				t.Errorf("deltas = %#v, want %#v", deltas, want)
+				t.Errorf("deltas = %+v, want %+v", deltas, want)
 			}
 		})
 	}
@@ -349,7 +342,7 @@ func TestEscalatorResolve(t *testing.T) {
 		t.Errorf("Name = %q", esc.Name())
 	}
 	rs, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{{
-		Row: 3, Before: "ctx above", After: "ctx below",
+		Segment: 3, Before: "ctx above", After: "ctx below",
 		Candidates: []arbiter.Candidate{
 			{Agent: "a#1", Text: "f1xed line"},
 			{Agent: "b#1", Text: "fixed 1ine"},
@@ -367,7 +360,7 @@ func TestEscalatorResolve(t *testing.T) {
 	if strings.Contains(gotBody, "confidence") {
 		t.Error("dispute prompt must not hand the arbiter a confidence signal")
 	}
-	want := []arbiter.Resolution{{Row: 3, Text: "fixed line"}, {Row: 4, Text: ""}}
+	want := []arbiter.Resolution{{Segment: 3, Text: "fixed line"}, {Segment: 4, Text: ""}}
 	if !reflect.DeepEqual(rs, want) {
 		t.Errorf("resolutions = %+v, want %+v", rs, want)
 	}
@@ -384,29 +377,9 @@ func TestEscalatorRejectsUnparseableOutput(t *testing.T) {
 	defer srv.Close()
 
 	esc := NewVisionEscalator(resolved(model.APIOpenAIResponses, srv.URL, ""), nil)
-	_, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{{Row: 0}})
-	if err == nil || !strings.Contains(err.Error(), "#<row>") {
+	_, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{{Segment: 0}})
+	if err == nil || !strings.Contains(err.Error(), "#<segment>") {
 		t.Errorf("err = %v, want a parse failure mentioning the expected form", err)
-	}
-}
-
-func TestSplitLines(t *testing.T) {
-	cases := []struct {
-		name, in string
-		want     []string
-	}{
-		{name: "plain", in: "alpha\nbravo", want: []string{"alpha", "bravo"}},
-		{name: "fenced", in: "```text\nalpha\nbravo\n```", want: []string{"alpha", "bravo"}},
-		{name: "blank and padded", in: "  alpha  \n\n\t\nbravo\n", want: []string{"alpha", "bravo"}},
-		{name: "no text in image", in: "", want: []string{}},
-		{name: "inner backticks kept", in: "a ``` b", want: []string{"a ``` b"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := splitLines(tc.in); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("splitLines(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
 	}
 }
 

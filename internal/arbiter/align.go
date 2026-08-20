@@ -1,26 +1,24 @@
 package arbiter
 
-import "github.com/lieyanc/BetterOCR/internal/agent"
+import (
+	"sort"
+	"strings"
 
-// cand 是某个行槽上来自单个引擎的候选。每个引擎在一个行槽上至多一条。
+	"github.com/lieyanc/BetterOCR/internal/agent"
+)
+
+// cand 是某个句段槽上来自单个引擎的候选。每个引擎在一个槽中至多一条。
 type cand struct {
 	agent string
 	text  string
 }
 
-// row 是对齐后的一个"行槽",汇集各引擎对同一物理行的候选。
+// row 保留这个内部名称以限制改动范围;语义上它已经是动态句段槽,不是物理行。
 type row struct {
 	cands []cand
 }
 
-// rep 返回该行槽的代表候选:medoid——与组内其他候选相似度之和最高的那条。
-//
-// medoid 只用候选彼此的关系推导"谁最不像离群值",不依赖任何引擎自报指标。
-// 三个引擎里两个读作 "Hello" 一个读作 "He110" 时,medoid 必是前者;
-// 换成自报置信度择优,则完全取决于哪个模型更爱写 0.98。
-// 只有两个候选时二者相似度相同,退化为字典序——那时本就没有可用信号。
-//
-// 平局按引擎名字典序,保证结果与 cands 的排列顺序无关、可复现。
+// rep 返回与组内其他候选最接近的 medoid,平局按引擎名保证确定性。
 func (r *row) rep() cand {
 	best, bestScore := r.cands[0], -1.0
 	for _, c := range r.cands {
@@ -37,96 +35,139 @@ func (r *row) rep() cand {
 	return best
 }
 
-// alignAll 把各引擎的行序列渐进对齐成行槽序列。
-// results 需已按确定性顺序排列;逐个结果用全局序列对齐
-// (Needleman-Wunsch)并入,行相似度超过 threshold 才归入同一行槽。
+// alignAll 先独立切分每个模型的全文,再渐进对齐句段序列。
 func alignAll(results []agent.Result, threshold float64) []*row {
 	var rows []*row
 	for _, res := range results {
-		rows = mergeResult(rows, res, threshold)
+		rows = mergeSegments(rows, res.Agent, SplitSegments(res.Text), threshold)
 	}
 	return rows
 }
 
 const (
-	moveDiag = int8(iota) // 行槽与新行配对
-	moveUp                // 行槽在该引擎中无对应行
-	moveLeft              // 新行插入为新行槽
+	moveDiag = int8(iota)
+	moveUp
+	moveLeft
+	moveRowsPair // 已有两个句段 ↔ 新结果一个句段
+	moveTextPair // 已有一个句段 ↔ 新结果两个句段
 )
 
-// mergeResult 用动态规划把一个引擎的行序列对齐进现有行槽序列。
-// 配对得分 = 相似度 - threshold,gap 得分 = 0:只有相似度严格超过
-// 阈值的行对才值得配对,边界情况宁可分成两行留给仲裁。
-func mergeResult(rows []*row, res agent.Result, threshold float64) []*row {
-	m, n := len(rows), len(res.Lines)
-	// 行槽锚点在 DP 之前一次性算好:rep 是候选数的平方级开销,
-	// 放进 DP 内层会被重复求值 m×n 次。
+type step struct {
+	move  int8
+	prevI int
+	prevJ int
+}
+
+// mergeSegments 使用带 1:2 / 2:1 转移的序列对齐。额外两种转移专门吸收
+// 模型漏掉或多写句末标点造成的边界差异。
+func mergeSegments(rows []*row, agentName string, texts []string, threshold float64) []*row {
+	if len(rows) == 0 {
+		out := make([]*row, 0, len(texts))
+		for _, text := range texts {
+			out = append(out, &row{cands: []cand{{agent: agentName, text: text}}})
+		}
+		return out
+	}
+	m, n := len(rows), len(texts)
 	anchors := make([]string, m)
 	for i, r := range rows {
 		anchors[i] = r.rep().text
 	}
 	dp := make([][]float64, m+1)
-	move := make([][]int8, m+1)
+	trace := make([][]step, m+1)
 	for i := range dp {
 		dp[i] = make([]float64, n+1)
-		move[i] = make([]int8, n+1)
+		trace[i] = make([]step, n+1)
 	}
 	for j := 1; j <= n; j++ {
-		move[0][j] = moveLeft
+		trace[0][j] = step{move: moveLeft, prevJ: j - 1}
 	}
 	for i := 1; i <= m; i++ {
-		move[i][0] = moveUp
+		trace[i][0] = step{move: moveUp, prevI: i - 1}
 	}
 	for i := 1; i <= m; i++ {
 		for j := 1; j <= n; j++ {
-			diag := dp[i-1][j-1] + Similarity(anchors[i-1], res.Lines[j-1]) - threshold
-			up := dp[i-1][j]
-			left := dp[i][j-1]
-			// 固定优先级保证确定性:严格更优才配对。
-			switch {
-			case diag > up && diag > left:
-				dp[i][j], move[i][j] = diag, moveDiag
-			case up >= left:
-				dp[i][j], move[i][j] = up, moveUp
-			default:
-				dp[i][j], move[i][j] = left, moveLeft
+			// 固定平局优先级为 gap > 配对,因此只有相似度严格超过阈值
+			// 的候选才会进入同一个句段槽。
+			best := dp[i-1][j]
+			choice := step{move: moveUp, prevI: i - 1, prevJ: j}
+			if score := dp[i][j-1]; score > best {
+				best, choice = score, step{move: moveLeft, prevI: i, prevJ: j - 1}
 			}
+			if score := dp[i-1][j-1] + Similarity(anchors[i-1], texts[j-1]) - threshold; score > best {
+				best, choice = score, step{move: moveDiag, prevI: i - 1, prevJ: j - 1}
+			}
+			if i >= 2 {
+				combined := anchors[i-2] + anchors[i-1]
+				if score := dp[i-2][j-1] + Similarity(combined, texts[j-1]) - threshold - 0.05; score > best {
+					best, choice = score, step{move: moveRowsPair, prevI: i - 2, prevJ: j - 1}
+				}
+			}
+			if j >= 2 {
+				combined := texts[j-2] + texts[j-1]
+				if score := dp[i-1][j-2] + Similarity(anchors[i-1], combined) - threshold - 0.05; score > best {
+					best, choice = score, step{move: moveTextPair, prevI: i - 1, prevJ: j - 2}
+				}
+			}
+			dp[i][j], trace[i][j] = best, choice
 		}
 	}
 
-	// 回溯得到操作序列(倒序),再正序重建行槽列表,
-	// 天然保持两个序列各自的阅读顺序。
-	var ops []int8
+	var reversed []alignedOp
 	for i, j := m, n; i > 0 || j > 0; {
-		mv := move[i][j]
-		ops = append(ops, mv)
-		switch mv {
+		s := trace[i][j]
+		reversed = append(reversed, alignedOp{move: s.move, i0: s.prevI, i1: i, j0: s.prevJ, j1: j})
+		i, j = s.prevI, s.prevJ
+	}
+	out := make([]*row, 0, m+n)
+	for k := len(reversed) - 1; k >= 0; k-- {
+		op := reversed[k]
+		switch op.move {
 		case moveDiag:
-			i--
-			j--
+			r := cloneRow(rows[op.i0])
+			r.cands = append(r.cands, cand{agent: agentName, text: texts[op.j0]})
+			out = append(out, r)
 		case moveUp:
-			i--
+			out = append(out, cloneRow(rows[op.i0]))
 		case moveLeft:
-			j--
+			out = append(out, &row{cands: []cand{{agent: agentName, text: texts[op.j0]}}})
+		case moveRowsPair:
+			r := combineRows(rows[op.i0], rows[op.i0+1])
+			r.cands = append(r.cands, cand{agent: agentName, text: texts[op.j0]})
+			out = append(out, r)
+		case moveTextPair:
+			r := cloneRow(rows[op.i0])
+			r.cands = append(r.cands, cand{agent: agentName, text: texts[op.j0] + texts[op.j0+1]})
+			out = append(out, r)
 		}
 	}
+	return out
+}
 
-	out := make([]*row, 0, m+n)
-	ri, li := 0, 0
-	for k := len(ops) - 1; k >= 0; k-- {
-		switch ops[k] {
-		case moveDiag:
-			rows[ri].cands = append(rows[ri].cands, cand{agent: res.Agent, text: res.Lines[li]})
-			out = append(out, rows[ri])
-			ri++
-			li++
-		case moveUp:
-			out = append(out, rows[ri])
-			ri++
-		case moveLeft:
-			out = append(out, &row{cands: []cand{{agent: res.Agent, text: res.Lines[li]}}})
-			li++
-		}
+type alignedOp struct {
+	move   int8
+	i0, i1 int
+	j0, j1 int
+}
+
+func cloneRow(src *row) *row {
+	return &row{cands: append([]cand(nil), src.cands...)}
+}
+
+func combineRows(a, b *row) *row {
+	byAgent := make(map[string][]string, len(a.cands)+len(b.cands))
+	all := append(append([]cand(nil), a.cands...), b.cands...)
+	for _, c := range all {
+		byAgent[c.agent] = append(byAgent[c.agent], c.text)
+	}
+	agents := make([]string, 0, len(byAgent))
+	for name := range byAgent {
+		agents = append(agents, name)
+	}
+	sort.Strings(agents)
+	out := &row{cands: make([]cand, 0, len(agents))}
+	for _, name := range agents {
+		out.cands = append(out.cands, cand{agent: name, text: strings.Join(byAgent[name], "")})
 	}
 	return out
 }

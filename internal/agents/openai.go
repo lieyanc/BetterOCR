@@ -56,31 +56,32 @@ func NewVisionVLM(name string, resolved model.Resolved, client *http.Client) *Vi
 // Name implements agent.Agent.
 func (v *VisionVLM) Name() string { return v.AgentName }
 
-const ocrSystem = `You are an OCR engine. Transcribe ALL text visible in the image, line by line, in natural reading order.
+const ocrSystem = `You are a pure OCR engine. Transcribe every visible character in the image in natural reading order.
 
-Output the transcription as plain text: one output line per line of text in the image. Nothing else.
+Return only the transcription as plain text.
 
 Rules:
 - Preserve characters exactly as printed: case, punctuation, digits, full-width/half-width forms.
-- Do not merge separate lines and do not split a single line.
-- Do not add line numbers, bullets, markdown, code fences, or any commentary.
+- Use line breaks only when the visible layout is unambiguous; line breaks are not required.
+- Do not explain, summarize, correct, infer missing text, or add markdown/code fences.
 - If the image contains no text, output nothing at all.`
 
 // Recognize implements agent.Agent.
 //
 // 纯文本输出没有"解析失败"这一说,代价是模型的寒暄(比如开头一句
 // "Here is the transcription:")会混进行里。这里不做启发式拦截——拦不准。
-// 它会成为只有一个引擎产出的孤行,在融合层进入仲裁,由仲裁器看图判定
+// 它会成为只有一个引擎产出的孤立句段,在融合层进入仲裁,由仲裁器看图判定
 // "不存在于图中"而丢弃。让架构处理噪声,比让正则去猜可靠。
 func (v *VisionVLM) Recognize(ctx context.Context, image []byte) (agent.Result, error) {
 	content, err := vision(ctx, v.Model, v.Client, ocrSystem, "Transcribe the image.", image, v.OnDelta)
 	if err != nil {
 		return agent.Result{}, err
 	}
-	return agent.Result{Lines: splitLines(content)}, nil
+	text := strings.TrimSpace(stripFences(content))
+	return agent.Result{Text: text}, nil
 }
 
-// VisionEscalator uses a configured multimodal model to resolve disputed rows.
+// VisionEscalator uses a configured multimodal model to resolve disputed segments.
 type VisionEscalator struct {
 	Model  model.Resolved
 	Client *http.Client
@@ -98,19 +99,20 @@ func (e *VisionEscalator) Name() string {
 	return "arbiter:" + e.Model.DisplayName() + " (" + e.Model.ProviderName() + ")"
 }
 
-const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several fast OCR engines transcribed the same image; most lines agree, but the rows listed below are disputed. Look at the image and decide the correct text for each disputed row.
+const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several OCR engines transcribed the same image. The disputed sentence segments listed below were aligned by their Chinese text content, not by physical image lines. Look at the image and decide the exact text for each segment.
 
-Output one plain-text line per disputed row, in exactly this form:
+Output one plain-text line per disputed segment, in exactly this form:
 
-#<row> <the correct text>
+#<segment> <the exact text>
 
 Rules:
-- Emit exactly one line per disputed row, reusing the row numbers given below.
+- Emit exactly one line per disputed segment, reusing the segment numbers given below.
 - Read the actual image; do not simply pick the most common candidate.
-- If a disputed row does not actually exist in the image, emit "#<row>" with nothing after it.
+- Preserve punctuation and symbols exactly; they are part of the OCR result.
+- If a disputed segment does not actually exist in the image, emit "#<segment>" with nothing after it.
 - Do not add commentary, markdown, or code fences.`
 
-// Resolve implements arbiter.Escalator and batches all disputed rows in one call.
+// Resolve implements arbiter.Escalator and batches all disputed segments in one call.
 func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []arbiter.Dispute) ([]arbiter.Resolution, error) {
 	content, err := vision(ctx, e.Model, e.Client, escalatorSystem, disputesPrompt(disputes), image, e.OnDelta)
 	if err != nil {
@@ -118,21 +120,20 @@ func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []
 	}
 	var out []arbiter.Resolution
 	for _, line := range strings.Split(stripFences(content), "\n") {
-		if row, text, ok := parseRowLine(line); ok {
-			out = append(out, arbiter.Resolution{Row: row, Text: text})
+		if segment, text, ok := parseRowLine(line); ok {
+			out = append(out, arbiter.Resolution{Segment: segment, Text: text})
 		}
 	}
-	// 一行都认不出来是真失败,必须报错:静默返回空会让所有分歧行悄悄
+	// 一个句段编号都认不出来是真失败,必须报错:静默返回空会让全部争议
 	// 走本地兜底,而 Stats.EscalationErr 是空的——问题被藏起来了。
 	if len(out) == 0 {
-		return nil, fmt.Errorf("仲裁输出中没有 \"#<row> <text>\" 形式的行: %.200s", content)
+		return nil, fmt.Errorf("仲裁输出中没有 \"#<segment> <text>\" 形式的行: %.200s", content)
 	}
 	return out, nil
 }
 
-// parseRowLine 解析一行 "#<row> <text>"。行号后必须紧跟空白或直接结束,
-// 以免把正文里的 "#1234.5" 误读成行号;认不出的行(寒暄、空行)直接忽略。
-// "#<row>" 后面为空表示仲裁器判定该行不存在于图中。
+// parseRowLine 解析一行 "#<segment> <text>"。编号后必须紧跟空白或结束,
+// 以免把正文里的 "#1234.5" 误读成编号;认不出的行直接忽略。
 func parseRowLine(s string) (int, string, bool) {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "#") {
@@ -159,9 +160,9 @@ func parseRowLine(s string) (int, string, bool) {
 
 func disputesPrompt(disputes []arbiter.Dispute) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Disputed rows (%d):\n", len(disputes))
+	fmt.Fprintf(&sb, "Disputed sentence segments (%d):\n", len(disputes))
 	for _, d := range disputes {
-		fmt.Fprintf(&sb, "\n#%d", d.Row)
+		fmt.Fprintf(&sb, "\n#%d", d.Segment)
 		if d.Before != "" || d.After != "" {
 			fmt.Fprintf(&sb, " (between %q and %q)", d.Before, d.After)
 		}
@@ -172,7 +173,7 @@ func disputesPrompt(disputes []arbiter.Dispute) string {
 			fmt.Fprintf(&sb, "  - engine %q read: %q\n", c.Agent, c.Text)
 		}
 	}
-	sb.WriteString("\nReturn one \"#<row> <text>\" line per disputed row.")
+	sb.WriteString("\nReturn one \"#<segment> <text>\" line per disputed segment.")
 	return sb.String()
 }
 
@@ -231,13 +232,25 @@ func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Clien
 		MaxTokens: maxOutputTokens(resolved.Context),
 		Stream:    true,
 	}
-	raw, streamed, err := postJSONStream(ctx, resolved, client, "/chat/completions", body, false, onDelta, chatDelta)
+	resp, err := postJSON(ctx, resolved, client, "/chat/completions", body, false)
 	if err != nil {
 		return "", err
 	}
-	if streamed != "" {
-		return streamed, nil
+	if isEventStream(resp) {
+		return readSSEText(resp, resolved, onDelta, chatDelta)
 	}
+	raw, err := readResponseBody(resp)
+	if err != nil {
+		return "", err
+	}
+	output, err := parseChatResponse(raw, resolved)
+	if err == nil {
+		emitModelOutput(onDelta, output)
+	}
+	return output.Text, err
+}
+
+func parseChatResponse(raw []byte, resolved model.Resolved) (modelOutput, error) {
 	var response struct {
 		Choices []struct {
 			Message struct {
@@ -249,21 +262,20 @@ func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Clien
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return "", fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
+		return modelOutput{}, fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
 	}
 	if len(response.Choices) == 0 {
-		return "", fmt.Errorf("模型 %s 未返回任何 choice", resolved.Ref)
+		return modelOutput{}, fmt.Errorf("模型 %s 未返回任何 choice", resolved.Ref)
 	}
 	message := response.Choices[0].Message
 	text := textFromContent(message.Content)
 	if text == "" {
-		return "", fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
+		return modelOutput{}, fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
 	}
-	emitModelOutput(onDelta, modelOutput{
+	return modelOutput{
 		Text:     text,
 		Thinking: firstTextContent(message.ReasoningContent, message.Reasoning, message.Thinking),
-	})
-	return text, nil
+	}, nil
 }
 
 type responsesRequest struct {
@@ -299,13 +311,25 @@ func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.
 		MaxOutputTokens: maxOutputTokens(resolved.Context),
 		Stream:          true,
 	}
-	raw, streamed, err := postJSONStream(ctx, resolved, client, "/responses", body, false, onDelta, responsesDelta)
+	resp, err := postJSON(ctx, resolved, client, "/responses", body, false)
 	if err != nil {
 		return "", err
 	}
-	if streamed != "" {
-		return streamed, nil
+	if isEventStream(resp) {
+		return readSSEText(resp, resolved, onDelta, responsesDelta)
 	}
+	raw, err := readResponseBody(resp)
+	if err != nil {
+		return "", err
+	}
+	output, err := parseResponsesResponse(raw, resolved)
+	if err == nil {
+		emitModelOutput(onDelta, output)
+	}
+	return output.Text, err
+}
+
+func parseResponsesResponse(raw []byte, resolved model.Resolved) (modelOutput, error) {
 	var response struct {
 		OutputText string `json:"output_text"`
 		Output     []struct {
@@ -320,7 +344,7 @@ func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.
 		} `json:"output"`
 	}
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return "", fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
+		return modelOutput{}, fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
 	}
 	var textParts, thinkingParts []string
 	for _, item := range response.Output {
@@ -340,10 +364,9 @@ func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.
 		text = strings.Join(textParts, "\n")
 	}
 	if text == "" {
-		return "", fmt.Errorf("模型 %s 未返回 output_text", resolved.Ref)
+		return modelOutput{}, fmt.Errorf("模型 %s 未返回 output_text", resolved.Ref)
 	}
-	emitModelOutput(onDelta, modelOutput{Text: text, Thinking: strings.Join(thinkingParts, "\n")})
-	return text, nil
+	return modelOutput{Text: text, Thinking: strings.Join(thinkingParts, "\n")}, nil
 }
 
 type anthropicRequest struct {
@@ -387,13 +410,25 @@ func anthropicMessages(ctx context.Context, resolved model.Resolved, client *htt
 		MaxTokens: maxOutputTokens(resolved.Context),
 		Stream:    true,
 	}
-	raw, streamed, err := postJSONStream(ctx, resolved, client, "/messages", body, true, onDelta, anthropicDelta)
+	resp, err := postJSON(ctx, resolved, client, "/messages", body, true)
 	if err != nil {
 		return "", err
 	}
-	if streamed != "" {
-		return streamed, nil
+	if isEventStream(resp) {
+		return readSSEText(resp, resolved, onDelta, anthropicDelta)
 	}
+	raw, err := readResponseBody(resp)
+	if err != nil {
+		return "", err
+	}
+	output, err := parseAnthropicResponse(raw, resolved)
+	if err == nil {
+		emitModelOutput(onDelta, output)
+	}
+	return output.Text, err
+}
+
+func parseAnthropicResponse(raw []byte, resolved model.Resolved) (modelOutput, error) {
 	var response struct {
 		Content []struct {
 			Type     string `json:"type"`
@@ -402,7 +437,7 @@ func anthropicMessages(ctx context.Context, resolved model.Resolved, client *htt
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return "", fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
+		return modelOutput{}, fmt.Errorf("模型 %s 返回了无效 JSON: %w", resolved.Ref, err)
 	}
 	var textParts, thinkingParts []string
 	for _, content := range response.Content {
@@ -414,24 +449,22 @@ func anthropicMessages(ctx context.Context, resolved model.Resolved, client *htt
 		}
 	}
 	if len(textParts) == 0 {
-		return "", fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
+		return modelOutput{}, fmt.Errorf("模型 %s 未返回文本内容", resolved.Ref)
 	}
-	text := strings.Join(textParts, "\n")
-	emitModelOutput(onDelta, modelOutput{Text: text, Thinking: strings.Join(thinkingParts, "\n")})
-	return text, nil
+	return modelOutput{
+		Text: strings.Join(textParts, "\n"), Thinking: strings.Join(thinkingParts, "\n"),
+	}, nil
 }
 
-type sseDelta func(event string, data []byte) ([]StreamDelta, error)
-
-func postJSONStream(ctx context.Context, resolved model.Resolved, client *http.Client, endpoint string, body any, anthropic bool, onDelta func(StreamDelta), extract sseDelta) ([]byte, string, error) {
+func postJSON(ctx context.Context, resolved model.Resolved, client *http.Client, endpoint string, body any, anthropic bool) (*http.Response, error) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(resolved.BaseURL, "/")+endpoint, bytes.NewReader(encoded))
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if anthropic {
@@ -444,34 +477,41 @@ func postJSONStream(ctx context.Context, resolved model.Resolved, client *http.C
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		defer resp.Body.Close()
 		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 		if readErr != nil {
-			return nil, "", readErr
+			return nil, readErr
 		}
 		message := strings.TrimSpace(string(responseBody))
-		if parsed := parseAPIError(responseBody); parsed != "" {
+		parsed := parseAPIError(responseBody)
+		if parsed != "" {
 			message = parsed
 		}
-		return nil, "", fmt.Errorf("模型 %s 请求失败 (HTTP %d): %.300s", resolved.Ref, resp.StatusCode, message)
+		return nil, fmt.Errorf("模型 %s 请求失败 (HTTP %d): %.300s", resolved.Ref, resp.StatusCode, message)
 	}
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-		text, err := readSSEText(resp, resolved, onDelta, extract)
-		return nil, text, err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return nil, "", err
-	}
-	if message := parseAPIError(raw); message != "" {
-		return nil, "", fmt.Errorf("模型 %s 返回错误: %s", resolved.Ref, message)
-	}
-	return raw, "", nil
+	return resp, nil
 }
+
+func isEventStream(resp *http.Response) bool {
+	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+}
+
+func readResponseBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		return nil, err
+	}
+	if message := parseAPIError(body); message != "" {
+		return nil, fmt.Errorf("模型返回错误: %s", message)
+	}
+	return body, nil
+}
+
+type sseDelta func(event string, data []byte) ([]StreamDelta, error)
 
 func readSSEText(resp *http.Response, resolved model.Resolved, onDelta func(StreamDelta), extract sseDelta) (string, error) {
 	defer resp.Body.Close()
@@ -564,12 +604,12 @@ func chatDelta(_ string, data []byte) ([]StreamDelta, error) {
 	if len(chunk.Choices) == 0 {
 		return nil, nil
 	}
-	delta := chunk.Choices[0].Delta
+	fragment := chunk.Choices[0].Delta
 	var deltas []StreamDelta
-	if thinking := firstTextContent(delta.ReasoningContent, delta.Reasoning, delta.Thinking); thinking != "" {
+	if thinking := firstTextContent(fragment.ReasoningContent, fragment.Reasoning, fragment.Thinking); thinking != "" {
 		deltas = append(deltas, StreamDelta{Kind: StreamThinking, Text: thinking})
 	}
-	if text := textFromContent(delta.Content); text != "" {
+	if text := textFromContent(fragment.Content); text != "" {
 		deltas = append(deltas, StreamDelta{Kind: StreamOutput, Text: text})
 	}
 	return deltas, nil
@@ -590,13 +630,14 @@ func responsesDelta(event string, data []byte) ([]StreamDelta, error) {
 		event == "response.error" || event == "response.failed" {
 		return nil, errors.New("Responses API 流返回错误")
 	}
-	if chunk.Type == "response.output_text.delta" || event == "response.output_text.delta" {
-		return []StreamDelta{{Kind: StreamOutput, Text: chunk.Delta}}, nil
+	eventType := chunk.Type
+	if eventType == "" {
+		eventType = event
 	}
-	if chunk.Type == "response.reasoning_summary_text.delta" ||
-		chunk.Type == "response.reasoning_text.delta" ||
-		event == "response.reasoning_summary_text.delta" ||
-		event == "response.reasoning_text.delta" {
+	switch eventType {
+	case "response.output_text.delta":
+		return []StreamDelta{{Kind: StreamOutput, Text: chunk.Delta}}, nil
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		return []StreamDelta{{Kind: StreamThinking, Text: chunk.Delta}}, nil
 	}
 	return nil, nil
@@ -629,6 +670,26 @@ func anthropicDelta(event string, data []byte) ([]StreamDelta, error) {
 		}
 	}
 	return nil, nil
+}
+
+func emitDelta(onDelta func(StreamDelta), delta StreamDelta) {
+	if onDelta != nil && delta.Text != "" {
+		onDelta(delta)
+	}
+}
+
+func emitModelOutput(onDelta func(StreamDelta), output modelOutput) {
+	emitDelta(onDelta, StreamDelta{Kind: StreamThinking, Text: output.Thinking})
+	emitDelta(onDelta, StreamDelta{Kind: StreamOutput, Text: output.Text})
+}
+
+func firstTextContent(values ...json.RawMessage) string {
+	for _, value := range values {
+		if text := textFromContent(value); text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func parseAPIError(body []byte) string {
@@ -666,26 +727,6 @@ func parseAPIError(body []byte) string {
 	return ""
 }
 
-func emitDelta(onDelta func(StreamDelta), delta StreamDelta) {
-	if onDelta != nil && delta.Text != "" {
-		onDelta(delta)
-	}
-}
-
-func emitModelOutput(onDelta func(StreamDelta), output modelOutput) {
-	emitDelta(onDelta, StreamDelta{Kind: StreamThinking, Text: output.Thinking})
-	emitDelta(onDelta, StreamDelta{Kind: StreamOutput, Text: output.Text})
-}
-
-func firstTextContent(values ...json.RawMessage) string {
-	for _, value := range values {
-		if text := textFromContent(value); text != "" {
-			return text
-		}
-	}
-	return ""
-}
-
 func imageDataURL(mediaType string, image []byte) string {
 	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(image)
 }
@@ -717,19 +758,6 @@ func textFromContent(raw json.RawMessage) string {
 		}
 	}
 	return strings.Join(texts, "\n")
-}
-
-// splitLines 把模型的纯文本输出切成行:去掉整体包裹的 markdown 围栏,
-// 丢弃空行,每行去首尾空白。留白不是识别分歧,不值得进入对齐。
-func splitLines(s string) []string {
-	raw := strings.Split(stripFences(s), "\n")
-	lines := make([]string, 0, len(raw))
-	for _, line := range raw {
-		if trimmed := strings.TrimSpace(line); trimmed != "" {
-			lines = append(lines, trimmed)
-		}
-	}
-	return lines
 }
 
 // stripFences 去掉整体包裹输出的 markdown 代码围栏(```、```text 等)。

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lieyanc/BetterOCR/internal/agents"
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
 	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/model"
@@ -42,6 +43,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("POST /api/ocr", s.handleOCR)
 	mux.HandleFunc("POST /api/ocr/stream", s.handleOCRStream)
+	mux.HandleFunc("POST /api/arbitrate/stream", s.handleArbitrateStream)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "未知接口: "+r.URL.Path)
 	})
@@ -114,13 +116,14 @@ func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
 }
 
 type streamEvent struct {
-	Type   string         `json:"type"`
-	Stage  string         `json:"stage,omitempty"`
-	Agent  string         `json:"agent,omitempty"`
-	Kind   string         `json:"kind,omitempty"`
-	Text   string         `json:"text,omitempty"`
-	Result *arbiter.Final `json:"result,omitempty"`
-	Error  string         `json:"error,omitempty"`
+	Type        string               `json:"type"`
+	Stage       string               `json:"stage,omitempty"`
+	Agent       string               `json:"agent,omitempty"`
+	Kind        string               `json:"kind,omitempty"`
+	Text        string               `json:"text,omitempty"`
+	Result      *arbiter.Final       `json:"result,omitempty"`
+	Resolutions []arbiter.Resolution `json:"resolutions,omitempty"`
+	Error       string               `json:"error,omitempty"`
 }
 
 // handleOCRStream emits newline-delimited JSON fragments as each upstream
@@ -176,6 +179,122 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 	writeEvent(streamEvent{Type: "result", Result: &final})
 }
 
+// handleArbitrateStream only resolves the submitted disputed segments. It does
+// not rerun the base OCR engines, so a user can merge candidates and arbitrate
+// the remaining uncertainty independently.
+func (s *Server) handleArbitrateStream(w http.ResponseWriter, r *http.Request) {
+	image, resolvedModel, disputes, ok := s.parseArbitrationRequest(w, r)
+	if !ok {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	encoder := json.NewEncoder(w)
+	controller := http.NewResponseController(w)
+	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
+	defer cancel()
+	streamOK := true
+	writeEvent := func(event streamEvent) {
+		if !streamOK {
+			return
+		}
+		if err := encoder.Encode(event); err != nil {
+			streamOK = false
+			cancel()
+			return
+		}
+		if err := controller.Flush(); err != nil {
+			streamOK = false
+			cancel()
+			return
+		}
+		if event.Type == "result" || event.Type == "error" {
+			streamOK = false
+		}
+	}
+
+	escalator := agents.NewVisionEscalator(resolvedModel, s.HTTPClient)
+	escalator.OnDelta = func(delta agents.StreamDelta) {
+		writeEvent(streamEvent{
+			Type: "delta", Stage: pipeline.StageArbiter, Agent: escalator.Name(),
+			Kind: string(delta.Kind), Text: delta.Text,
+		})
+	}
+	writeEvent(streamEvent{Type: "start"})
+	resolutions, err := escalator.Resolve(ctx, image, disputes)
+	if err != nil {
+		writeEvent(streamEvent{Type: "error", Error: err.Error()})
+		return
+	}
+	disputeBySegment := make(map[int]arbiter.Dispute, len(disputes))
+	for _, dispute := range disputes {
+		disputeBySegment[dispute.Segment] = dispute
+	}
+	filtered := make([]arbiter.Resolution, 0, len(resolutions))
+	for _, resolution := range resolutions {
+		dispute, exists := disputeBySegment[resolution.Segment]
+		if !exists {
+			continue
+		}
+		resolution.Confidence = arbiter.ResolutionConfidence(dispute.Candidates, resolution.Text)
+		resolution.From = []string{escalator.Name()}
+		filtered = append(filtered, resolution)
+	}
+	writeEvent(streamEvent{Type: "result", Resolutions: filtered})
+}
+
+func (s *Server) parseArbitrationRequest(w http.ResponseWriter, r *http.Request) ([]byte, model.Resolved, []arbiter.Dispute, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxImageBytes)
+	if err := r.ParseMultipartForm(maxImageBytes); err != nil {
+		writeErr(w, http.StatusBadRequest, "解析仲裁表单失败: "+err.Error())
+		return nil, model.Resolved{}, nil, false
+	}
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "缺少图片文件字段 image")
+		return nil, model.Resolved{}, nil, false
+	}
+	defer file.Close()
+	image, err := io.ReadAll(file)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "读取图片失败: "+err.Error())
+		return nil, model.Resolved{}, nil, false
+	}
+	if ct := http.DetectContentType(image); !strings.HasPrefix(ct, "image/") {
+		writeErr(w, http.StatusBadRequest, "上传内容不是可识别的图片格式: "+ct)
+		return nil, model.Resolved{}, nil, false
+	}
+	arbiterRef := formOr(r, "arbiter", s.Config.Arbiter)
+	if arbiterRef == "" {
+		writeErr(w, http.StatusBadRequest, "未选择仲裁模型")
+		return nil, model.Resolved{}, nil, false
+	}
+	resolved, err := s.Config.Resolve(arbiterRef)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return nil, model.Resolved{}, nil, false
+	}
+	var disputes []arbiter.Dispute
+	if err := json.Unmarshal([]byte(formOr(r, "disputes", "")), &disputes); err != nil {
+		writeErr(w, http.StatusBadRequest, "争议句段格式无效: "+err.Error())
+		return nil, model.Resolved{}, nil, false
+	}
+	if len(disputes) == 0 || len(disputes) > 200 {
+		writeErr(w, http.StatusBadRequest, "争议句段数量必须在 1 到 200 之间")
+		return nil, model.Resolved{}, nil, false
+	}
+	for _, dispute := range disputes {
+		if dispute.Segment < 0 || len(dispute.Candidates) == 0 || len(dispute.Candidates) > 32 {
+			writeErr(w, http.StatusBadRequest, "争议句段缺少有效编号或候选")
+			return nil, model.Resolved{}, nil, false
+		}
+	}
+	return image, resolved, disputes, true
+}
+
 func (s *Server) parseOCRRequest(w http.ResponseWriter, r *http.Request) ([]byte, pipeline.Config, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxImageBytes)
 	if err := r.ParseMultipartForm(maxImageBytes); err != nil {
@@ -218,9 +337,10 @@ func (s *Server) parseOCRRequest(w http.ResponseWriter, r *http.Request) ([]byte
 		arbiterModel = &resolved
 	}
 	return image, pipeline.Config{
-		Engines:    engines,
-		Arbiter:    arbiterModel,
-		HTTPClient: s.HTTPClient,
+		Engines:          engines,
+		Arbiter:          arbiterModel,
+		DeferArbitration: strings.EqualFold(formOr(r, "auto_arbitrate", "true"), "false"),
+		HTTPClient:       s.HTTPClient,
 	}, true
 }
 

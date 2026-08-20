@@ -13,20 +13,16 @@ import (
 type Result struct {
 	// Agent 是产出该结果的 Agent 名称,由 Coordinator 填写。
 	Agent string `json:"agent"`
-	// Lines 是按阅读顺序排列的识别行,一个元素对应图中一条物理行。
-	// 行是融合的最小单元:只有行级结构才能让仲裁发生在低于整篇文本的
-	// 粒度上,融合准确率才有机会超过最好的单个引擎。
-	//
-	// 这里只有文本,不带任何引擎自报的指标。可信度由融合层从结构信号
-	// (多少引擎逐字一致、多少持异议)推导,见 internal/arbiter。
-	Lines []string `json:"lines,omitempty"`
+	// Text 是模型返回的完整识别文本。模型不需要遵循物理行;融合层会按
+	// 中文句末标点动态切分并对齐句段。
+	Text string `json:"text,omitempty"`
 	// LatencyMS 是本次识别耗时(毫秒)。
 	LatencyMS int64 `json:"latency_ms"`
-	// Err 为非空时表示该 Agent 识别失败,此时 Lines 无效。
+	// Err 为非空时表示该 Agent 识别失败,此时 Text 无效。
 	Err string `json:"err,omitempty"`
 }
 
-// Agent 是一个 OCR 引擎的抽象。实现方应按图中的物理行切分返回文本。
+// Agent 是一个 OCR 引擎的抽象。实现方只需返回完整识别文本。
 type Agent interface {
 	// Name 返回 Agent 唯一名称,如 "tesseract"、"claude-haiku-4-5#1"。
 	Name() string

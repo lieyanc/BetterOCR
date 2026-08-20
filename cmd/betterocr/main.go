@@ -1,5 +1,5 @@
 // BetterOCR 是一个多引擎 OCR 融合工具:并发调用多个便宜的 VLM 引擎,
-// 行级对齐后一致的行免费通过,只有分歧行交给更强的 VLM 仲裁。
+// 将完整文本动态切成中文句段,只把争议句段交给更强的 VLM 仲裁。
 // 强模型成本与分歧量成正比,融合准确率可超过任何单个引擎。
 //
 // 全部运行参数来自 JSON 配置文件(模板内置在二进制中,启动时自动
@@ -65,7 +65,7 @@ func main() {
 		fatal("读取图片失败:", err)
 	}
 	if cfg.Arbiter == "" {
-		fmt.Fprintln(os.Stderr, "警告: 配置中 arbiter 为空,分歧行将退化为本地择优,无法获得超越单引擎的准确率")
+		fmt.Fprintln(os.Stderr, "警告: 配置中 arbiter 为空,争议句段将使用本地候选;Web 模式下仍可人工合并")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout())

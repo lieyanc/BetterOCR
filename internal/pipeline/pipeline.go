@@ -21,8 +21,10 @@ import (
 type Config struct {
 	// Engines are fully resolved provider models. Repeats enable multi-sampling.
 	Engines []model.Resolved
-	// Arbiter is nil when disputed rows should use the local fallback.
+	// Arbiter is nil when disputed segments should use the local candidate.
 	Arbiter *model.Resolved
+	// DeferArbitration leaves disputes unresolved for user merge or a later call.
+	DeferArbitration bool
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
 	// OnDelta receives serialized model text fragments while engines and the
@@ -43,7 +45,7 @@ const (
 	StageArbiter = "arbiter"
 )
 
-// Run 执行一次完整识别:并发引擎 → 行级对齐 → 共识/仲裁融合。
+// Run 执行一次完整识别:并发全文 OCR → 中文句段对齐 → 共识/仲裁融合。
 func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	if len(cfg.Engines) == 0 {
 		return arbiter.Final{}, errors.New("未配置任何引擎模型")
@@ -55,8 +57,8 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 		if cfg.OnDelta == nil || delta.Text == "" {
 			return
 		}
-		// Engine calls run concurrently, so callbacks writing one response must
-		// never overlap.
+		// Engine calls run concurrently; keep callback invocations ordered and
+		// safe for streaming encoders that write to a single response.
 		progressMu.Lock()
 		defer progressMu.Unlock()
 		cfg.OnDelta(delta)
@@ -72,6 +74,7 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	}
 
 	arb := arbiter.New()
+	arb.DeferEscalation = cfg.DeferArbitration
 	if cfg.Arbiter != nil {
 		escalator := agents.NewVisionEscalator(*cfg.Arbiter, cfg.HTTPClient)
 		escalator.OnDelta = func(delta agents.StreamDelta) {

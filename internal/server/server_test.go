@@ -34,92 +34,6 @@ func testPNG(t *testing.T) []byte {
 	return buf.Bytes()
 }
 
-func TestOCRStreamEmitsDeltasThenResult(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var request struct {
-			Stream bool `json:"stream"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
-		}
-		if !request.Stream {
-			t.Error("upstream request did not enable streaming")
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" carefully\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	}))
-	defer upstream.Close()
-
-	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
-	body, contentType := multipartBody(t, testPNG(t), map[string]string{
-		"engines": "test/tiny-a,test/tiny-b",
-		"arbiter": "",
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/ocr/stream", body)
-	req.Header.Set("Content-Type", contentType)
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
-	}
-	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "application/x-ndjson") {
-		t.Errorf("Content-Type = %q", got)
-	}
-	var events []streamEvent
-	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
-		var event streamEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			t.Fatalf("invalid stream line %q: %v", line, err)
-		}
-		events = append(events, event)
-	}
-	if len(events) < 4 || events[0].Type != "start" {
-		t.Fatalf("events = %+v", events)
-	}
-	thinkingByAgent := make(map[string]*strings.Builder)
-	outputByAgent := make(map[string]*strings.Builder)
-	for _, event := range events[1 : len(events)-1] {
-		if event.Type != "delta" || event.Stage != pipeline.StageEngine || event.Agent == "" {
-			t.Errorf("unexpected progress event: %+v", event)
-		}
-		if thinkingByAgent[event.Agent] == nil {
-			thinkingByAgent[event.Agent] = &strings.Builder{}
-			outputByAgent[event.Agent] = &strings.Builder{}
-		}
-		switch event.Kind {
-		case string(agents.StreamThinking):
-			thinkingByAgent[event.Agent].WriteString(event.Text)
-		case string(agents.StreamOutput):
-			outputByAgent[event.Agent].WriteString(event.Text)
-		default:
-			t.Errorf("unexpected delta kind: %+v", event)
-		}
-	}
-	if len(thinkingByAgent) != 2 {
-		t.Fatalf("thinking grouped into %d agents, want 2", len(thinkingByAgent))
-	}
-	for agent, thinking := range thinkingByAgent {
-		if thinking.String() != "inspect carefully" {
-			t.Errorf("%s thinking = %q", agent, thinking.String())
-		}
-		if outputByAgent[agent].String() != "hello world" {
-			t.Errorf("%s output = %q", agent, outputByAgent[agent].String())
-		}
-	}
-	last := events[len(events)-1]
-	if last.Type != "result" || last.Result == nil || last.Result.Text != "hello world" {
-		t.Errorf("last event = %+v", last)
-	}
-	if strings.Contains(last.Result.Text, "inspect") {
-		t.Errorf("thinking leaked into final result: %q", last.Result.Text)
-	}
-}
-
 // fakeUpstream 模拟 OpenAI 兼容端点,记录每次请求的 Authorization 头。
 func fakeUpstream(content string) (*httptest.Server, func() []string) {
 	var mu sync.Mutex
@@ -192,7 +106,7 @@ func serverConfig(baseURL, apiKey string) config.Config {
 
 // TestOCREndToEnd 走完整链路:multipart 上传 → 双引擎并发 → 共识融合 → JSON。
 func TestOCREndToEnd(t *testing.T) {
-	upstream, auths := fakeUpstream("hello world\nsecond line")
+	upstream, auths := fakeUpstream("第一句。\n第二句。")
 	defer upstream.Close()
 
 	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
@@ -207,17 +121,17 @@ func TestOCREndToEnd(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &final); err != nil {
 		t.Fatal(err)
 	}
-	if final.Text != "hello world\nsecond line" {
+	if final.Text != "第一句。\n第二句。" {
 		t.Errorf("text = %q", final.Text)
 	}
 	// 两个引擎逐字一致,两行都是 2/2 共识;置信度由结构信号推导,不来自模型
 	if final.Confidence != 0.9239 {
 		t.Errorf("confidence = %v, want 0.9239 (2-of-2 consensus)", final.Confidence)
 	}
-	if s := final.Stats; s.Engines != 2 || s.ConsensusRows != 2 || s.FailedEngines != 0 {
+	if s := final.Stats; s.Engines != 2 || s.ConsensusSegments != 2 || s.FailedEngines != 0 {
 		t.Errorf("stats = %+v", s)
 	}
-	for _, l := range final.Lines {
+	for _, l := range final.Segments {
 		if l.Source != arbiter.SourceConsensus {
 			t.Errorf("line %+v, want consensus", l)
 		}
@@ -226,6 +140,140 @@ func TestOCREndToEnd(t *testing.T) {
 	for _, a := range auths() {
 		if a != "Bearer server-key" {
 			t.Errorf("Authorization = %q, want server key", a)
+		}
+	}
+}
+
+func TestOCRStreamEmitsDeltasThenResult(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if !request.Stream {
+			t.Error("upstream request did not enable streaming")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"considering\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
+	body, contentType := multipartBody(t, testPNG(t), map[string]string{
+		"engines": "test/tiny-a,test/tiny-b",
+		"arbiter": "",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/ocr/stream", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "application/x-ndjson") {
+		t.Errorf("Content-Type = %q", got)
+	}
+	var events []streamEvent
+	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
+		var event streamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("invalid stream line %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	if len(events) < 4 || events[0].Type != "start" {
+		t.Fatalf("events = %+v", events)
+	}
+	thinkingByAgent := make(map[string]string)
+	outputByAgent := make(map[string]string)
+	for _, event := range events[1 : len(events)-1] {
+		if event.Type != "delta" || event.Stage != pipeline.StageEngine || event.Agent == "" {
+			t.Errorf("unexpected progress event: %+v", event)
+		}
+		switch event.Kind {
+		case string(agents.StreamThinking):
+			thinkingByAgent[event.Agent] += event.Text
+		case string(agents.StreamOutput):
+			outputByAgent[event.Agent] += event.Text
+		default:
+			t.Errorf("unexpected delta kind: %+v", event)
+		}
+	}
+	if len(thinkingByAgent) != 2 || len(outputByAgent) != 2 {
+		t.Fatalf("thinking = %v, output = %v", thinkingByAgent, outputByAgent)
+	}
+	for agent, thinking := range thinkingByAgent {
+		if thinking != "considering" || outputByAgent[agent] != "hello world" {
+			t.Errorf("agent %q: thinking = %q, output = %q", agent, thinking, outputByAgent[agent])
+		}
+	}
+	last := events[len(events)-1]
+	if last.Type != "result" || last.Result == nil || last.Result.Text != "hello world" {
+		t.Errorf("last event = %+v", last)
+	}
+	if strings.Contains(last.Result.Text, "considering") {
+		t.Errorf("thinking leaked into result: %q", last.Result.Text)
+	}
+}
+
+func TestManualArbitrationStream(t *testing.T) {
+	var prompt string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Messages []struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		prompt = string(request.Messages[len(request.Messages)-1].Content)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"#3 正确句。\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	disputes, _ := json.Marshal([]arbiter.Dispute{{
+		Segment: 3, Before: "前句。", After: "后句。",
+		Candidates: []arbiter.Candidate{{Agent: "a", Text: "正确句。"}, {Agent: "b", Text: "正确信。"}},
+	}})
+	body, contentType := multipartBody(t, testPNG(t), map[string]string{
+		"arbiter": "test/big", "disputes": string(disputes),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/arbitrate/stream", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	(&Server{Config: serverConfig(upstream.URL, "server-key")}).Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	var events []streamEvent
+	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
+		var event streamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	last := events[len(events)-1]
+	if last.Type != "result" || len(last.Resolutions) != 1 {
+		t.Fatalf("events = %+v", events)
+	}
+	resolution := last.Resolutions[0]
+	if resolution.Segment != 3 || resolution.Text != "正确句。" || resolution.Confidence != 0.95 || len(resolution.From) != 1 {
+		t.Fatalf("resolution = %+v", resolution)
+	}
+	for _, want := range []string{"#3", "前句。", "后句。", "正确句。", "正确信。"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing %q: %s", want, prompt)
 		}
 	}
 }
@@ -359,9 +407,7 @@ func TestStaticHandlerUnbuilt(t *testing.T) {
 	}
 }
 
-// TestOCREscalationEndToEnd 走一遍真正有分歧的链路:两个引擎读出不同的第二行,
-// 仲裁模型按 "#<row> <text>" 纯文本格式裁定。这是唯一一处能同时验证
-// 引擎的按行输出、分歧提示词与仲裁回包格式在真实 HTTP 上串得起来的测试。
+// TestOCREscalationEndToEnd 验证全文切句、分歧提示词与仲裁回包格式。
 func TestOCREscalationEndToEnd(t *testing.T) {
 	var mu sync.Mutex
 	var arbiterPrompt string
@@ -377,9 +423,9 @@ func TestOCREscalationEndToEnd(t *testing.T) {
 			t.Error(err)
 		}
 		content := map[string]string{
-			"tiny-a": "shared first line\ninv0ice 042",
-			"tiny-b": "shared first line\ninvoice O42",
-			"big":    "#1 invoice 042", // 仲裁器只回分歧行
+			"tiny-a": "共同内容。\n发票编号inv0ice 042。",
+			"tiny-b": "共同内容。发票编号invoice O42。",
+			"big":    "#1 发票编号invoice 042。",
 		}[req.Model]
 		if req.Model == "big" {
 			mu.Lock()
@@ -406,19 +452,19 @@ func TestOCREscalationEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &final); err != nil {
 		t.Fatal(err)
 	}
-	if final.Text != "shared first line\ninvoice 042" {
+	if final.Text != "共同内容。\n发票编号invoice 042。" {
 		t.Errorf("text = %q", final.Text)
 	}
-	if s := final.Stats; s.Rows != 2 || s.ConsensusRows != 1 || s.EscalatedRows != 1 || s.EscalationErr != "" {
+	if s := final.Stats; s.Segments != 2 || s.ConsensusSegments != 1 || s.EscalatedSegments != 1 || s.EscalationErr != "" {
 		t.Errorf("stats = %+v, want 1 consensus + 1 escalated", s)
 	}
 	// 仲裁裁定不同于任何候选(两家都读错了),没有旁证 → solo 档
-	if l := final.Lines[1]; l.Source != arbiter.SourceEscalated || l.Confidence != 0.80 {
+	if l := final.Segments[1]; l.Source != arbiter.SourceEscalated || l.Confidence != 0.80 {
 		t.Errorf("escalated line = %+v, want solo-tier confidence", l)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	for _, want := range []string{"#1", "shared first line", "inv0ice 042", "invoice O42"} {
+	for _, want := range []string{"#1", "共同内容。", "inv0ice 042", "invoice O42"} {
 		if !strings.Contains(arbiterPrompt, want) {
 			t.Errorf("arbiter prompt missing %q, got %s", want, arbiterPrompt)
 		}
