@@ -76,16 +76,12 @@ func TestFuseChineseSegmentsThreePaths(t *testing.T) {
 	}
 }
 
-func TestFuseBatchesAllDisputesInOneEscalation(t *testing.T) {
+func TestFuseCombinesAdjacentDisputesIntoOneRegion(t *testing.T) {
 	esc := &fakeEsc{fn: func(disputes []Dispute) ([]Resolution, error) {
-		resolutions := make([]Resolution, 0, len(disputes))
-		for _, dispute := range disputes {
-			resolutions = append(resolutions, Resolution{
-				Segment: dispute.Segment,
-				Text:    "裁定:" + dispute.Candidates[0].Text,
-			})
-		}
-		return resolutions, nil
+		return []Resolution{{
+			Segment: disputes[0].Segment,
+			Text:    "发票编号042。应付金额128元。",
+		}}, nil
 	}}
 	fuser := New()
 	fuser.Escalator = esc
@@ -97,17 +93,20 @@ func TestFuseBatchesAllDisputesInOneEscalation(t *testing.T) {
 	if len(esc.calls) != 1 {
 		t.Fatalf("arbiter calls = %d, want exactly one batch", len(esc.calls))
 	}
-	if got := esc.calls[0]; len(got) != 2 || got[0].Segment != 1 || got[1].Segment != 2 {
-		t.Fatalf("batched disputes = %+v, want segments 1 and 2", got)
+	if got := esc.calls[0]; len(got) != 1 || got[0].Segment != 1 || len(got[0].Candidates) != 2 {
+		t.Fatalf("disputed regions = %+v, want one region with both engines", got)
 	}
-	if final.Stats.EscalatedSegments != 2 || final.Stats.FallbackSegments != 0 {
-		t.Fatalf("stats = %+v, want both disputes escalated", final.Stats)
+	if got := esc.calls[0][0].Candidates[0].Text; got != "发票编号042。应付金额128元。" {
+		t.Fatalf("first region candidate = %q", got)
 	}
-	for _, index := range []int{1, 2} {
-		segment := final.Segments[index]
-		if segment.Source != SourceEscalated || !strings.HasPrefix(segment.Text, "裁定:") {
-			t.Fatalf("segment %d = %+v, want escalated resolution", index, segment)
-		}
+	if final.Stats.EscalatedSegments != 1 || final.Stats.FallbackSegments != 0 {
+		t.Fatalf("stats = %+v, want one escalated region", final.Stats)
+	}
+	if len(final.Segments) != 2 || final.Segments[1].Source != SourceEscalated {
+		t.Fatalf("segments = %+v, want consensus plus one escalated region", final.Segments)
+	}
+	if final.Text != "共同内容。\n发票编号042。应付金额128元。" {
+		t.Fatalf("text = %q", final.Text)
 	}
 }
 
@@ -135,6 +134,32 @@ func TestFuseCanDeferArbitrationForUser(t *testing.T) {
 	}
 }
 
+func TestFuseCollapsesUnalignedLongRegionWithoutArbiter(t *testing.T) {
+	parts := []string{
+		"第一部分。", "第二部分。", "第三部分。", "第四部分。", "第五部分。",
+		"第六部分。", "第七部分。", "第八部分。", "第九部分。",
+	}
+	fuser := New()
+	fuser.DeferEscalation = true
+	final := fuser.Fuse(context.Background(), nil, []agent.Result{
+		result("a", "前锚点。"+strings.Join(parts, "")+"后锚点。"),
+		result("b", "前锚点。第一部分第二部分第三部分第四部分第五部分第六部分第七部分第八部分第九部分。后锚点。"),
+	})
+
+	if len(final.Segments) != 3 {
+		t.Fatalf("segments = %+v, want anchor + one disputed region + anchor", final.Segments)
+	}
+	middle := final.Segments[1]
+	if middle.Source != SourceFallback || len(middle.Candidates) != 2 {
+		t.Fatalf("middle region = %+v", middle)
+	}
+	for _, part := range parts {
+		if got := strings.Count(final.Text, strings.TrimSuffix(part, "。")); got != 1 {
+			t.Fatalf("%q occurs %d times in %q", part, got, final.Text)
+		}
+	}
+}
+
 func TestSymbolsAlignButRemainDisputed(t *testing.T) {
 	esc := &fakeEsc{fn: func(disputes []Dispute) ([]Resolution, error) {
 		return []Resolution{{Segment: 0, Text: "温度-5℃。"}}, nil
@@ -159,13 +184,12 @@ func TestEscalationFailureFallsBackWithCandidates(t *testing.T) {
 	final := fuser.Fuse(context.Background(), nil, []agent.Result{
 		result("a", "候选甲。"), result("b", "候选乙。"),
 	})
-	if final.Stats.EscalationErr != "model failed" || final.Stats.FallbackSegments != 2 {
+	if final.Stats.EscalationErr != "model failed" || final.Stats.FallbackSegments != 1 {
 		t.Fatalf("stats = %+v", final.Stats)
 	}
-	for _, segment := range final.Segments {
-		if segment.Source != SourceFallback || !segment.Disputed || len(segment.Candidates) != 1 {
-			t.Fatalf("fallback segment = %+v", segment)
-		}
+	if len(final.Segments) != 1 || final.Segments[0].Source != SourceFallback ||
+		!final.Segments[0].Disputed || len(final.Segments[0].Candidates) != 2 {
+		t.Fatalf("fallback region = %+v", final.Segments)
 	}
 }
 
@@ -178,8 +202,11 @@ func TestEscalatorCanDropSegment(t *testing.T) {
 	final := fuser.Fuse(context.Background(), nil, []agent.Result{
 		result("a", "模型寒暄内容。"), result("b", "正常正文。"),
 	})
-	if final.Stats.DroppedSegments != 1 || final.Stats.FallbackSegments != 1 {
+	if final.Stats.DroppedSegments != 1 || final.Stats.EscalatedSegments != 1 || final.Stats.FallbackSegments != 0 {
 		t.Fatalf("stats = %+v", final.Stats)
+	}
+	if len(final.Segments) != 0 {
+		t.Fatalf("dropped region remained in output: %+v", final.Segments)
 	}
 }
 

@@ -24,20 +24,24 @@ type Config struct {
 	Engines []model.Resolved
 	// Arbiter is nil when disputed segments should use the local candidate.
 	Arbiter *model.Resolved
+	// DuplicateChecker configures the optional text-only Fast Model.
+	DuplicateChecker *model.Resolved
 	// DeferArbitration leaves disputes unresolved for user merge or a later call.
 	DeferArbitration bool
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
 	// EngineTimeout is the maximum idle period for every engine attempt.
 	EngineTimeout time.Duration
-	// ArbiterTimeout is the maximum idle period for every arbitration attempt.
+	// ArbiterTimeout is the maximum idle period for every arbitration or Fast
+	// Model attempt.
 	ArbiterTimeout time.Duration
 	// EngineMaxAttempts is per engine; one means no retry.
 	EngineMaxAttempts int
-	// ArbiterMaxAttempts applies only to arbitration; one means no retry.
+	// ArbiterMaxAttempts applies to arbitration and the Fast Model.
 	ArbiterMaxAttempts int
-	// OnDelta receives serialized model text fragments while engines and the
-	// optional arbiter are running. Nil disables progress reporting.
+	// OnDelta receives serialized model text fragments while engines, the
+	// optional arbiter, and the Fast Model are running. Nil disables
+	// progress reporting.
 	OnDelta func(Delta)
 	// OnEvent receives model lifecycle and text events. Lifecycle events make
 	// the engine-completion barrier before arbitration observable.
@@ -67,8 +71,9 @@ type Event struct {
 }
 
 const (
-	StageEngine  = "engine"
-	StageArbiter = "arbiter"
+	StageEngine         = "engine"
+	StageArbiter        = "arbiter"
+	StageDuplicateCheck = "duplicate_check"
 
 	EventStageStart    = "stage_start"
 	EventStageDone     = "stage_done"
@@ -165,15 +170,53 @@ func ResolveWithRetry(
 	maxAttempts int,
 	emit func(Event),
 ) ([]arbiter.Resolution, error) {
+	return runWithRetry(
+		ctx, StageArbiter, escalator.Name(), escalator, timeout, maxAttempts, emit,
+		func(attemptCtx context.Context) ([]arbiter.Resolution, error) {
+			return escalator.Resolve(attemptCtx, image, disputes)
+		},
+	)
+}
+
+type duplicateChecker interface {
+	Name() string
+	Check(context.Context, []arbiter.FinalSegment) ([]arbiter.DuplicatePair, error)
+}
+
+func checkDuplicatesWithRetry(
+	ctx context.Context,
+	checker duplicateChecker,
+	segments []arbiter.FinalSegment,
+	timeout time.Duration,
+	maxAttempts int,
+	emit func(Event),
+) ([]arbiter.DuplicatePair, error) {
+	return runWithRetry(
+		ctx, StageDuplicateCheck, checker.Name(), checker, timeout, maxAttempts, emit,
+		func(attemptCtx context.Context) ([]arbiter.DuplicatePair, error) {
+			return checker.Check(attemptCtx, segments)
+		},
+	)
+}
+
+func runWithRetry[T any](
+	ctx context.Context,
+	stage, name string,
+	target any,
+	timeout time.Duration,
+	maxAttempts int,
+	emit func(Event),
+	execute func(context.Context) (T, error),
+) (T, error) {
 	if emit == nil {
 		emit = func(Event) {}
 	}
 	started := time.Now()
 	maxAttempts = normalizeAttempts(maxAttempts)
 	emit(Event{
-		Type: EventAgentStart, Stage: StageArbiter, Agent: escalator.Name(), MaxAttempts: maxAttempts,
+		Type: EventAgentStart, Stage: stage, Agent: name, MaxAttempts: maxAttempts,
 	})
-	var resolutions []arbiter.Resolution
+	var result T
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if parentErr := ctx.Err(); parentErr != nil {
@@ -181,21 +224,21 @@ func ResolveWithRetry(
 			break
 		}
 		emit(Event{
-			Type: EventAttemptStart, Stage: StageArbiter, Agent: escalator.Name(),
+			Type: EventAttemptStart, Stage: stage, Agent: name,
 			Attempt: attempt, MaxAttempts: maxAttempts,
 		})
 		attemptStarted := time.Now()
 		attemptCtx, cancel, touch := withIdleTimeout(ctx, timeout)
-		setActivityCallback(escalator, touch)
-		resolutions, err = escalator.Resolve(attemptCtx, image, disputes)
-		setActivityCallback(escalator, nil)
+		setActivityCallback(target, touch)
+		result, err = execute(attemptCtx)
+		setActivityCallback(target, nil)
 		err = idleTimeoutError(ctx, attemptCtx, timeout, err)
 		cancel()
 		if err == nil {
 			break
 		}
 		emit(Event{
-			Type: EventAttemptFailed, Stage: StageArbiter, Agent: escalator.Name(),
+			Type: EventAttemptFailed, Stage: stage, Agent: name,
 			Attempt: attempt, MaxAttempts: maxAttempts,
 			LatencyMS: time.Since(attemptStarted).Milliseconds(), Error: err.Error(),
 		})
@@ -205,14 +248,14 @@ func ResolveWithRetry(
 		}
 	}
 	event := Event{
-		Type: EventAgentDone, Stage: StageArbiter, Agent: escalator.Name(),
+		Type: EventAgentDone, Stage: stage, Agent: name,
 		LatencyMS: time.Since(started).Milliseconds(), MaxAttempts: maxAttempts,
 	}
 	if err != nil {
 		event.Error = err.Error()
 	}
 	emit(event)
-	return resolutions, err
+	return result, err
 }
 
 func normalizeTimeout(timeout time.Duration) time.Duration {
@@ -361,6 +404,28 @@ func Run(ctx context.Context, cfg Config, image []byte) (arbiter.Final, error) {
 	results := agent.NewCoordinator(reg).RunConcurrent(ctx, image)
 	emit(Event{Type: EventStageDone, Stage: StageEngine, Total: len(results)})
 	final := arb.Fuse(ctx, image, results)
+	if cfg.DuplicateChecker != nil {
+		checker := agents.NewDuplicateChecker(*cfg.DuplicateChecker, cfg.HTTPClient)
+		final.Stats.DuplicateChecker = checker.Name()
+		if len(final.Segments) > 1 {
+			checker.OnDelta = func(delta agents.StreamDelta) {
+				emit(Event{
+					Type: EventDelta, Stage: StageDuplicateCheck, Agent: checker.Name(),
+					Kind: string(delta.Kind), Text: delta.Text,
+				})
+			}
+			pairs, err := checkDuplicatesWithRetry(
+				ctx, checker, final.Segments, cfg.ArbiterTimeout, cfg.ArbiterMaxAttempts, emit,
+			)
+			if err != nil {
+				final.Stats.DuplicateCheckErr = err.Error()
+			} else {
+				var removed int
+				final, removed = arbiter.ApplyDuplicatePairs(final, pairs)
+				final.Stats.DuplicateSegments = removed
+			}
+		}
+	}
 	emit(Event{Type: EventDone})
 	return final, nil
 }

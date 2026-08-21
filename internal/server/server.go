@@ -136,6 +136,7 @@ type configResponse struct {
 	Providers        []providerResponse `json:"providers"`
 	Engines          []string           `json:"engines"`
 	Arbiter          string             `json:"arbiter"`
+	DuplicateChecker string             `json:"duplicate_checker"`
 	TimeoutMS        int64              `json:"timeout_ms"`
 	EngineTimeoutMS  int64              `json:"engine_timeout_ms"`
 	ArbiterTimeoutMS int64              `json:"arbiter_timeout_ms"`
@@ -166,9 +167,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, configResponse{
-		Providers: providers,
-		Engines:   engines,
-		Arbiter:   cfg.Arbiter,
+		Providers:        providers,
+		Engines:          engines,
+		Arbiter:          cfg.Arbiter,
+		DuplicateChecker: cfg.DuplicateChecker,
 		// timeout_ms remains as a compatibility alias for engine_timeout_ms.
 		TimeoutMS:        s.engineTimeout().Milliseconds(),
 		EngineTimeoutMS:  s.engineTimeout().Milliseconds(),
@@ -401,16 +403,16 @@ func (s *Server) parseArbitrationRequest(w http.ResponseWriter, r *http.Request)
 	}
 	var disputes []arbiter.Dispute
 	if err := json.Unmarshal([]byte(formOr(r, "disputes", "")), &disputes); err != nil {
-		writeErr(w, http.StatusBadRequest, "争议句段格式无效: "+err.Error())
+		writeErr(w, http.StatusBadRequest, "争议区域格式无效: "+err.Error())
 		return nil, model.Resolved{}, nil, false
 	}
 	if len(disputes) == 0 || len(disputes) > 200 {
-		writeErr(w, http.StatusBadRequest, "争议句段数量必须在 1 到 200 之间")
+		writeErr(w, http.StatusBadRequest, "争议区域数量必须在 1 到 200 之间")
 		return nil, model.Resolved{}, nil, false
 	}
 	for _, dispute := range disputes {
 		if dispute.Segment < 0 || len(dispute.Candidates) == 0 || len(dispute.Candidates) > 32 {
-			writeErr(w, http.StatusBadRequest, "争议句段缺少有效编号或候选")
+			writeErr(w, http.StatusBadRequest, "争议区域缺少有效编号或候选")
 			return nil, model.Resolved{}, nil, false
 		}
 	}
@@ -459,9 +461,19 @@ func (s *Server) parseOCRRequest(w http.ResponseWriter, r *http.Request) ([]byte
 		}
 		arbiterModel = &resolved
 	}
+	var duplicateChecker *model.Resolved
+	if checkerRef := formOr(r, "duplicate_checker", cfg.DuplicateChecker); checkerRef != "" {
+		resolved, err := cfg.Resolve(checkerRef)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return nil, pipeline.Config{}, false
+		}
+		duplicateChecker = &resolved
+	}
 	return image, pipeline.Config{
 		Engines:            engines,
 		Arbiter:            arbiterModel,
+		DuplicateChecker:   duplicateChecker,
 		DeferArbitration:   strings.EqualFold(formOr(r, "auto_arbitrate", "true"), "false"),
 		HTTPClient:         s.HTTPClient,
 		EngineTimeout:      s.engineTimeout(),

@@ -34,6 +34,9 @@ export interface Stats {
   dropped_segments?: number
   escalator?: string
   escalation_err?: string
+  duplicate_checker?: string
+  duplicate_check_err?: string
+  duplicate_segments?: number
 }
 
 export interface Final {
@@ -68,6 +71,7 @@ export interface ServerConfig {
   providers: Provider[]
   engines: string[]
   arbiter: string
+  duplicate_checker: string
   timeout_ms: number
   engine_timeout_ms: number
   arbiter_timeout_ms: number
@@ -99,6 +103,7 @@ export interface TaskRecord {
   status: "running" | "completed" | "failed"
   engines: string[]
   arbiter?: string
+  duplicate_checker?: string
   created_at: string
   completed_at?: string
   duration_ms?: number
@@ -114,6 +119,7 @@ export interface AdminSettings {
   providers: SettingsProvider[]
   engines: string[]
   arbiter: string
+  duplicate_checker: string
   engine_timeout_seconds: number
   arbiter_timeout_seconds: number
   engine_max_attempts: number
@@ -287,6 +293,7 @@ export interface DocumentProjectRecord {
   pending_disputes: number
   engines: string[]
   arbiter?: string
+  duplicate_checker?: string
   auto_arbitrate: boolean
   created_at: string
   updated_at: string
@@ -306,6 +313,7 @@ export interface DocumentDisputeItem {
 export interface DocumentRunSettings {
   engines: string[]
   arbiter: string
+  duplicateChecker: string
   autoArbitrate: boolean
 }
 
@@ -315,12 +323,13 @@ export type DocumentProgressStage =
   | "engine"
   | "merge"
   | "arbiter"
+  | "duplicate_check"
   | "saving"
   | "complete"
 
 export interface DocumentAgentProgress {
   agent: string
-  stage: "engine" | "arbiter"
+  stage: "engine" | "arbiter" | "duplicate_check"
   status:
     | "waiting"
     | "thinking"
@@ -416,6 +425,7 @@ export function uploadDocument(
     filename: file.name,
     engines: settings.engines.join(","),
     arbiter: settings.arbiter,
+    duplicate_checker: settings.duplicateChecker,
     auto_arbitrate: String(settings.autoArbitrate),
   })
   return new Promise((resolve, reject) => {
@@ -463,6 +473,7 @@ export async function runDocument(
     {
       engines: settings.engines,
       arbiter: settings.arbiter,
+      duplicate_checker: settings.duplicateChecker,
       auto_arbitrate: settings.autoArbitrate,
     },
     "启动文档识别",
@@ -565,13 +576,14 @@ export interface OCRRequest {
   image: File
   engines: string[]
   arbiter: string
+  duplicateChecker: string
   autoArbitrate: boolean
   signal?: AbortSignal
 }
 
 export interface OCRDelta {
   type: "delta" | "attempt_start" | "attempt_failed"
-  stage: "engine" | "arbiter"
+  stage: "engine" | "arbiter" | "duplicate_check"
   agent: string
   kind: "thinking" | "output"
   text: string
@@ -623,6 +635,7 @@ export async function runOCR(
   fd.append("engines", req.engines.join(","))
   // 显式空值表示清空仲裁模型,而不是回退服务端默认。
   fd.append("arbiter", req.arbiter)
+  fd.append("duplicate_checker", req.duplicateChecker)
   fd.append("auto_arbitrate", String(req.autoArbitrate))
 
   const res = await apiFetch("/api/ocr/stream", {

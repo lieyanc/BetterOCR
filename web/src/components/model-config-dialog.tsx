@@ -59,23 +59,32 @@ interface ModelConfigDialogProps {
   config: ServerConfig | null
   engines: string[]
   arbiter: string
-  onApply: (engines: string[], arbiter: string) => void
+  duplicateChecker: string
+  onApply: (
+    engines: string[],
+    arbiter: string,
+    duplicateChecker: string,
+  ) => void
 }
 
 export function ModelConfigDialog({
   config,
   engines,
   arbiter,
+  duplicateChecker,
   onApply,
 }: ModelConfigDialogProps) {
   const [open, setOpen] = useState(false)
   const [draftEngines, setDraftEngines] = useState(engines)
   const [draftArbiter, setDraftArbiter] = useState(arbiter)
+  const [draftDuplicateChecker, setDraftDuplicateChecker] =
+    useState(duplicateChecker)
 
   const handleOpenChange = (next: boolean) => {
     if (next) {
       setDraftEngines(engines)
       setDraftArbiter(arbiter)
+      setDraftDuplicateChecker(duplicateChecker)
     }
     setOpen(next)
   }
@@ -159,25 +168,27 @@ export function ModelConfigDialog({
                               toggleEngine(ref, value === true)
                             }
                           />
-                          <FieldContent className="min-w-0">
-                            <FieldTitle className="truncate">
-                              {model.alias}
-                            </FieldTitle>
-                            <FieldDescription
-                              className="truncate text-xs"
-                              title={model.id}
-                            >
-                              {model.id}
-                            </FieldDescription>
-                          </FieldContent>
-                          <span className="flex shrink-0 flex-col items-end gap-1">
-                            <Badge variant="outline">
-                              {apiLabels[model.api]}
-                            </Badge>
-                            <span className="text-xs tabular-nums text-muted-foreground">
-                              {formatContext(model.context)} context
+                          <div className="flex min-w-0 flex-1 flex-col gap-2 min-[421px]:flex-row min-[421px]:items-center">
+                            <FieldContent className="min-w-0">
+                              <FieldTitle className="truncate">
+                                {model.alias}
+                              </FieldTitle>
+                              <FieldDescription
+                                className="truncate text-xs"
+                                title={model.id}
+                              >
+                                {model.id}
+                              </FieldDescription>
+                            </FieldContent>
+                            <span className="flex shrink-0 flex-col items-start gap-1 min-[421px]:items-end">
+                              <Badge variant="outline">
+                                {apiLabels[model.api]}
+                              </Badge>
+                              <span className="text-xs tabular-nums text-muted-foreground">
+                                {formatContext(model.context)} context
+                              </span>
                             </span>
-                          </span>
+                          </div>
                         </Field>
                       </FieldLabel>
                     )
@@ -220,6 +231,40 @@ export function ModelConfigDialog({
           </Select>
         </Field>
 
+        <Field>
+          <FieldLabel htmlFor="duplicate-checker-model">
+            Fast Model
+          </FieldLabel>
+          <Select
+            value={draftDuplicateChecker || noArbiter}
+            onValueChange={(value) =>
+              setDraftDuplicateChecker(value === noArbiter ? "" : value)
+            }
+          >
+            <SelectTrigger id="duplicate-checker-model" className="w-full">
+              <SelectValue placeholder="选择 Fast Model" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value={noArbiter}>不使用 Fast Model</SelectItem>
+              </SelectGroup>
+              {config?.providers.map((provider) => (
+                <SelectGroup key={provider.id}>
+                  <SelectLabel>{provider.alias}</SelectLabel>
+                  {provider.models.map((model) => (
+                    <SelectItem
+                      key={`${provider.id}/${model.id}`}
+                      value={`${provider.id}/${model.id}`}
+                    >
+                      {provider.alias} · {model.alias} · {apiLabels[model.api]}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+
         <DialogFooter className="items-center sm:justify-between">
           <p className="text-xs text-muted-foreground">
             已选 {draftEngines.length} 个基础模型
@@ -230,6 +275,7 @@ export function ModelConfigDialog({
               onClick={() => {
                 setDraftEngines(config?.engines ?? [])
                 setDraftArbiter(config?.arbiter ?? "")
+                setDraftDuplicateChecker(config?.duplicate_checker ?? "")
               }}
             >
               恢复默认
@@ -237,7 +283,11 @@ export function ModelConfigDialog({
             <Button
               disabled={draftEngines.length === 0}
               onClick={() => {
-                onApply(draftEngines, draftArbiter)
+                onApply(
+                  draftEngines,
+                  draftArbiter,
+                  draftDuplicateChecker,
+                )
                 setOpen(false)
               }}
             >

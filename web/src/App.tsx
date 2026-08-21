@@ -7,6 +7,7 @@ import {
   Loader2,
   LogOut,
   Moon,
+  ScanSearch,
   ScanText,
   Sun,
 } from "lucide-react"
@@ -141,6 +142,7 @@ function OCRWorkspace({
   const [cfg, setCfg] = useState<ServerConfig | null>(null)
   const [engines, setEngines] = useState<string[]>([])
   const [arbiter, setArbiter] = useState("")
+  const [duplicateChecker, setDuplicateChecker] = useState("")
 
   const loadConfig = useCallback(() => {
     fetchConfig()
@@ -152,12 +154,14 @@ function OCRWorkspace({
         )
         let nextEngines = c.engines
         let nextArbiter = c.arbiter
+        let nextDuplicateChecker = c.duplicate_checker ?? ""
         try {
           const saved = JSON.parse(
             localStorage.getItem(selectionStorageKey) ?? "null",
           ) as {
             engines?: unknown
             arbiter?: unknown
+            duplicateChecker?: unknown
           } | null
           if (Array.isArray(saved?.engines)) {
             const filtered = saved.engines.filter(
@@ -172,12 +176,20 @@ function OCRWorkspace({
           ) {
             nextArbiter = saved.arbiter
           }
+          if (
+            typeof saved?.duplicateChecker === "string" &&
+            (saved.duplicateChecker === "" ||
+              validRefs.has(saved.duplicateChecker))
+          ) {
+            nextDuplicateChecker = saved.duplicateChecker
+          }
         } catch {
           localStorage.removeItem(selectionStorageKey)
         }
         setCfg(c)
         setEngines(nextEngines)
         setArbiter(nextArbiter)
+        setDuplicateChecker(nextDuplicateChecker)
       })
       .catch((cause) => {
         setError(cause instanceof Error ? cause.message : "加载模型配置失败")
@@ -201,12 +213,21 @@ function OCRWorkspace({
     return index
   }, [cfg])
 
-  const applyModelSelection = (nextEngines: string[], nextArbiter: string) => {
+  const applyModelSelection = (
+    nextEngines: string[],
+    nextArbiter: string,
+    nextDuplicateChecker: string,
+  ) => {
     setEngines(nextEngines)
     setArbiter(nextArbiter)
+    setDuplicateChecker(nextDuplicateChecker)
     localStorage.setItem(
       selectionStorageKey,
-      JSON.stringify({ engines: nextEngines, arbiter: nextArbiter }),
+      JSON.stringify({
+        engines: nextEngines,
+        arbiter: nextArbiter,
+        duplicateChecker: nextDuplicateChecker,
+      }),
     )
   }
 
@@ -237,6 +258,7 @@ function OCRWorkspace({
               config={cfg}
               engines={engines}
               arbiter={arbiter}
+              duplicateChecker={duplicateChecker}
               onApply={applyModelSelection}
             />
             <Badge variant="outline" className="hidden md:inline-flex">
@@ -317,6 +339,23 @@ function OCRWorkspace({
                 : "本地兜底"}
             </Badge>
           </div>
+          <ArrowRight className="hidden size-4 shrink-0 text-muted-foreground sm:block" />
+          <div className="flex min-w-0 basis-full items-center gap-2 sm:basis-auto">
+            <ScanSearch className="size-4 shrink-0 text-muted-foreground" />
+            <span className="text-xs font-medium text-muted-foreground">
+              Fast Model
+            </span>
+            <Badge variant="outline" title={duplicateChecker || undefined}>
+              {duplicateChecker
+                ? (() => {
+                    const m = modelIndex.get(duplicateChecker)
+                    return m
+                      ? `${m.provider} · ${m.alias}`
+                      : duplicateChecker
+                  })()
+                : "未启用"}
+            </Badge>
+          </div>
         </div>
 
         {error && (
@@ -326,7 +365,11 @@ function OCRWorkspace({
             <AlertDescription className="break-all">{error}</AlertDescription>
           </Alert>
         )}
-        <DocumentWorkspace engines={engines} arbiter={arbiter} />
+        <DocumentWorkspace
+          engines={engines}
+          arbiter={arbiter}
+          duplicateChecker={duplicateChecker}
+        />
       </main>
     </div>
   )

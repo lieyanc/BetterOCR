@@ -48,8 +48,16 @@ const (
 	moveDiag = int8(iota)
 	moveUp
 	moveLeft
-	moveRowsPair // 已有两个句段 ↔ 新结果一个句段
-	moveTextPair // 已有一个句段 ↔ 新结果两个句段
+	moveSpan // 已有多个句段 ↔ 新结果多个句段
+)
+
+const (
+	// maxAlignSpan 限制一次转移合并的边界数。更大的无锚点区域会在融合层
+	// 继续合成争议块,因此这里无需用无界搜索拖慢正常页面。
+	maxAlignSpan = 8
+	// spanBoundaryPenalty 只用于打破“保留边界”和“合并边界”的竞争。
+	// 多个可靠的 1:1 匹配天然会获得更高总分,这里保持很小即可。
+	spanBoundaryPenalty = 0.02
 )
 
 type step struct {
@@ -58,8 +66,9 @@ type step struct {
 	prevJ int
 }
 
-// mergeSegments 使用带 1:2 / 2:1 转移的序列对齐。额外两种转移专门吸收
-// 模型漏掉或多写句末标点造成的边界差异。
+// mergeSegments 使用有界多对多动态规划对齐句段序列。不同 OCR 模型常把
+// 同一段分别切成 1、3、5 个句段;只支持 1:2 / 2:1 会把这些替代读法排成
+// 多份正文。span 转移比较拼接后的内容,同时让可靠的细粒度匹配优先。
 func mergeSegments(rows []*row, agentName string, texts []string, threshold float64) []*row {
 	if len(rows) == 0 {
 		out := make([]*row, 0, len(texts))
@@ -73,6 +82,8 @@ func mergeSegments(rows []*row, agentName string, texts []string, threshold floa
 	for i, r := range rows {
 		anchors[i] = r.rep().text
 	}
+	anchorCores := alignmentSpanFingerprints(anchors)
+	textCores := alignmentSpanFingerprints(texts)
 	dp := make([][]float64, m+1)
 	trace := make([][]step, m+1)
 	for i := range dp {
@@ -94,19 +105,30 @@ func mergeSegments(rows []*row, agentName string, texts []string, threshold floa
 			if score := dp[i][j-1]; score > best {
 				best, choice = score, step{move: moveLeft, prevI: i, prevJ: j - 1}
 			}
-			if score := dp[i-1][j-1] + Similarity(anchors[i-1], texts[j-1]) - threshold; score > best {
-				best, choice = score, step{move: moveDiag, prevI: i - 1, prevJ: j - 1}
-			}
-			if i >= 2 {
-				combined := anchors[i-2] + anchors[i-1]
-				if score := dp[i-2][j-1] + Similarity(combined, texts[j-1]) - threshold - 0.05; score > best {
-					best, choice = score, step{move: moveRowsPair, prevI: i - 2, prevJ: j - 1}
+			if similarity, ok := anchorCores[i][1].similarityAbove(textCores[j][1], threshold); ok {
+				if score := dp[i-1][j-1] + similarity - threshold; score > best {
+					best, choice = score, step{move: moveDiag, prevI: i - 1, prevJ: j - 1}
 				}
 			}
-			if j >= 2 {
-				combined := texts[j-2] + texts[j-1]
-				if score := dp[i-1][j-2] + Similarity(anchors[i-1], combined) - threshold - 0.05; score > best {
-					best, choice = score, step{move: moveTextPair, prevI: i - 1, prevJ: j - 2}
+			maxRows := min(i, maxAlignSpan)
+			maxTexts := min(j, maxAlignSpan)
+			for rowSpan := 1; rowSpan <= maxRows; rowSpan++ {
+				for textSpan := 1; textSpan <= maxTexts; textSpan++ {
+					if rowSpan == 1 && textSpan == 1 {
+						continue
+					}
+					penalty := spanBoundaryPenalty * float64(rowSpan+textSpan-2)
+					similarity, ok := anchorCores[i][rowSpan].similarityAbove(
+						textCores[j][textSpan], threshold+penalty,
+					)
+					if !ok {
+						continue
+					}
+					score := dp[i-rowSpan][j-textSpan] + similarity - threshold - penalty
+					if score > best {
+						best = score
+						choice = step{move: moveSpan, prevI: i - rowSpan, prevJ: j - textSpan}
+					}
 				}
 			}
 			dp[i][j], trace[i][j] = best, choice
@@ -131,14 +153,29 @@ func mergeSegments(rows []*row, agentName string, texts []string, threshold floa
 			out = append(out, cloneRow(rows[op.i0]))
 		case moveLeft:
 			out = append(out, &row{cands: []cand{{agent: agentName, text: texts[op.j0]}}})
-		case moveRowsPair:
-			r := combineRows(rows[op.i0], rows[op.i0+1])
-			r.cands = append(r.cands, cand{agent: agentName, text: texts[op.j0]})
+		case moveSpan:
+			r := combineRows(rows[op.i0:op.i1])
+			r.cands = append(r.cands, cand{
+				agent: agentName,
+				text:  strings.Join(texts[op.j0:op.j1], ""),
+			})
 			out = append(out, r)
-		case moveTextPair:
-			r := cloneRow(rows[op.i0])
-			r.cands = append(r.cands, cand{agent: agentName, text: texts[op.j0] + texts[op.j0+1]})
-			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// alignmentSpanFingerprints 缓存每个结束位置向前 1..maxAlignSpan 个句段的
+// 正文骨架及 bigram 集合,让 DP 内的相似度比较不再重复分配 map。
+func alignmentSpanFingerprints(texts []string) [][]coreFingerprint {
+	out := make([][]coreFingerprint, len(texts)+1)
+	for end := 1; end <= len(texts); end++ {
+		limit := min(end, maxAlignSpan)
+		out[end] = make([]coreFingerprint, limit+1)
+		combined := ""
+		for span := 1; span <= limit; span++ {
+			combined = texts[end-span] + combined
+			out[end][span] = newCoreFingerprint(CoreNormalize(combined))
 		}
 	}
 	return out
@@ -154,11 +191,12 @@ func cloneRow(src *row) *row {
 	return &row{cands: append([]cand(nil), src.cands...)}
 }
 
-func combineRows(a, b *row) *row {
-	byAgent := make(map[string][]string, len(a.cands)+len(b.cands))
-	all := append(append([]cand(nil), a.cands...), b.cands...)
-	for _, c := range all {
-		byAgent[c.agent] = append(byAgent[c.agent], c.text)
+func combineRows(rows []*row) *row {
+	byAgent := make(map[string][]string)
+	for _, row := range rows {
+		for _, c := range row.cands {
+			byAgent[c.agent] = append(byAgent[c.agent], c.text)
+		}
 	}
 	agents := make([]string, 0, len(byAgent))
 	for name := range byAgent {

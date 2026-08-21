@@ -127,20 +127,22 @@ func (e *VisionEscalator) emitDelta(delta StreamDelta) {
 	}
 }
 
-const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several OCR engines transcribed the same image. The disputed sentence segments listed below were aligned by their Chinese text content, not by physical image lines. Look at the image and decide the exact text for each segment.
+const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several OCR engines transcribed the same image. The disputed text regions below are bounded by reliable surrounding text. Each numbered region may contain one or more adjacent sentences, and the engine entries under it are alternative transcriptions of that same region. Look at the image and produce one exact, non-repeating transcription for each region.
 
-Output one plain-text line per disputed segment, in exactly this form:
+Output one plain-text line per disputed region, in exactly this form:
 
-#<segment> <the exact text>
+#<region> <the complete exact text>
 
 Rules:
-- Emit exactly one line per disputed segment, reusing the segment numbers given below.
+- Emit exactly one line per disputed region, reusing the region numbers given below.
 - Read the actual image; do not simply pick the most common candidate.
+- Candidate boundaries may differ or overlap. Reconcile them into one transcription and never repeat overlapping text.
+- The "between" texts are location anchors only. Do not include them in the region output.
 - Preserve punctuation and symbols exactly; they are part of the OCR result.
-- If a disputed segment does not actually exist in the image, emit "#<segment>" with nothing after it.
+- If a disputed region does not actually exist in the image, emit "#<region>" with nothing after it.
 - Do not add commentary, markdown, or code fences.`
 
-// Resolve implements arbiter.Escalator and batches all disputed segments in one call.
+// Resolve implements arbiter.Escalator and batches all disputed regions in one call.
 func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []arbiter.Dispute) ([]arbiter.Resolution, error) {
 	content, err := vision(ctx, e.Model, e.Client, escalatorSystem, disputesPrompt(disputes), image, e.emitDelta)
 	if err != nil {
@@ -173,10 +175,10 @@ func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []
 		seen[dispute.Segment] = struct{}{}
 		out = append(out, arbiter.Resolution{Segment: dispute.Segment, Text: text})
 	}
-	// 一个句段编号都认不出来是真失败,必须报错:静默返回空会让全部争议
+	// 一个区域编号都认不出来是真失败,必须报错:静默返回空会让全部争议
 	// 走本地兜底,而 Stats.EscalationErr 是空的——问题被藏起来了。
 	if len(out) == 0 {
-		return nil, fmt.Errorf("仲裁输出中没有 \"#<segment> <text>\" 形式的行: %.200s", content)
+		return nil, fmt.Errorf("仲裁输出中没有 \"#<region> <text>\" 形式的行: %.200s", content)
 	}
 	return out, nil
 }
@@ -209,7 +211,7 @@ func parseRowLine(s string) (int, string, bool) {
 
 func disputesPrompt(disputes []arbiter.Dispute) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Disputed sentence segments (%d):\n", len(disputes))
+	fmt.Fprintf(&sb, "Disputed text regions (%d):\n", len(disputes))
 	for _, d := range disputes {
 		fmt.Fprintf(&sb, "\n#%d", d.Segment)
 		if d.Before != "" || d.After != "" {
@@ -222,7 +224,7 @@ func disputesPrompt(disputes []arbiter.Dispute) string {
 			fmt.Fprintf(&sb, "  - engine %q read: %q\n", c.Agent, c.Text)
 		}
 	}
-	sb.WriteString("\nReturn one \"#<segment> <text>\" line per disputed segment.")
+	sb.WriteString("\nReturn one \"#<region> <text>\" line per disputed region.")
 	return sb.String()
 }
 
@@ -241,6 +243,22 @@ func vision(ctx context.Context, resolved model.Resolved, client *http.Client, s
 		return openAIResponses(ctx, resolved, client, system, userText, mediaType, image, onDelta)
 	case model.APIAnthropicMessages:
 		return anthropicMessages(ctx, resolved, client, system, userText, mediaType, image, onDelta)
+	default:
+		return "", fmt.Errorf("模型 %s 使用了不受支持的 API %q", resolved.Ref, resolved.API)
+	}
+}
+
+func textCompletion(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText string, onDelta func(StreamDelta)) (string, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	switch resolved.API {
+	case model.APIOpenAIChatCompletions:
+		return openAIChat(ctx, resolved, client, system, userText, "", nil, onDelta)
+	case model.APIOpenAIResponses:
+		return openAIResponses(ctx, resolved, client, system, userText, "", nil, onDelta)
+	case model.APIAnthropicMessages:
+		return anthropicMessages(ctx, resolved, client, system, userText, "", nil, onDelta)
 	default:
 		return "", fmt.Errorf("模型 %s 使用了不受支持的 API %q", resolved.Ref, resolved.API)
 	}
@@ -269,14 +287,18 @@ type chatImageURL struct {
 }
 
 func openAIChat(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte, onDelta func(StreamDelta)) (string, error) {
+	var userContent any = userText
+	if len(image) > 0 {
+		userContent = []chatContentPart{
+			{Type: "image_url", ImageURL: &chatImageURL{URL: imageDataURL(mediaType, image)}},
+			{Type: "text", Text: userText},
+		}
+	}
 	body := chatRequest{
 		Model: resolved.ID,
 		Messages: []chatMessage{
 			{Role: "system", Content: system},
-			{Role: "user", Content: []chatContentPart{
-				{Type: "image_url", ImageURL: &chatImageURL{URL: imageDataURL(mediaType, image)}},
-				{Type: "text", Text: userText},
-			}},
+			{Role: "user", Content: userContent},
 		},
 		MaxTokens: maxOutputTokens(resolved.Context),
 		Stream:    true,
@@ -328,11 +350,11 @@ func parseChatResponse(raw []byte, resolved model.Resolved) (modelOutput, error)
 }
 
 type responsesRequest struct {
-	Model           string             `json:"model"`
-	Instructions    string             `json:"instructions"`
-	Input           []responsesMessage `json:"input"`
-	MaxOutputTokens int                `json:"max_output_tokens,omitempty"`
-	Stream          bool               `json:"stream"`
+	Model           string `json:"model"`
+	Instructions    string `json:"instructions"`
+	Input           any    `json:"input"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
+	Stream          bool   `json:"stream"`
 }
 
 type responsesMessage struct {
@@ -347,16 +369,20 @@ type responsesContentPart struct {
 }
 
 func openAIResponses(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte, onDelta func(StreamDelta)) (string, error) {
-	body := responsesRequest{
-		Model:        resolved.ID,
-		Instructions: system,
-		Input: []responsesMessage{{
+	var input any = userText
+	if len(image) > 0 {
+		input = []responsesMessage{{
 			Role: "user",
 			Content: []responsesContentPart{
 				{Type: "input_image", ImageURL: imageDataURL(mediaType, image)},
 				{Type: "input_text", Text: userText},
 			},
-		}},
+		}}
+	}
+	body := responsesRequest{
+		Model:           resolved.ID,
+		Instructions:    system,
+		Input:           input,
 		MaxOutputTokens: maxOutputTokens(resolved.Context),
 		Stream:          true,
 	}
@@ -444,17 +470,19 @@ type anthropicSource struct {
 }
 
 func anthropicMessages(ctx context.Context, resolved model.Resolved, client *http.Client, system, userText, mediaType string, image []byte, onDelta func(StreamDelta)) (string, error) {
+	content := make([]anthropicContentPart, 0, 2)
+	if len(image) > 0 {
+		content = append(content, anthropicContentPart{Type: "image", Source: &anthropicSource{
+			Type: "base64", MediaType: mediaType, Data: base64.StdEncoding.EncodeToString(image),
+		}})
+	}
+	content = append(content, anthropicContentPart{Type: "text", Text: userText})
 	body := anthropicRequest{
 		Model:  resolved.ID,
 		System: system,
 		Messages: []anthropicMessage{{
-			Role: "user",
-			Content: []anthropicContentPart{
-				{Type: "image", Source: &anthropicSource{
-					Type: "base64", MediaType: mediaType, Data: base64.StdEncoding.EncodeToString(image),
-				}},
-				{Type: "text", Text: userText},
-			},
+			Role:    "user",
+			Content: content,
 		}},
 		MaxTokens: maxOutputTokens(resolved.Context),
 		Stream:    true,

@@ -297,6 +297,9 @@ export function ResultWorkbench({
           {sourceCounts.user > 0 && (
             <Badge variant="secondary">人工合并 {sourceCounts.user}</Badge>
           )}
+          {(stats.duplicate_segments ?? 0) > 0 && (
+            <Badge variant="secondary">去重 {stats.duplicate_segments}</Badge>
+          )}
           {pendingIndexes.length > 0 && (
             <Badge variant="outline">待处理 {pendingIndexes.length}</Badge>
           )}
@@ -322,6 +325,17 @@ export function ResultWorkbench({
             <AlertTitle>自动仲裁失败，争议已保留</AlertTitle>
             <AlertDescription className="break-all">
               {stats.escalation_err}
+            </AlertDescription>
+          </Alert>
+        )}
+        {stats.duplicate_check_err && (
+          <Alert>
+            <AlertCircle />
+            <AlertTitle className="line-clamp-none">
+              Fast Model 检查未完成，原结果已保留
+            </AlertTitle>
+            <AlertDescription className="break-all">
+              {stats.duplicate_check_err}
             </AlertDescription>
           </Alert>
         )}

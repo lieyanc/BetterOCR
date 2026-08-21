@@ -92,6 +92,10 @@ func TestLoadSupplementsMissingFields(t *testing.T) {
 	if cfg.Arbiter != "" {
 		t.Errorf("显式空 arbiter 被改写: %q", cfg.Arbiter)
 	}
+	written, err := os.ReadFile(path)
+	if err != nil || !bytes.Contains(written, []byte(`"duplicate_checker": ""`)) {
+		t.Errorf("duplicate_checker missing after supplement: %s (err=%v)", written, err)
+	}
 	if cfg.EngineTimeoutSeconds != Default().EngineTimeoutSeconds ||
 		cfg.ArbiterTimeoutSeconds != Default().ArbiterTimeoutSeconds ||
 		cfg.EngineMaxAttempts != Default().EngineMaxAttempts ||
@@ -137,7 +141,7 @@ func TestLoadSupplementsProviderAliases(t *testing.T) {
 
 func TestLoadKeepsExplicitProviderAlias(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	full := []byte(`{"providers":[{"id":"openai","alias":"My OpenAI","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
+	full := []byte(`{"providers":[{"id":"openai","alias":"My OpenAI","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","duplicate_checker":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +160,7 @@ func TestLoadKeepsExplicitProviderAlias(t *testing.T) {
 func TestLoadKeepsCompleteFileByteForByte(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
 	// 顶层字段与 provider alias 均齐全 → 原样使用,逐字节不变
-	full := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
+	full := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","duplicate_checker":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -272,6 +276,11 @@ func TestValidateAndResolve(t *testing.T) {
 	bad.Providers[0].Models[0].API = "unknown"
 	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "不受支持") {
 		t.Errorf("invalid api error = %v", err)
+	}
+	bad = cfg
+	bad.DuplicateChecker = "missing/model"
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate_checker") {
+		t.Errorf("invalid duplicate checker error = %v", err)
 	}
 }
 

@@ -133,7 +133,11 @@ func (s *Server) startTask(w http.ResponseWriter, r *http.Request, runConfig pip
 	if runConfig.Arbiter != nil {
 		arbiterRef = runConfig.Arbiter.Ref
 	}
-	task, err := s.Store.CreateTask(auth.User, requestFilename(r), engines, arbiterRef)
+	duplicateCheckerRef := ""
+	if runConfig.DuplicateChecker != nil {
+		duplicateCheckerRef = runConfig.DuplicateChecker.Ref
+	}
+	task, err := s.Store.CreateTask(auth.User, requestFilename(r), engines, arbiterRef, duplicateCheckerRef)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "创建任务记录失败: "+err.Error())
 		return "", false

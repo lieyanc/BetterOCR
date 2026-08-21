@@ -34,13 +34,15 @@ type Config struct {
 	Engines []string `json:"engines"`
 	// Arbiter is a provider/model reference. Empty disables remote arbitration.
 	Arbiter string `json:"arbiter"`
+	// DuplicateChecker configures the optional text-only Fast Model.
+	DuplicateChecker string `json:"duplicate_checker"`
 	// EngineTimeoutSeconds 是每个基础模型每次尝试的连续无输出超时秒数。
 	EngineTimeoutSeconds int `json:"engine_timeout_seconds"`
-	// ArbiterTimeoutSeconds 是仲裁模型每次尝试的连续无输出超时秒数。
+	// ArbiterTimeoutSeconds 是仲裁模型与 Fast Model 每次尝试的连续无输出超时秒数。
 	ArbiterTimeoutSeconds int `json:"arbiter_timeout_seconds"`
 	// EngineMaxAttempts 是单个基础模型的最大尝试次数,1 表示不重试。
 	EngineMaxAttempts int `json:"engine_max_attempts"`
-	// ArbiterMaxAttempts 是仲裁模型的最大尝试次数,1 表示不重试。
+	// ArbiterMaxAttempts 是仲裁模型与 Fast Model 的最大尝试次数,1 表示不重试。
 	ArbiterMaxAttempts int `json:"arbiter_max_attempts"`
 	// TimeoutSeconds 仅用于读取旧配置,规范写回时会移除。
 	TimeoutSeconds int `json:"timeout_seconds,omitempty" config:"legacy"`
@@ -74,6 +76,7 @@ func Default() Config {
 		},
 		Engines:               []string{"openai/gpt-4.1-mini", "openai/gpt-4o-mini"},
 		Arbiter:               "anthropic/claude-sonnet-4-20250514",
+		DuplicateChecker:      "",
 		EngineTimeoutSeconds:  defaultTimeoutSeconds,
 		ArbiterTimeoutSeconds: defaultTimeoutSeconds,
 		EngineMaxAttempts:     defaultMaxAttempts,
@@ -87,7 +90,8 @@ func (c Config) EngineTimeout() time.Duration {
 	return time.Duration(c.normalized().EngineTimeoutSeconds) * time.Second
 }
 
-// ArbiterTimeout returns the independent idle timeout for each arbiter attempt.
+// ArbiterTimeout returns the independent idle timeout for each arbitration or
+// duplicate-check attempt.
 func (c Config) ArbiterTimeout() time.Duration {
 	return time.Duration(c.normalized().ArbiterTimeoutSeconds) * time.Second
 }
@@ -95,7 +99,8 @@ func (c Config) ArbiterTimeout() time.Duration {
 // EngineAttempts returns the maximum attempts for each individual engine.
 func (c Config) EngineAttempts() int { return c.normalized().EngineMaxAttempts }
 
-// ArbiterAttempts returns the maximum attempts for arbitration only.
+// ArbiterAttempts returns the maximum attempts for arbitration and duplicate
+// checking.
 func (c Config) ArbiterAttempts() int { return c.normalized().ArbiterMaxAttempts }
 
 func (c Config) normalized() Config {
@@ -295,6 +300,11 @@ func (c Config) Validate() error {
 	if ref := strings.TrimSpace(c.Arbiter); ref != "" {
 		if _, ok := refs[ref]; !ok {
 			return fmt.Errorf("arbiter 引用了未配置模型 %q", ref)
+		}
+	}
+	if ref := strings.TrimSpace(c.DuplicateChecker); ref != "" {
+		if _, ok := refs[ref]; !ok {
+			return fmt.Errorf("duplicate_checker 引用了未配置模型 %q", ref)
 		}
 	}
 	return nil

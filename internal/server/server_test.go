@@ -384,6 +384,16 @@ func TestOCRRejectsUnconfiguredModel(t *testing.T) {
 	}
 }
 
+func TestOCRRejectsUnconfiguredDuplicateChecker(t *testing.T) {
+	srv := &Server{Config: serverConfig("http://127.0.0.1:1", "")}
+	rec := postOCR(t, srv.Handler(), testPNG(t), map[string]string{
+		"engines": "test/tiny-a", "arbiter": "", "duplicate_checker": "other/quick",
+	})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "未配置模型") {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+}
+
 // TestOCRBadRequests 覆盖各类 400:缺图、缺引擎、非图片内容。
 func TestOCRBadRequests(t *testing.T) {
 	h := (&Server{}).Handler()
@@ -416,8 +426,10 @@ func TestOCRBadRequests(t *testing.T) {
 
 // TestConfigEndpoint 验证页面预填数据,且不泄露密钥明文。
 func TestConfigEndpoint(t *testing.T) {
+	serverCfg := serverConfig("http://example/v1", "secret")
+	serverCfg.DuplicateChecker = "test/tiny-a"
 	srv := &Server{
-		Config:  serverConfig("http://example/v1", "secret"),
+		Config:  serverCfg,
 		Timeout: 45 * time.Second,
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
@@ -434,7 +446,8 @@ func TestConfigEndpoint(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Engines) != 2 || cfg.Arbiter != "test/big" || len(cfg.Providers) != 1 {
+	if len(cfg.Engines) != 2 || cfg.Arbiter != "test/big" ||
+		cfg.DuplicateChecker != "test/tiny-a" || len(cfg.Providers) != 1 {
 		t.Errorf("config = %+v", cfg)
 	}
 	provider := cfg.Providers[0]
@@ -570,7 +583,7 @@ func TestOCRStreamAutoArbitratesAllDisputesInOneRequest(t *testing.T) {
 		content := map[string]string{
 			"tiny-a": "共同内容。发票编号042。应付金额128元。",
 			"tiny-b": "共同内容。发票编号O42。应付金额129元。",
-			"big":    "#1 发票编号042。\n#2 应付金额128元。",
+			"big":    "#1 发票编号042。应付金额128元。",
 		}[req.Model]
 		if req.Model == "big" {
 			mu.Lock()
@@ -611,10 +624,10 @@ func TestOCRStreamAutoArbitratesAllDisputesInOneRequest(t *testing.T) {
 	if final == nil {
 		t.Fatalf("stream did not return final result: %s", rec.Body)
 	}
-	if final.Stats.EscalatedSegments != 2 || final.Stats.FallbackSegments != 0 {
-		t.Fatalf("stats = %+v, want both disputes escalated", final.Stats)
+	if final.Stats.EscalatedSegments != 1 || final.Stats.FallbackSegments != 0 {
+		t.Fatalf("stats = %+v, want one escalated region", final.Stats)
 	}
-	if final.Text != "共同内容。\n发票编号042。\n应付金额128元。" {
+	if final.Text != "共同内容。\n发票编号042。应付金额128元。" {
 		t.Fatalf("text = %q", final.Text)
 	}
 
@@ -623,7 +636,7 @@ func TestOCRStreamAutoArbitratesAllDisputesInOneRequest(t *testing.T) {
 	if arbiterCalls != 1 {
 		t.Fatalf("arbiter calls = %d, want one request for all disputes", arbiterCalls)
 	}
-	for _, want := range []string{"Disputed sentence segments (2)", "#1", "#2", "发票编号O42", "应付金额129元"} {
+	for _, want := range []string{"Disputed text regions (1)", "#1", "发票编号O42。应付金额129元"} {
 		if !strings.Contains(arbiterPrompt, want) {
 			t.Errorf("arbiter prompt missing %q: %s", want, arbiterPrompt)
 		}

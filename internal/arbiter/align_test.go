@@ -45,6 +45,50 @@ func TestAlignAbsorbsSentenceBoundaryDifference(t *testing.T) {
 	}
 }
 
+func TestAlignAbsorbsLongSentenceBoundaryDifference(t *testing.T) {
+	rows := alignAll([]agent.Result{
+		full("a", "前锚点。第一部分。第二部分。第三部分。第四部分。第五部分。后锚点。"),
+		full("b", "前锚点。第一部分第二部分第三部分第四部分第五部分。后锚点。"),
+		full("c", "前锚点。第一部分第二部分。第三部分第四部分第五部分。后锚点。"),
+	}, 0.35)
+	if len(rows) != 3 {
+		t.Fatalf("long boundary mismatch should become one middle slot: %#v", rowTexts(rows))
+	}
+	if got := len(rows[1].cands); got != 3 {
+		t.Fatalf("middle candidate count = %d, want 3: %#v", got, rowTexts(rows))
+	}
+}
+
+func TestAlignSupportsManyToManyBoundaryShift(t *testing.T) {
+	rows := alignAll([]agent.Result{
+		full("a", "前锚点。甲乙。丙丁。戊己。后锚点。"),
+		full("b", "前锚点。甲。乙丙。丁戊。己。后锚点。"),
+	}, 0.35)
+	want := [][]string{
+		{"前锚点。", "前锚点。"},
+		{"甲乙。丙丁。戊己。", "甲。乙丙。丁戊。己。"},
+		{"后锚点。", "后锚点。"},
+	}
+	if got := rowTexts(rows); !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestAlignPreservesRealRepeatedSentences(t *testing.T) {
+	rows := alignAll([]agent.Result{
+		full("a", "开头。重复内容。重复内容。结尾。"),
+		full("b", "开头。重复内容。重复内容。结尾。"),
+	}, 0.35)
+	if len(rows) != 4 {
+		t.Fatalf("real repeated sentences were collapsed: %#v", rowTexts(rows))
+	}
+	for i, row := range rows {
+		if len(row.cands) != 2 {
+			t.Fatalf("row %d candidates = %#v, want both engines", i, rowTexts(rows))
+		}
+	}
+}
+
 func TestAlignMissingSentenceAndDeterministic(t *testing.T) {
 	results := []agent.Result{
 		full("a", "甲句内容。乙句内容。丙句内容。"),

@@ -30,24 +30,56 @@ func CoreNormalize(s string) string {
 // Similarity 计算两段正文骨架的相似度,基于 rune bigram Jaccard。
 // 中文以单字为天然单位,因此无需分词即可稳定地对齐相邻句段。
 func Similarity(a, b string) float64 {
-	a, b = CoreNormalize(a), CoreNormalize(b)
-	if a == "" || b == "" {
-		return 0
+	return coreSimilarity(CoreNormalize(a), CoreNormalize(b))
+}
+
+// coreSimilarity 比较已经过 CoreNormalize 的文本。对齐动态规划会反复比较
+// 同一批候选,将规整结果缓存后可避免在热路径重复扫描 Unicode 文本。
+func coreSimilarity(a, b string) float64 {
+	return newCoreFingerprint(a).similarity(newCoreFingerprint(b))
+}
+
+type coreFingerprint struct {
+	text    string
+	bigrams map[string]struct{}
+}
+
+func newCoreFingerprint(core string) coreFingerprint {
+	return coreFingerprint{text: core, bigrams: bigrams(core)}
+}
+
+func (a coreFingerprint) similarity(b coreFingerprint) float64 {
+	similarity, _ := a.similarityAbove(b, -1)
+	return similarity
+}
+
+// similarityAbove 先用集合大小计算 Jaccard 的理论上界。上界都无法超过
+// DP 当前转移的最低收益时,无需遍历较长文本的 bigram 集合。
+func (a coreFingerprint) similarityAbove(b coreFingerprint, floor float64) (float64, bool) {
+	if a.text == "" || b.text == "" {
+		return 0, false
 	}
-	if a == b {
-		return 1
+	if a.text == b.text {
+		return 1, 1 > floor
 	}
-	setA, setB := bigrams(a), bigrams(b)
-	if len(setA) == 0 || len(setB) == 0 {
-		return 0
+	if len(a.bigrams) == 0 || len(b.bigrams) == 0 {
+		return 0, false
+	}
+	smaller, larger := a.bigrams, b.bigrams
+	if len(smaller) > len(larger) {
+		smaller, larger = larger, smaller
+	}
+	if upper := float64(len(smaller)) / float64(len(larger)); upper <= floor {
+		return 0, false
 	}
 	inter := 0
-	for g := range setA {
-		if _, ok := setB[g]; ok {
+	for gram := range smaller {
+		if _, ok := larger[gram]; ok {
 			inter++
 		}
 	}
-	return float64(inter) / float64(len(setA)+len(setB)-inter)
+	similarity := float64(inter) / float64(len(a.bigrams)+len(b.bigrams)-inter)
+	return similarity, similarity > floor
 }
 
 // SplitSegments 按中文句末标点切分完整 OCR 文本。换行只被当作排版空白,

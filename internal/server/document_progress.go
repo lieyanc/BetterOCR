@@ -286,7 +286,7 @@ func (p *documentPageProgress) handle(event pipeline.Event) {
 			agent.Status = "completed"
 			agent.Error = ""
 		}
-		if event.Stage == pipeline.StageArbiter {
+		if event.Stage == pipeline.StageArbiter || event.Stage == pipeline.StageDuplicateCheck {
 			p.progress.Stage = "saving"
 		}
 	case pipeline.EventDone:

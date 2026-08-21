@@ -62,6 +62,116 @@ func TestRunRequiresEngines(t *testing.T) {
 	}
 }
 
+func TestRunChecksFinalDuplicatesAfterFusion(t *testing.T) {
+	var mu sync.Mutex
+	requestOrder := make([]string, 0, 3)
+	checkerHadImage := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		modelID, _ := request["model"].(string)
+		mu.Lock()
+		requestOrder = append(requestOrder, modelID)
+		mu.Unlock()
+		if modelID == "quick" {
+			checkerHadImage = strings.Contains(mustJSON(request), "image_url")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{map[string]any{"message": map[string]any{"content": "#1 -> #0"}}},
+			})
+			return
+		}
+		second := "合同金额人民币一百二十元。"
+		if modelID == "engine-b" {
+			second = "合同金额人民币一百二十圆。"
+		}
+		content := "合同金额人民币一百二十元。" + second
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		})
+	}))
+	defer upstream.Close()
+
+	resolved := func(id string) model.Resolved {
+		return model.Resolved{
+			Ref: "test/" + id, ProviderID: "test", BaseURL: upstream.URL,
+			ID: id, Context: 32768, Alias: id, API: model.APIOpenAIChatCompletions,
+		}
+	}
+	quick := resolved("quick")
+	var events []Event
+	final, err := Run(context.Background(), Config{
+		Engines:          []model.Resolved{resolved("engine-a"), resolved("engine-b")},
+		DuplicateChecker: &quick,
+		OnEvent:          func(event Event) { events = append(events, event) },
+	}, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Text != "合同金额人民币一百二十元。" || len(final.Segments) != 1 {
+		t.Fatalf("final = %+v", final)
+	}
+	if final.Stats.DuplicateSegments != 1 || final.Stats.DuplicateCheckErr != "" ||
+		!strings.Contains(final.Stats.DuplicateChecker, "quick") {
+		t.Fatalf("stats = %+v", final.Stats)
+	}
+	if checkerHadImage {
+		t.Fatal("duplicate checker received image content")
+	}
+	if len(requestOrder) != 3 || requestOrder[2] != "quick" {
+		t.Fatalf("request order = %v, want checker last", requestOrder)
+	}
+	checkerDone, pipelineDone := -1, -1
+	for index, event := range events {
+		if event.Type == EventAgentDone && event.Stage == StageDuplicateCheck {
+			checkerDone = index
+		}
+		if event.Type == EventDone {
+			pipelineDone = index
+		}
+	}
+	if checkerDone < 0 || pipelineDone <= checkerDone {
+		t.Fatalf("event order = %+v", events)
+	}
+}
+
+func TestRunDuplicateCheckerFailureIsNonfatal(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		if request.Model == "quick" {
+			http.Error(w, "quick checker unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": "第一段足够长的可靠正文。第二段足够长的可靠正文。"}}},
+		})
+	}))
+	defer upstream.Close()
+	resolved := func(id string) model.Resolved {
+		return model.Resolved{Ref: "test/" + id, ProviderID: "test", BaseURL: upstream.URL, ID: id, Context: 32768, Alias: id, API: model.APIOpenAIChatCompletions}
+	}
+	quick := resolved("quick")
+	final, err := Run(context.Background(), Config{
+		Engines: []model.Resolved{resolved("engine-a"), resolved("engine-b")}, DuplicateChecker: &quick,
+		ArbiterMaxAttempts: 1,
+	}, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(final.Stats.DuplicateCheckErr, "503") || len(final.Segments) != 2 {
+		t.Fatalf("final = %+v", final)
+	}
+}
+
+func mustJSON(value any) string {
+	raw, _ := json.Marshal(value)
+	return string(raw)
+}
+
 func TestRunStartsArbitrationAfterEveryEngineCompletes(t *testing.T) {
 	var upstreamMu sync.Mutex
 	engineStreamsDone := 0

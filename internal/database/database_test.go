@@ -69,7 +69,7 @@ func TestStoreLifecycleAndPermissions(t *testing.T) {
 		t.Fatal("last administrator was deleted")
 	}
 
-	task, err := store.CreateTask(user, "invoice.png", []string{"openai/gpt-4o-mini"}, "")
+	task, err := store.CreateTask(user, "invoice.png", []string{"openai/gpt-4o-mini"}, "", "openai/quick")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,8 @@ func TestStoreLifecycleAndPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	tasks := store.Tasks(user.ID, false)
-	if len(tasks) != 1 || tasks[0].Status != "completed" || tasks[0].Result == nil || tasks[0].Result.Text != "识别结果" {
+	if len(tasks) != 1 || tasks[0].Status != "completed" || tasks[0].Result == nil ||
+		tasks[0].Result.Text != "识别结果" || tasks[0].DuplicateChecker != "openai/quick" {
 		t.Fatalf("tasks = %+v", tasks)
 	}
 	if tasks := store.Tasks(admin.ID, false); len(tasks) != 0 {
@@ -146,7 +147,7 @@ func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	processing, err := store.CreateDocument(admin, "processing.pdf", "pdf", "application/pdf", 1024, []string{"openai/gpt-4o-mini"}, "", false)
+	processing, err := store.CreateDocument(admin, "processing.pdf", "pdf", "application/pdf", 1024, []string{"openai/gpt-4o-mini"}, "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +161,7 @@ func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	preparing, err := store.CreateDocument(admin, "preparing.pdf", "pdf", "application/pdf", 2048, []string{"openai/gpt-4o-mini"}, "", false)
+	preparing, err := store.CreateDocument(admin, "preparing.pdf", "pdf", "application/pdf", 2048, []string{"openai/gpt-4o-mini"}, "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

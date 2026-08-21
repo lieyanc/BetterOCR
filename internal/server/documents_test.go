@@ -77,7 +77,7 @@ func TestDocumentUploadPreparationOwnershipAndPersistence(t *testing.T) {
 
 	upload := requestWithAuth(
 		http.MethodPost,
-		"/api/documents?filename=contract.pdf&engines=test%2Ftiny-a&arbiter=&auto_arbitrate=false",
+		"/api/documents?filename=contract.pdf&engines=test%2Ftiny-a&arbiter=&duplicate_checker=test%2Ftiny-b&auto_arbitrate=false",
 		bytes.NewReader([]byte("%PDF-1.4\nserver-side-test")),
 		ownerCookie,
 		ownerCSRF,
@@ -92,7 +92,8 @@ func TestDocumentUploadPreparationOwnershipAndPersistence(t *testing.T) {
 	if err := json.Unmarshal(uploadRecorder.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	if created.Status != database.DocumentPreparing || created.SizeBytes == 0 {
+	if created.Status != database.DocumentPreparing || created.SizeBytes == 0 ||
+		created.DuplicateChecker != "test/tiny-b" {
 		t.Fatalf("created = %+v", created)
 	}
 

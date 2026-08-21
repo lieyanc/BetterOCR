@@ -91,10 +91,19 @@ func main() {
 		}
 		arbiterModel = &resolved
 	}
+	var duplicateChecker *model.Resolved
+	if cfg.DuplicateChecker != "" {
+		resolved, resolveErr := cfg.Resolve(cfg.DuplicateChecker)
+		if resolveErr != nil {
+			fatal("配置错误:", resolveErr)
+		}
+		duplicateChecker = &resolved
+	}
 
 	final, err := pipeline.Run(context.Background(), pipeline.Config{
 		Engines:            engines,
 		Arbiter:            arbiterModel,
+		DuplicateChecker:   duplicateChecker,
 		EngineTimeout:      cfg.EngineTimeout(),
 		ArbiterTimeout:     cfg.ArbiterTimeout(),
 		EngineMaxAttempts:  cfg.EngineAttempts(),

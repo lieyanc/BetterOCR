@@ -63,18 +63,19 @@ type session struct {
 
 // Task is one persisted OCR run. Images are deliberately not retained.
 type Task struct {
-	ID          string         `json:"id"`
-	UserID      string         `json:"user_id"`
-	Username    string         `json:"username"`
-	Filename    string         `json:"filename"`
-	Status      string         `json:"status"`
-	Engines     []string       `json:"engines"`
-	Arbiter     string         `json:"arbiter,omitempty"`
-	CreatedAt   time.Time      `json:"created_at"`
-	CompletedAt *time.Time     `json:"completed_at,omitempty"`
-	DurationMS  int64          `json:"duration_ms,omitempty"`
-	Result      *arbiter.Final `json:"result,omitempty"`
-	Error       string         `json:"error,omitempty"`
+	ID               string         `json:"id"`
+	UserID           string         `json:"user_id"`
+	Username         string         `json:"username"`
+	Filename         string         `json:"filename"`
+	Status           string         `json:"status"`
+	Engines          []string       `json:"engines"`
+	Arbiter          string         `json:"arbiter,omitempty"`
+	DuplicateChecker string         `json:"duplicate_checker,omitempty"`
+	CreatedAt        time.Time      `json:"created_at"`
+	CompletedAt      *time.Time     `json:"completed_at,omitempty"`
+	DurationMS       int64          `json:"duration_ms,omitempty"`
+	Result           *arbiter.Final `json:"result,omitempty"`
+	Error            string         `json:"error,omitempty"`
 }
 
 const (
@@ -95,27 +96,28 @@ const (
 // DocumentProject is lightweight project metadata. Source files, rendered
 // page images and full OCR results are stored separately on disk.
 type DocumentProject struct {
-	ID              string         `json:"id"`
-	UserID          string         `json:"user_id"`
-	Username        string         `json:"username"`
-	Name            string         `json:"name"`
-	SourceType      string         `json:"source_type"`
-	MimeType        string         `json:"mime_type"`
-	SizeBytes       int64          `json:"size_bytes"`
-	Status          string         `json:"status"`
-	PageCount       int            `json:"page_count"`
-	PreparedPages   int            `json:"prepared_pages"`
-	ProcessedPages  int            `json:"processed_pages"`
-	FailedPages     int            `json:"failed_pages"`
-	PendingDisputes int            `json:"pending_disputes"`
-	Engines         []string       `json:"engines"`
-	Arbiter         string         `json:"arbiter,omitempty"`
-	AutoArbitrate   bool           `json:"auto_arbitrate"`
-	CreatedAt       time.Time      `json:"created_at"`
-	UpdatedAt       time.Time      `json:"updated_at"`
-	CompletedAt     *time.Time     `json:"completed_at,omitempty"`
-	Error           string         `json:"error,omitempty"`
-	Pages           []DocumentPage `json:"pages,omitempty"`
+	ID               string         `json:"id"`
+	UserID           string         `json:"user_id"`
+	Username         string         `json:"username"`
+	Name             string         `json:"name"`
+	SourceType       string         `json:"source_type"`
+	MimeType         string         `json:"mime_type"`
+	SizeBytes        int64          `json:"size_bytes"`
+	Status           string         `json:"status"`
+	PageCount        int            `json:"page_count"`
+	PreparedPages    int            `json:"prepared_pages"`
+	ProcessedPages   int            `json:"processed_pages"`
+	FailedPages      int            `json:"failed_pages"`
+	PendingDisputes  int            `json:"pending_disputes"`
+	Engines          []string       `json:"engines"`
+	Arbiter          string         `json:"arbiter,omitempty"`
+	DuplicateChecker string         `json:"duplicate_checker,omitempty"`
+	AutoArbitrate    bool           `json:"auto_arbitrate"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+	CompletedAt      *time.Time     `json:"completed_at,omitempty"`
+	Error            string         `json:"error,omitempty"`
+	Pages            []DocumentPage `json:"pages,omitempty"`
 }
 
 type DocumentPage struct {
@@ -469,14 +471,15 @@ func (s *Store) DeleteUser(id string) error {
 	return nil
 }
 
-func (s *Store) CreateTask(user User, filename string, engines []string, arbiterRef string) (Task, error) {
+func (s *Store) CreateTask(user User, filename string, engines []string, arbiterRef, duplicateCheckerRef string) (Task, error) {
 	id, err := randomToken(12)
 	if err != nil {
 		return Task{}, err
 	}
 	task := Task{
 		ID: id, UserID: user.ID, Username: user.Username, Filename: strings.TrimSpace(filename),
-		Status: "running", Engines: append([]string(nil), engines...), Arbiter: arbiterRef, CreatedAt: time.Now().UTC(),
+		Status: "running", Engines: append([]string(nil), engines...), Arbiter: arbiterRef,
+		DuplicateChecker: strings.TrimSpace(duplicateCheckerRef), CreatedAt: time.Now().UTC(),
 	}
 	if task.Filename == "" {
 		task.Filename = "未命名图片"
@@ -544,6 +547,7 @@ func (s *Store) CreateDocument(
 	sizeBytes int64,
 	engines []string,
 	arbiterRef string,
+	duplicateCheckerRef string,
 	autoArbitrate bool,
 ) (DocumentProject, error) {
 	id, err := randomToken(12)
@@ -556,7 +560,8 @@ func (s *Store) CreateDocument(
 		Name: strings.TrimSpace(name), SourceType: sourceType, MimeType: mimeType,
 		SizeBytes: sizeBytes, Status: DocumentPreparing,
 		Engines: append([]string(nil), engines...), Arbiter: strings.TrimSpace(arbiterRef),
-		AutoArbitrate: autoArbitrate, CreatedAt: now, UpdatedAt: now,
+		DuplicateChecker: strings.TrimSpace(duplicateCheckerRef),
+		AutoArbitrate:    autoArbitrate, CreatedAt: now, UpdatedAt: now,
 		Pages: []DocumentPage{},
 	}
 	if document.Name == "" {

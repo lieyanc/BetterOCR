@@ -59,7 +59,7 @@ func TestAuthenticationAndRoleGuards(t *testing.T) {
 		t.Fatalf("create user status = %d body=%s", withCSRFRec.Code, withCSRFRec.Body)
 	}
 
-	task, err := store.CreateTask(reader, "reader.png", []string{"test/tiny-a"}, "")
+	task, err := store.CreateTask(reader, "reader.png", []string{"test/tiny-a"}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

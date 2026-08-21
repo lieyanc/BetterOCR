@@ -354,7 +354,10 @@ func TestEscalatorResolve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"#3", "ctx above", "ctx below", "f1xed line", "fixed 1ine", "data:image/png;base64,"} {
+	for _, want := range []string{
+		"#3", "ctx above", "ctx below", "f1xed line", "fixed 1ine",
+		"alternative transcriptions", "never repeat overlapping text", "data:image/png;base64,",
+	} {
 		if !strings.Contains(gotBody, want) {
 			t.Errorf("request body missing %q", want)
 		}
@@ -381,7 +384,7 @@ func TestEscalatorRejectsUnparseableOutput(t *testing.T) {
 
 	esc := NewVisionEscalator(resolved(model.APIOpenAIResponses, srv.URL, ""), nil)
 	_, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{{Segment: 0}})
-	if err == nil || !strings.Contains(err.Error(), "#<segment>") {
+	if err == nil || !strings.Contains(err.Error(), "#<region>") {
 		t.Errorf("err = %v, want a parse failure mentioning the expected form", err)
 	}
 }
@@ -409,6 +412,117 @@ func TestParseRowLine(t *testing.T) {
 		if ok != tc.wantOK || (ok && (row != tc.wantRow || text != tc.wantText)) {
 			t.Errorf("parseRowLine(%q) = %d, %q, %v; want %d, %q, %v",
 				tc.in, row, text, ok, tc.wantRow, tc.wantText, tc.wantOK)
+		}
+	}
+}
+
+func TestDuplicateCheckerUsesTextOnlyRequestsAcrossAPIs(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      model.API
+		wantPath string
+		response any
+		check    func(*testing.T, map[string]any)
+	}{
+		{
+			name: "openai chat", api: model.APIOpenAIChatCompletions, wantPath: "/chat/completions",
+			response: map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "#1 -> #0"}}}},
+			check: func(t *testing.T, body map[string]any) {
+				encoded := mustJSON(body["messages"])
+				if strings.Contains(encoded, "image_url") || !strings.Contains(encoded, "Final OCR text regions") {
+					t.Fatalf("chat text-only body = %s", encoded)
+				}
+			},
+		},
+		{
+			name: "openai responses", api: model.APIOpenAIResponses, wantPath: "/responses",
+			response: map[string]any{"output_text": "#1 -> #0"},
+			check: func(t *testing.T, body map[string]any) {
+				input, ok := body["input"].(string)
+				if !ok || !strings.Contains(input, "Final OCR text regions") || strings.Contains(input, "input_image") {
+					t.Fatalf("responses text-only input = %#v", body["input"])
+				}
+			},
+		},
+		{
+			name: "anthropic", api: model.APIAnthropicMessages, wantPath: "/messages",
+			response: map[string]any{"content": []any{map[string]any{"type": "text", "text": "#1 -> #0"}}},
+			check: func(t *testing.T, body map[string]any) {
+				encoded := mustJSON(body["messages"])
+				if strings.Contains(encoded, `"type":"image"`) || !strings.Contains(encoded, "Final OCR text regions") {
+					t.Fatalf("anthropic text-only body = %s", encoded)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tt.wantPath {
+					t.Errorf("path = %q, want %q", r.URL.Path, tt.wantPath)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				tt.check(t, body)
+				_ = json.NewEncoder(w).Encode(tt.response)
+			}))
+			defer srv.Close()
+
+			checker := NewDuplicateChecker(resolved(tt.api, srv.URL, ""), nil)
+			pairs, err := checker.Check(context.Background(), []arbiter.FinalSegment{
+				{Text: "合同金额人民币一百二十元。"},
+				{Text: "合同金额人民币一百二十元。", Disputed: true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []arbiter.DuplicatePair{{Later: 1, Earlier: 0}}
+			if !reflect.DeepEqual(pairs, want) {
+				t.Fatalf("pairs = %+v, want %+v", pairs, want)
+			}
+		})
+	}
+}
+
+func TestDuplicateCheckerParsesNoneAndRejectsUnstructuredOutput(t *testing.T) {
+	for name, test := range map[string]struct {
+		output    string
+		wantError bool
+	}{
+		"none":         {output: "```\nNONE\n```"},
+		"unstructured": {output: "The text looks fine.", wantError: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"output_text": test.output})
+			}))
+			defer srv.Close()
+			checker := NewDuplicateChecker(resolved(model.APIOpenAIResponses, srv.URL, ""), nil)
+			pairs, err := checker.Check(context.Background(), []arbiter.FinalSegment{{Text: "some sufficiently long text"}})
+			if (err != nil) != test.wantError {
+				t.Fatalf("pairs=%+v err=%v, wantError=%v", pairs, err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestParseDuplicateLine(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		pair  arbiter.DuplicatePair
+		ok    bool
+	}{
+		{input: " #12 -> #3 ", pair: arbiter.DuplicatePair{Later: 12, Earlier: 3}, ok: true},
+		{input: "#12 => #3"},
+		{input: "#12 -> 3"},
+		{input: "duplicate #12 -> #3"},
+	} {
+		pair, ok := parseDuplicateLine(test.input)
+		if ok != test.ok || pair != test.pair {
+			t.Errorf("parseDuplicateLine(%q) = %+v, %v", test.input, pair, ok)
 		}
 	}
 }

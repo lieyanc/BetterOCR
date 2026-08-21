@@ -351,7 +351,7 @@ func (m *documentManager) process(ctx context.Context, id string) {
 	if !ok || document.Status == database.DocumentCancelled || document.PreparedPages == 0 {
 		return
 	}
-	engines, arbiterModel, err := m.resolveModels(document)
+	engines, arbiterModel, duplicateChecker, err := m.resolveModels(document)
 	if err != nil {
 		m.failDocument(id, ctx, err)
 		return
@@ -409,7 +409,7 @@ func (m *documentManager) process(ctx context.Context, id string) {
 		}
 		cfg := m.server.currentConfig()
 		final, runErr := pipeline.Run(ctx, pipeline.Config{
-			Engines: engines, Arbiter: arbiterModel,
+			Engines: engines, Arbiter: arbiterModel, DuplicateChecker: duplicateChecker,
 			DeferArbitration:   !document.AutoArbitrate,
 			HTTPClient:         m.server.HTTPClient,
 			EngineTimeout:      m.server.engineTimeout(),
@@ -460,24 +460,32 @@ func (m *documentManager) process(ctx context.Context, id string) {
 	}
 }
 
-func (m *documentManager) resolveModels(document database.DocumentProject) ([]model.Resolved, *model.Resolved, error) {
+func (m *documentManager) resolveModels(document database.DocumentProject) ([]model.Resolved, *model.Resolved, *model.Resolved, error) {
 	cfg := m.server.currentConfig()
 	engines, err := cfg.ResolveMany(document.Engines)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(engines) == 0 {
-		return nil, nil, errors.New("文档没有可用的基础模型")
+		return nil, nil, nil, errors.New("文档没有可用的基础模型")
 	}
 	var arbiterModel *model.Resolved
 	if document.Arbiter != "" {
 		resolved, err := cfg.Resolve(document.Arbiter)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		arbiterModel = &resolved
 	}
-	return engines, arbiterModel, nil
+	var duplicateChecker *model.Resolved
+	if document.DuplicateChecker != "" {
+		resolved, err := cfg.Resolve(document.DuplicateChecker)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		duplicateChecker = &resolved
+	}
+	return engines, arbiterModel, duplicateChecker, nil
 }
 
 func (m *documentManager) failPage(id, pageID string, cause error, duration time.Duration, resultReady bool) {
@@ -604,7 +612,7 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 	name := cleanDocumentName(r.URL.Query().Get("filename"), sourceType)
 	document, err := s.Store.CreateDocument(
 		auth.User, name, sourceType, mimeType, written,
-		settings.Engines, settings.Arbiter, settings.AutoArbitrate,
+		settings.Engines, settings.Arbiter, settings.DuplicateChecker, settings.AutoArbitrate,
 	)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "创建文档记录失败: "+err.Error())
@@ -630,9 +638,10 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 type documentRunSettings struct {
-	Engines       []string `json:"engines"`
-	Arbiter       string   `json:"arbiter"`
-	AutoArbitrate bool     `json:"auto_arbitrate"`
+	Engines          []string `json:"engines"`
+	Arbiter          string   `json:"arbiter"`
+	DuplicateChecker string   `json:"duplicate_checker"`
+	AutoArbitrate    bool     `json:"auto_arbitrate"`
 }
 
 func (s *Server) documentSettingsFromQuery(r *http.Request) (documentRunSettings, error) {
@@ -645,8 +654,14 @@ func (s *Server) documentSettingsFromQuery(r *http.Request) (documentRunSettings
 	if r.URL.Query().Has("arbiter") {
 		arbiterRef = strings.TrimSpace(r.URL.Query().Get("arbiter"))
 	}
+	duplicateChecker := cfg.DuplicateChecker
+	if r.URL.Query().Has("duplicate_checker") {
+		duplicateChecker = strings.TrimSpace(r.URL.Query().Get("duplicate_checker"))
+	}
 	autoArbitrate := !strings.EqualFold(r.URL.Query().Get("auto_arbitrate"), "false")
-	settings := documentRunSettings{Engines: engines, Arbiter: arbiterRef, AutoArbitrate: autoArbitrate}
+	settings := documentRunSettings{
+		Engines: engines, Arbiter: arbiterRef, DuplicateChecker: duplicateChecker, AutoArbitrate: autoArbitrate,
+	}
 	return settings, s.validateDocumentSettings(settings)
 }
 
@@ -660,6 +675,11 @@ func (s *Server) validateDocumentSettings(settings documentRunSettings) error {
 	}
 	if settings.Arbiter != "" {
 		if _, err := cfg.Resolve(settings.Arbiter); err != nil {
+			return err
+		}
+	}
+	if settings.DuplicateChecker != "" {
+		if _, err := cfg.Resolve(settings.DuplicateChecker); err != nil {
 			return err
 		}
 	}
@@ -728,6 +748,7 @@ func (s *Server) handleRunDocument(w http.ResponseWriter, r *http.Request) {
 		document, err = s.Store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
 			next.Engines = append([]string(nil), settings.Engines...)
 			next.Arbiter = settings.Arbiter
+			next.DuplicateChecker = settings.DuplicateChecker
 			next.AutoArbitrate = settings.AutoArbitrate
 			next.Status = database.DocumentPreparing
 			next.CompletedAt = nil
@@ -748,6 +769,7 @@ func (s *Server) handleRunDocument(w http.ResponseWriter, r *http.Request) {
 	document, err = s.Store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
 		next.Engines = append([]string(nil), settings.Engines...)
 		next.Arbiter = settings.Arbiter
+		next.DuplicateChecker = settings.DuplicateChecker
 		next.AutoArbitrate = settings.AutoArbitrate
 		next.Status = database.DocumentProcessing
 		next.CompletedAt = nil

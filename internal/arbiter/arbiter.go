@@ -20,13 +20,15 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/agent"
 )
 
-// Candidate 是分歧句段上来自某个引擎的候选文本。
+// Candidate 是分歧句段或连续争议区域上来自某个引擎的候选文本。
 type Candidate struct {
 	Agent string `json:"agent"`
 	Text  string `json:"text"`
 }
 
-// Dispute 是一处待仲裁的句段分歧。Before/After 是最近的上下文句段。
+// Dispute 是一处待仲裁的连续文本区域。它通常包含一个句段;当相邻句段
+// 都缺少可靠共识时,会合成一个区域,避免不同模型的重叠切分被重复输出。
+// Before/After 是区域两侧最近的共识句段。
 type Dispute struct {
 	Segment    int         `json:"segment"`
 	Before     string      `json:"before,omitempty"`
@@ -35,7 +37,7 @@ type Dispute struct {
 }
 
 // Resolution 是仲裁器对一处分歧的裁定。
-// Text 为空表示该句段并不存在于图中,应当丢弃。其余字段由独立仲裁
+// Text 为空表示该争议区域并不存在于图中,应当丢弃。其余字段由独立仲裁
 // 接口补齐,便于前端直接更新结果。
 type Resolution struct {
 	Segment    int      `json:"segment"`
@@ -84,6 +86,9 @@ type Stats struct {
 	DroppedSegments   int    `json:"dropped_segments,omitempty"`
 	Escalator         string `json:"escalator,omitempty"`
 	EscalationErr     string `json:"escalation_err,omitempty"`
+	DuplicateChecker  string `json:"duplicate_checker,omitempty"`
+	DuplicateCheckErr string `json:"duplicate_check_err,omitempty"`
+	DuplicateSegments int    `json:"duplicate_segments,omitempty"`
 }
 
 // Final 是融合后的最终结果。
@@ -138,33 +143,30 @@ func (a *Arbiter) Fuse(ctx context.Context, image []byte, results []agent.Result
 	}
 
 	rows := alignAll(valid, a.AlignThreshold)
-	stats.Segments = len(rows)
 
 	segments := make([]*FinalSegment, len(rows))
-	var disputeIndexes []int
 	for i, r := range rows {
 		if segment, ok := consensusOf(r, len(valid)); ok {
 			segments[i] = segment
 			stats.ConsensusSegments++
-		} else {
-			disputeIndexes = append(disputeIndexes, i)
 		}
 	}
 
-	if len(disputeIndexes) > 0 {
-		disputes := buildDisputes(rows, segments, disputeIndexes)
-		disputeByIndex := make(map[int]Dispute, len(disputes))
-		for _, dispute := range disputes {
-			disputeByIndex[dispute.Segment] = dispute
+	blocks := buildDisputeBlocks(rows, segments)
+	stats.Segments = stats.ConsensusSegments + len(blocks)
+	if len(blocks) > 0 {
+		disputes := make([]Dispute, 0, len(blocks))
+		for _, block := range blocks {
+			disputes = append(disputes, block.dispute)
 		}
 		resolved := map[int]Resolution{}
 		if a.Escalator != nil && !a.DeferEscalation {
 			if rs, err := a.Escalator.Resolve(ctx, image, disputes); err != nil {
 				stats.EscalationErr = err.Error()
 			} else {
-				inDispute := make(map[int]bool, len(disputeIndexes))
-				for _, i := range disputeIndexes {
-					inDispute[i] = true
+				inDispute := make(map[int]bool, len(blocks))
+				for _, block := range blocks {
+					inDispute[block.start] = true
 				}
 				for _, res := range rs {
 					if inDispute[res.Segment] {
@@ -173,33 +175,39 @@ func (a *Arbiter) Fuse(ctx context.Context, image []byte, results []agent.Result
 				}
 			}
 		}
-		for _, i := range disputeIndexes {
-			candidates := disputeByIndex[i].Candidates
-			if res, ok := resolved[i]; ok {
+		for _, block := range blocks {
+			candidates := block.dispute.Candidates
+			if res, ok := resolved[block.start]; ok {
 				stats.EscalatedSegments++
 				if strings.TrimSpace(res.Text) == "" {
 					stats.DroppedSegments++
-					continue
-				}
-				segments[i] = &FinalSegment{
-					Text:       res.Text,
-					Confidence: escalatedConfidence(rows[i], res.Text),
-					Source:     SourceEscalated,
-					From:       []string{a.Escalator.Name()},
-					Disputed:   true,
-					Candidates: candidates,
+				} else {
+					segments[block.start] = &FinalSegment{
+						Text:       res.Text,
+						Confidence: ResolutionConfidence(candidates, res.Text),
+						Source:     SourceEscalated,
+						From:       []string{a.Escalator.Name()},
+						Disputed:   true,
+						Candidates: candidates,
+					}
 				}
 			} else {
-				c := rows[i].rep()
-				segments[i] = &FinalSegment{
+				candidateRow := rowFromCandidates(candidates)
+				c := candidateRow.rep()
+				segments[block.start] = &FinalSegment{
 					Text:       c.text,
-					Confidence: round4(fallbackConfidence(rows[i], c)),
+					Confidence: round4(fallbackConfidence(candidateRow, c)),
 					Source:     SourceFallback,
 					From:       []string{c.agent},
 					Disputed:   true,
 					Candidates: candidates,
 				}
 				stats.FallbackSegments++
+			}
+			// 一个连续争议块只产生一份正文。其余槽位即使来自不同模型的
+			// 重叠切分,也不会再次进入最终拼接。
+			for i := block.start + 1; i < block.end; i++ {
+				segments[i] = nil
 			}
 		}
 	}
@@ -284,17 +292,6 @@ func consensusConfidence(k, n int) float64 {
 	return conf
 }
 
-// escalatedConfidence 区分仲裁裁定是否拿到了独立旁证。
-func escalatedConfidence(r *row, text string) float64 {
-	norm := Normalize(text)
-	for _, c := range r.cands {
-		if Normalize(c.text) == norm {
-			return escalatedCorroborated
-		}
-	}
-	return escalatedSolo
-}
-
 // fallbackConfidence 由候选彼此的接近程度推导兜底句段置信度:候选只差
 // 一两个字符时,选错的代价有限;彼此面目全非时,这一句段基本是掷硬币。
 func fallbackConfidence(r *row, rep cand) float64 {
@@ -353,29 +350,63 @@ func consensusOf(r *row, n int) (*FinalSegment, bool) {
 	return nil, false
 }
 
-// buildDisputes 为待仲裁句段构造 Dispute,附上最近的上下文共识句段。
-func buildDisputes(rows []*row, segments []*FinalSegment, disputeIndexes []int) []Dispute {
-	disputes := make([]Dispute, 0, len(disputeIndexes))
-	for _, i := range disputeIndexes {
-		d := Dispute{Segment: i}
-		for j := i - 1; j >= 0; j-- {
-			if segments[j] != nil {
-				d.Before = segments[j].Text
-				break
+type disputeBlock struct {
+	start   int
+	end     int // exclusive
+	dispute Dispute
+}
+
+// buildDisputeBlocks 把相邻的非共识槽合成一个区域。候选按引擎重新拼接,
+// 所以 1:N、N:1 乃至渐进对齐失败产生的重叠槽都只保留一份候选正文。
+func buildDisputeBlocks(rows []*row, segments []*FinalSegment) []disputeBlock {
+	var blocks []disputeBlock
+	for start := 0; start < len(rows); {
+		if segments[start] != nil {
+			start++
+			continue
+		}
+		end := start + 1
+		for end < len(rows) && segments[end] == nil {
+			end++
+		}
+
+		dispute := Dispute{Segment: start}
+		if start > 0 {
+			dispute.Before = segments[start-1].Text
+		}
+		if end < len(segments) {
+			dispute.After = segments[end].Text
+		}
+
+		byAgent := make(map[string][]string)
+		for _, row := range rows[start:end] {
+			for _, candidate := range row.cands {
+				byAgent[candidate.agent] = append(byAgent[candidate.agent], candidate.text)
 			}
 		}
-		for j := i + 1; j < len(segments); j++ {
-			if segments[j] != nil {
-				d.After = segments[j].Text
-				break
-			}
+		agents := make([]string, 0, len(byAgent))
+		for name := range byAgent {
+			agents = append(agents, name)
 		}
-		for _, c := range rows[i].cands {
-			d.Candidates = append(d.Candidates, Candidate{Agent: c.agent, Text: c.text})
+		sort.Strings(agents)
+		for _, name := range agents {
+			dispute.Candidates = append(dispute.Candidates, Candidate{
+				Agent: name,
+				Text:  strings.Join(byAgent[name], ""),
+			})
 		}
-		disputes = append(disputes, d)
+		blocks = append(blocks, disputeBlock{start: start, end: end, dispute: dispute})
+		start = end
 	}
-	return disputes
+	return blocks
+}
+
+func rowFromCandidates(candidates []Candidate) *row {
+	r := &row{cands: make([]cand, 0, len(candidates))}
+	for _, candidate := range candidates {
+		r.cands = append(r.cands, cand{agent: candidate.Agent, text: candidate.Text})
+	}
+	return r
 }
 
 // ResolutionConfidence 为独立的手动仲裁接口计算与自动仲裁一致的置信度。

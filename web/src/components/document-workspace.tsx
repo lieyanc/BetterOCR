@@ -79,11 +79,13 @@ import { cn } from "@/lib/utils"
 interface DocumentWorkspaceProps {
   engines: string[]
   arbiter: string
+  duplicateChecker: string
 }
 
 export function DocumentWorkspace({
   engines,
   arbiter,
+  duplicateChecker,
 }: DocumentWorkspaceProps) {
   const [projects, setProjects] = useState<DocumentProjectRecord[]>([])
   const [project, setProject] = useState<DocumentProjectRecord | null>(null)
@@ -335,7 +337,7 @@ export function DocumentWorkspace({
       try {
         const created = await uploadDocument(
           file,
-          { engines, arbiter, autoArbitrate },
+          { engines, arbiter, duplicateChecker, autoArbitrate },
           (loaded, total) => setUploadProgress({ loaded, total }),
           controller.signal,
         )
@@ -350,7 +352,7 @@ export function DocumentWorkspace({
         setUploading(false)
       }
     },
-    [arbiter, autoArbitrate, engines, mergeProject, uploading],
+    [arbiter, autoArbitrate, duplicateChecker, engines, mergeProject, uploading],
   )
 
   useEffect(() => {
@@ -371,7 +373,12 @@ export function DocumentWorkspace({
     setError("")
     try {
       mergeProject(
-        await runDocument(project.id, { engines, arbiter, autoArbitrate }),
+        await runDocument(project.id, {
+          engines,
+          arbiter,
+          duplicateChecker,
+          autoArbitrate,
+        }),
       )
     } catch (cause) {
       setError(errorMessage(cause))
@@ -1365,6 +1372,9 @@ function LiveAgentProgress({ agent }: { agent: DocumentAgentProgress }) {
           </Badge>
         )}
         {agent.stage === "arbiter" && <Badge variant="outline">仲裁</Badge>}
+        {agent.stage === "duplicate_check" && (
+          <Badge variant="outline">Fast Model</Badge>
+        )}
       </div>
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs tabular-nums text-muted-foreground">
         <span>
@@ -1439,6 +1449,8 @@ function progressStageText(progress: DocumentProgressEvent | null): string {
       return "基础模型已全部返回，正在对齐文本并定位分歧"
     case "arbiter":
       return "基础模型已全部返回，仲裁模型正在裁定分歧"
+    case "duplicate_check":
+      return "正在检查最终文本中的合并重复"
     case "saving":
       return "模型输出已完成，正在生成并保存最终结果"
     case "complete":

@@ -225,6 +225,9 @@ function TaskDetail({
                 {task.result.stats.segments} 个句段
               </Badge>
               {task.arbiter && <Badge variant="outline">已配置仲裁</Badge>}
+              {task.duplicate_checker && (
+                <Badge variant="outline">已配置 Fast Model</Badge>
+              )}
             </div>
             <pre className="min-h-48 whitespace-pre-wrap break-words rounded-md bg-muted/50 p-4 font-sans text-sm leading-6">
               {task.result.text || "无文本结果"}
