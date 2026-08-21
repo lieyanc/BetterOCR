@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -277,6 +278,111 @@ func TestRunRetriesArbitrationWithoutRerunningEngines(t *testing.T) {
 	}
 	if final.Text != "发票编号042。" || final.Stats.EscalatedSegments != 1 {
 		t.Fatalf("final = %+v", final)
+	}
+}
+
+func TestRunRenewsIndependentTimeoutsWhileModelsAreStreaming(t *testing.T) {
+	var mu sync.Mutex
+	calls := map[string]int{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		mu.Lock()
+		calls[request.Model]++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("test server does not support flushing")
+		}
+		chunks := map[string][]string{
+			"engine-a": {"合同", "金额", "100", "元。"},
+			"engine-b": {"合同金额101元。"},
+			"arbiter":  {"#0 ", "合同", "金额", "102", "元。"},
+		}[request.Model]
+		for index, chunk := range chunks {
+			_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", chunk)
+			flusher.Flush()
+			if index < len(chunks)-1 {
+				time.Sleep(30 * time.Millisecond)
+			}
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	resolved := func(id string) model.Resolved {
+		return model.Resolved{
+			Ref: "test/" + id, ProviderID: "test", ProviderAlias: "Test",
+			BaseURL: upstream.URL, ID: id, Alias: id, Context: 32768,
+			API: model.APIOpenAIChatCompletions,
+		}
+	}
+	arbiterModel := resolved("arbiter")
+	final, err := Run(context.Background(), Config{
+		Engines:       []model.Resolved{resolved("engine-a"), resolved("engine-b")},
+		Arbiter:       &arbiterModel,
+		EngineTimeout: 70 * time.Millisecond, ArbiterTimeout: 70 * time.Millisecond,
+		EngineMaxAttempts: 1, ArbiterMaxAttempts: 1,
+	}, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls["engine-a"] != 1 || calls["engine-b"] != 1 || calls["arbiter"] != 1 {
+		t.Fatalf("streaming attempts were interrupted: calls = %v", calls)
+	}
+	if final.Text != "合同金额102元。" {
+		t.Fatalf("final text = %q", final.Text)
+	}
+}
+
+func TestRunRetriesWhenStreamingBecomesIdle(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		attempt := calls
+		mu.Unlock()
+		if attempt == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"部分\"}}]}\n\n")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": "完整结果。"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	engine := model.Resolved{
+		Ref: "test/engine", ProviderID: "test", BaseURL: upstream.URL,
+		ID: "engine", Alias: "engine", Context: 32768, API: model.APIOpenAIChatCompletions,
+	}
+	final, err := Run(context.Background(), Config{
+		Engines: []model.Resolved{engine}, EngineTimeout: 50 * time.Millisecond, EngineMaxAttempts: 2,
+	}, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if final.Text != "完整结果。" {
+		t.Fatalf("final text = %q", final.Text)
 	}
 }
 

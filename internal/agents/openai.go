@@ -26,7 +26,8 @@ type VisionVLM struct {
 	Model     model.Resolved
 	Client    *http.Client
 	// OnDelta receives separately classified thinking and output fragments.
-	OnDelta func(StreamDelta)
+	OnDelta    func(StreamDelta)
+	onActivity func()
 }
 
 // StreamKind separates model reasoning from text that belongs in OCR output.
@@ -56,6 +57,19 @@ func NewVisionVLM(name string, resolved model.Resolved, client *http.Client) *Vi
 // Name implements agent.Agent.
 func (v *VisionVLM) Name() string { return v.AgentName }
 
+// SetActivityCallback lets the pipeline renew this call's idle timeout whenever
+// the model emits a thinking or output fragment.
+func (v *VisionVLM) SetActivityCallback(callback func()) { v.onActivity = callback }
+
+func (v *VisionVLM) emitDelta(delta StreamDelta) {
+	if v.onActivity != nil {
+		v.onActivity()
+	}
+	if v.OnDelta != nil {
+		v.OnDelta(delta)
+	}
+}
+
 const ocrSystem = `You are a pure OCR engine. Transcribe every visible character in the image in natural reading order.
 
 Return only the transcription as plain text.
@@ -73,7 +87,7 @@ Rules:
 // 它会成为只有一个引擎产出的孤立句段,在融合层进入仲裁,由仲裁器看图判定
 // "不存在于图中"而丢弃。让架构处理噪声,比让正则去猜可靠。
 func (v *VisionVLM) Recognize(ctx context.Context, image []byte) (agent.Result, error) {
-	content, err := vision(ctx, v.Model, v.Client, ocrSystem, "Transcribe the image.", image, v.OnDelta)
+	content, err := vision(ctx, v.Model, v.Client, ocrSystem, "Transcribe the image.", image, v.emitDelta)
 	if err != nil {
 		return agent.Result{}, err
 	}
@@ -86,7 +100,8 @@ type VisionEscalator struct {
 	Model  model.Resolved
 	Client *http.Client
 	// OnDelta receives separately classified arbitration fragments.
-	OnDelta func(StreamDelta)
+	OnDelta    func(StreamDelta)
+	onActivity func()
 }
 
 // NewVisionEscalator creates a dispute arbiter.
@@ -97,6 +112,19 @@ func NewVisionEscalator(resolved model.Resolved, client *http.Client) *VisionEsc
 // Name implements arbiter.Escalator.
 func (e *VisionEscalator) Name() string {
 	return "arbiter:" + e.Model.DisplayName() + " (" + e.Model.ProviderName() + ")"
+}
+
+// SetActivityCallback lets the pipeline renew this call's idle timeout whenever
+// the model emits a thinking or output fragment.
+func (e *VisionEscalator) SetActivityCallback(callback func()) { e.onActivity = callback }
+
+func (e *VisionEscalator) emitDelta(delta StreamDelta) {
+	if e.onActivity != nil {
+		e.onActivity()
+	}
+	if e.OnDelta != nil {
+		e.OnDelta(delta)
+	}
 }
 
 const escalatorSystem = `You are the arbiter in a multi-engine OCR system. Several OCR engines transcribed the same image. The disputed sentence segments listed below were aligned by their Chinese text content, not by physical image lines. Look at the image and decide the exact text for each segment.
@@ -114,7 +142,7 @@ Rules:
 
 // Resolve implements arbiter.Escalator and batches all disputed segments in one call.
 func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []arbiter.Dispute) ([]arbiter.Resolution, error) {
-	content, err := vision(ctx, e.Model, e.Client, escalatorSystem, disputesPrompt(disputes), image, e.OnDelta)
+	content, err := vision(ctx, e.Model, e.Client, escalatorSystem, disputesPrompt(disputes), image, e.emitDelta)
 	if err != nil {
 		return nil, err
 	}

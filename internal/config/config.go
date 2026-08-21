@@ -34,9 +34,9 @@ type Config struct {
 	Engines []string `json:"engines"`
 	// Arbiter is a provider/model reference. Empty disables remote arbitration.
 	Arbiter string `json:"arbiter"`
-	// EngineTimeoutSeconds 是每个基础模型每次尝试的超时秒数。
+	// EngineTimeoutSeconds 是每个基础模型每次尝试的连续无输出超时秒数。
 	EngineTimeoutSeconds int `json:"engine_timeout_seconds"`
-	// ArbiterTimeoutSeconds 是仲裁模型每次尝试的超时秒数。
+	// ArbiterTimeoutSeconds 是仲裁模型每次尝试的连续无输出超时秒数。
 	ArbiterTimeoutSeconds int `json:"arbiter_timeout_seconds"`
 	// EngineMaxAttempts 是单个基础模型的最大尝试次数,1 表示不重试。
 	EngineMaxAttempts int `json:"engine_max_attempts"`
@@ -82,12 +82,12 @@ func Default() Config {
 	}
 }
 
-// EngineTimeout returns the independent timeout budget for each engine attempt.
+// EngineTimeout returns the independent idle timeout for each engine attempt.
 func (c Config) EngineTimeout() time.Duration {
 	return time.Duration(c.normalized().EngineTimeoutSeconds) * time.Second
 }
 
-// ArbiterTimeout returns the independent timeout budget for each arbiter attempt.
+// ArbiterTimeout returns the independent idle timeout for each arbiter attempt.
 func (c Config) ArbiterTimeout() time.Duration {
 	return time.Duration(c.normalized().ArbiterTimeoutSeconds) * time.Second
 }

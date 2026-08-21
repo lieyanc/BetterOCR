@@ -261,8 +261,8 @@ data/documents/<项目 ID>/
 | `models[].api`    | `openai-chat-completions`、`openai-responses` 或 `anthropic-messages` |
 | `engines`         | 基础模型引用数组;重复即多路采样(CLI 模式必填)              |
 | `arbiter`         | 仲裁模型引用;置空时争议句段等待人工合并                    |
-| `engine_timeout_seconds`  | 每个基础模型每次尝试的独立超时秒数                         |
-| `arbiter_timeout_seconds` | 仲裁模型每次尝试的独立超时秒数                             |
+| `engine_timeout_seconds`  | 基础模型每次尝试连续无输出的超时秒数;每个流片段都会重新计时 |
+| `arbiter_timeout_seconds` | 仲裁模型每次尝试连续无输出的超时秒数;每个流片段都会重新计时 |
 | `engine_max_attempts`     | 单个基础模型最大尝试次数,`1` 表示不重试                    |
 | `arbiter_max_attempts`    | 仲裁最大尝试次数,`1` 表示不重试                            |
 | `serve_addr`              | Web 模式监听地址,如 `127.0.0.1:8787`                       |

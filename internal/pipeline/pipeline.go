@@ -28,9 +28,9 @@ type Config struct {
 	DeferArbitration bool
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
-	// EngineTimeout is applied independently to every engine attempt.
+	// EngineTimeout is the maximum idle period for every engine attempt.
 	EngineTimeout time.Duration
-	// ArbiterTimeout is applied independently to every arbitration attempt.
+	// ArbiterTimeout is the maximum idle period for every arbitration attempt.
 	ArbiterTimeout time.Duration
 	// EngineMaxAttempts is per engine; one means no retry.
 	EngineMaxAttempts int
@@ -87,6 +87,10 @@ type observedAgent struct {
 	emit        func(Event)
 }
 
+type activityAware interface {
+	SetActivityCallback(func())
+}
+
 func (a observedAgent) Recognize(ctx context.Context, image []byte) (agent.Result, error) {
 	started := time.Now()
 	maxAttempts := normalizeAttempts(a.maxAttempts)
@@ -105,8 +109,11 @@ func (a observedAgent) Recognize(ctx context.Context, image []byte) (agent.Resul
 			Attempt: attempt, MaxAttempts: maxAttempts,
 		})
 		attemptStarted := time.Now()
-		attemptCtx, cancel := context.WithTimeout(ctx, normalizeTimeout(a.timeout))
+		attemptCtx, cancel, touch := withIdleTimeout(ctx, a.timeout)
+		setActivityCallback(a.Agent, touch)
 		result, err = a.Agent.Recognize(attemptCtx, image)
+		setActivityCallback(a.Agent, nil)
+		err = idleTimeoutError(ctx, attemptCtx, a.timeout, err)
 		cancel()
 		if err == nil {
 			break
@@ -147,7 +154,7 @@ func (e observedEscalator) Resolve(
 	return ResolveWithRetry(ctx, e.Escalator, image, disputes, e.timeout, e.maxAttempts, e.emit)
 }
 
-// ResolveWithRetry runs arbitration with a fresh timeout for every attempt.
+// ResolveWithRetry runs arbitration with a fresh idle timeout for every attempt.
 // It is shared by automatic arbitration and the manual arbitration endpoint.
 func ResolveWithRetry(
 	ctx context.Context,
@@ -178,8 +185,11 @@ func ResolveWithRetry(
 			Attempt: attempt, MaxAttempts: maxAttempts,
 		})
 		attemptStarted := time.Now()
-		attemptCtx, cancel := context.WithTimeout(ctx, normalizeTimeout(timeout))
+		attemptCtx, cancel, touch := withIdleTimeout(ctx, timeout)
+		setActivityCallback(escalator, touch)
 		resolutions, err = escalator.Resolve(attemptCtx, image, disputes)
+		setActivityCallback(escalator, nil)
+		err = idleTimeoutError(ctx, attemptCtx, timeout, err)
 		cancel()
 		if err == nil {
 			break
@@ -210,6 +220,70 @@ func normalizeTimeout(timeout time.Duration) time.Duration {
 		return timeout
 	}
 	return 2 * time.Minute
+}
+
+func setActivityCallback(target any, callback func()) {
+	if aware, ok := target.(activityAware); ok {
+		aware.SetActivityCallback(callback)
+	}
+}
+
+func withIdleTimeout(parent context.Context, timeout time.Duration) (
+	context.Context,
+	context.CancelFunc,
+	func(),
+) {
+	timeout = normalizeTimeout(timeout)
+	ctx, cancelCause := context.WithCancelCause(parent)
+	activity := make(chan struct{}, 1)
+	var activityMu sync.Mutex
+	lastActivity := time.Now()
+	touch := func() {
+		activityMu.Lock()
+		lastActivity = time.Now()
+		activityMu.Unlock()
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-activity:
+			case <-timer.C:
+			}
+
+			activityMu.Lock()
+			remaining := timeout - time.Since(lastActivity)
+			activityMu.Unlock()
+			if remaining <= 0 {
+				cancelCause(context.DeadlineExceeded)
+				return
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(remaining)
+		}
+	}()
+
+	return ctx, func() { cancelCause(context.Canceled) }, touch
+}
+
+func idleTimeoutError(parent, attempt context.Context, timeout time.Duration, err error) error {
+	if err != nil && parent.Err() == nil && errors.Is(context.Cause(attempt), context.DeadlineExceeded) {
+		return fmt.Errorf("连续 %s 未收到模型输出: %w", normalizeTimeout(timeout), context.DeadlineExceeded)
+	}
+	return err
 }
 
 func normalizeAttempts(maxAttempts int) int {
