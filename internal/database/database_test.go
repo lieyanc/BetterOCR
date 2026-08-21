@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -137,5 +138,51 @@ func TestInitializeAdminAllowsOneConcurrentWinner(t *testing.T) {
 	}
 	if succeeded != 1 || alreadyInitialized != 1 || len(store.Users()) != 1 {
 		t.Fatalf("succeeded=%d already_initialized=%d users=%d", succeeded, alreadyInitialized, len(store.Users()))
+	}
+}
+
+func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database.json")
+	store, err := Open(path, config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := store.InitializeAdmin("admin", "admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	processing, err := store.CreateDocument(admin, "processing.pdf", "pdf", "application/pdf", 1024, []string{"openai/gpt-4o-mini"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateDocument(processing.ID, func(document *DocumentProject) error {
+		document.Status = DocumentProcessing
+		document.Pages = []DocumentPage{
+			{ID: "page-000001", SourcePage: 1, Status: PageCompleted, ImageReady: true, ResultReady: true},
+			{ID: "page-000002", SourcePage: 2, Status: PageProcessing, ImageReady: true},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	preparing, err := store.CreateDocument(admin, "preparing.pdf", "pdf", "application/pdf", 2048, []string{"openai/gpt-4o-mini"}, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := reopened.RecoverDocuments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(recovery.Process, processing.ID) || !slices.Contains(recovery.Prepare, preparing.ID) {
+		t.Fatalf("recovery = %+v", recovery)
+	}
+	recovered, ok := reopened.Document(processing.ID)
+	if !ok || recovered.Status != DocumentReady || recovered.Pages[0].Status != PageCompleted || recovered.Pages[1].Status != PageQueued {
+		t.Fatalf("recovered = %+v ok=%v", recovered, ok)
 	}
 }

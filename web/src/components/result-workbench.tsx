@@ -57,9 +57,17 @@ interface ResultWorkbenchProps {
   final: Final
   image: File
   arbiter: string
+  initialTab?: "text" | "disputes" | "segments" | "engines" | "json"
+  onChange?: (final: Final) => void
 }
 
-export function ResultWorkbench({ final, image, arbiter }: ResultWorkbenchProps) {
+export function ResultWorkbench({
+  final,
+  image,
+  arbiter,
+  initialTab,
+  onChange,
+}: ResultWorkbenchProps) {
   const [segments, setSegments] = useState(final.segments)
   const [editing, setEditing] = useState<number | null>(null)
   const [draft, setDraft] = useState("")
@@ -72,16 +80,7 @@ export function ResultWorkbench({ final, image, arbiter }: ResultWorkbenchProps)
   const arbiterThinkingRef = useRef<HTMLPreElement>(null)
   const arbiterOutputRef = useRef<HTMLPreElement>(null)
 
-  useEffect(() => {
-    setSegments(final.segments)
-    setEditing(null)
-    setDraft("")
-    setArbitrating([])
-    setArbiterThinking("")
-    setArbiterOutput("")
-    setFeedback("")
-    setArbitrationError("")
-  }, [final])
+  useEffect(() => () => arbitrationAbort.current?.abort(), [])
 
   useEffect(() => {
     const thinking = arbiterThinkingRef.current
@@ -124,9 +123,28 @@ export function ResultWorkbench({ final, image, arbiter }: ResultWorkbenchProps)
     [segments],
   )
 
+  const applySegments = (next: FinalSegment[]) => {
+    setSegments(next)
+    const visible = next.filter((segment) => segment.text.trim())
+    const nextConfidence =
+      visible.length === 0
+        ? 0
+        : visible.reduce((sum, segment) => sum + segment.confidence, 0) /
+          visible.length
+    onChange?.({
+      ...final,
+      text: next
+        .map((segment) => segment.text.trim())
+        .filter(Boolean)
+        .join("\n"),
+      confidence: nextConfidence,
+      segments: next,
+    })
+  }
+
   const updateSegment = (index: number, update: Partial<FinalSegment>) => {
-    setSegments((current) =>
-      current.map((segment, currentIndex) =>
+    applySegments(
+      segments.map((segment, currentIndex) =>
         currentIndex === index ? { ...segment, ...update } : segment,
       ),
     )
@@ -184,8 +202,8 @@ export function ResultWorkbench({ final, image, arbiter }: ResultWorkbenchProps)
         },
       )
       const byIndex = new Map(resolutions.map((resolution) => [resolution.segment, resolution]))
-      setSegments((current) =>
-        current.map((segment, index) => {
+      applySegments(
+        segments.map((segment, index) => {
           const resolution = byIndex.get(index)
           if (!resolution) return segment
           return {
@@ -243,12 +261,15 @@ export function ResultWorkbench({ final, image, arbiter }: ResultWorkbenchProps)
             <Badge variant="destructive">失败 {stats.failed_engines}</Badge>
           )}
         </CardDescription>
-        <CardAction className="flex w-32 flex-col items-end gap-1.5">
-          <span className="text-2xl font-semibold leading-none tabular-nums">
-            {pct(confidence)}
-          </span>
-          <Progress value={confidence * 100} />
-          <span className="text-xs text-muted-foreground">当前置信度</span>
+        <CardAction className="flex flex-col items-end gap-2.5">
+          <div className="flex w-32 flex-col items-end gap-1.5">
+            <span className="text-2xl font-semibold leading-none tabular-nums">
+              {pct(confidence)}
+            </span>
+            <Progress value={confidence * 100} />
+            <span className="text-xs text-muted-foreground">当前置信度</span>
+          </div>
+          <CopyButton text={mergedText} labeled />
         </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
@@ -316,7 +337,11 @@ export function ResultWorkbench({ final, image, arbiter }: ResultWorkbenchProps)
           </Alert>
         )}
 
-        <Tabs defaultValue={pendingIndexes.length > 0 ? "disputes" : "text"}>
+        <Tabs
+          defaultValue={
+            initialTab ?? (pendingIndexes.length > 0 ? "disputes" : "text")
+          }
+        >
           <TabsList className="grid h-auto w-full grid-cols-5">
             <TabsTrigger value="text">
               <span className="sm:hidden">合并</span>
@@ -605,10 +630,21 @@ function EngineOutput({ result }: { result: EngineResult }) {
   )
 }
 
-function CopyButton({ text, className }: { text: string; className?: string }) {
+function CopyButton({
+  text,
+  className,
+  labeled = false,
+}: {
+  text: string
+  className?: string
+  labeled?: boolean
+}) {
   const [status, setStatus] = useState<"idle" | "pending" | "success" | "error">(
     "idle",
   )
+
+  useEffect(() => setStatus("idle"), [text])
+
   const label =
     status === "pending"
       ? "正在复制"
@@ -616,10 +652,12 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
         ? "已复制"
         : status === "error"
           ? "复制失败"
-          : "复制"
+          : labeled
+            ? "复制最终结果"
+            : "复制"
   return (
     <div className={cn("flex items-center gap-2", className)}>
-      {status !== "idle" && (
+      {!labeled && status !== "idle" && (
         <Badge variant={status === "error" ? "destructive" : "secondary"} role="status">
           {label}
         </Badge>
@@ -627,11 +665,11 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
-            variant={status === "error" ? "destructive" : "secondary"}
-            size="icon"
-            className="size-8"
+            variant={status === "error" ? "destructive" : labeled ? "default" : "secondary"}
+            size={labeled ? "sm" : "icon"}
+            className={cn(!labeled && "size-8")}
             aria-label={label}
-            disabled={status === "pending"}
+            disabled={status === "pending" || text.length === 0}
             onClick={async () => {
               setStatus("pending")
               try {
@@ -649,17 +687,20 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
             }}
           >
             {status === "pending" ? (
-              <Loader2 className="animate-spin" />
+              <Loader2 data-icon={labeled ? "inline-start" : undefined} className="animate-spin" />
             ) : status === "success" ? (
-              <Check />
+              <Check data-icon={labeled ? "inline-start" : undefined} />
             ) : status === "error" ? (
-              <AlertCircle />
+              <AlertCircle data-icon={labeled ? "inline-start" : undefined} />
             ) : (
-              <Copy />
+              <Copy data-icon={labeled ? "inline-start" : undefined} />
             )}
+            {labeled && label}
           </Button>
         </TooltipTrigger>
-        <TooltipContent>{label}</TooltipContent>
+        <TooltipContent>
+          {status === "idle" && labeled ? "复制最新合并文本" : label}
+        </TooltipContent>
       </Tooltip>
     </div>
   )

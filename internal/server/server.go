@@ -16,6 +16,7 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
 	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/database"
+	"github.com/lieyanc/BetterOCR/internal/documents"
 	"github.com/lieyanc/BetterOCR/internal/model"
 	"github.com/lieyanc/BetterOCR/internal/pipeline"
 	"github.com/lieyanc/BetterOCR/web"
@@ -35,6 +36,14 @@ type Server struct {
 	// Store enables login, authorization, editable settings and task history.
 	// A nil store keeps the handler useful for isolated package tests.
 	Store *database.Store
+	// DocumentRoot overrides the default directory beside database.json.
+	DocumentRoot string
+	// PDFRenderer is injectable for tests. Production uses embedded PDFium WASM.
+	PDFRenderer documents.PageRenderer
+
+	documentOnce    sync.Once
+	documentManager *documentManager
+	documentInitErr error
 }
 
 // Handler 返回完整的 HTTP 处理器:/api/* 为接口,其余为内嵌前端。
@@ -54,6 +63,20 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/ocr/stream", s.requireAuth(http.HandlerFunc(s.handleOCRStream)))
 	mux.Handle("POST /api/arbitrate/stream", s.requireAuth(http.HandlerFunc(s.handleArbitrateStream)))
 	mux.Handle("GET /api/tasks", s.requireAuth(http.HandlerFunc(s.handleTasks)))
+	mux.Handle("GET /api/documents", s.requireAuth(http.HandlerFunc(s.handleDocuments)))
+	mux.Handle("POST /api/documents", s.requireAuth(http.HandlerFunc(s.handleCreateDocument)))
+	mux.Handle("GET /api/documents/{id}", s.requireAuth(http.HandlerFunc(s.handleDocument)))
+	mux.Handle("DELETE /api/documents/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteDocument)))
+	mux.Handle("POST /api/documents/{id}/run", s.requireAuth(http.HandlerFunc(s.handleRunDocument)))
+	mux.Handle("POST /api/documents/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelDocument)))
+	mux.Handle("PUT /api/documents/{id}/pages/order", s.requireAuth(http.HandlerFunc(s.handleDocumentPageOrder)))
+	mux.Handle("GET /api/documents/{id}/pages/{pageID}/image", s.requireAuth(http.HandlerFunc(s.handleDocumentPageImage)))
+	mux.Handle("GET /api/documents/{id}/pages/{pageID}/result", s.requireAuth(http.HandlerFunc(s.handleDocumentPageResult)))
+	mux.Handle("PUT /api/documents/{id}/pages/{pageID}/result", s.requireAuth(http.HandlerFunc(s.handleUpdateDocumentPageResult)))
+	mux.Handle("DELETE /api/documents/{id}/pages/{pageID}", s.requireAuth(http.HandlerFunc(s.handleDeleteDocumentPage)))
+	mux.Handle("GET /api/documents/{id}/disputes", s.requireAuth(http.HandlerFunc(s.handleDocumentDisputes)))
+	mux.Handle("GET /api/documents/{id}/export/text", s.requireAuth(http.HandlerFunc(s.handleDocumentTextExport)))
+	mux.Handle("GET /api/documents/{id}/export/audit", s.requireAuth(http.HandlerFunc(s.handleDocumentAuditExport)))
 	mux.Handle("GET /api/admin/users", s.requireAdmin(http.HandlerFunc(s.handleUsers)))
 	mux.Handle("POST /api/admin/users", s.requireAdmin(http.HandlerFunc(s.handleCreateUser)))
 	mux.Handle("PUT /api/admin/users/{id}", s.requireAdmin(http.HandlerFunc(s.handleUpdateUser)))

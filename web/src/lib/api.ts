@@ -231,6 +231,231 @@ export async function fetchConfig(): Promise<ServerConfig> {
   return res.json() as Promise<ServerConfig>
 }
 
+export type DocumentStatus =
+  | "preparing"
+  | "ready"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "cancelled"
+
+export type DocumentPageStatus =
+  | "preparing"
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed"
+
+export interface DocumentPageRecord {
+  id: string
+  source_page: number
+  page_number: number
+  status: DocumentPageStatus
+  image_ready: boolean
+  result_ready: boolean
+  confidence?: number
+  segments?: number
+  pending_disputes?: number
+  duration_ms?: number
+  revision: number
+  error?: string
+  updated_at: string
+}
+
+export interface DocumentProjectRecord {
+  id: string
+  user_id: string
+  username: string
+  name: string
+  source_type: "pdf" | "image"
+  mime_type: string
+  size_bytes: number
+  status: DocumentStatus
+  page_count: number
+  prepared_pages: number
+  processed_pages: number
+  failed_pages: number
+  pending_disputes: number
+  engines: string[]
+  arbiter?: string
+  auto_arbitrate: boolean
+  created_at: string
+  updated_at: string
+  completed_at?: string
+  error?: string
+  pages?: DocumentPageRecord[]
+}
+
+export interface DocumentDisputeItem {
+  page_id: string
+  page_number: number
+  source_page: number
+  segment_index: number
+  segment: FinalSegment
+}
+
+export interface DocumentRunSettings {
+  engines: string[]
+  arbiter: string
+  autoArbitrate: boolean
+}
+
+export async function fetchDocuments(): Promise<DocumentProjectRecord[]> {
+  const res = await apiFetch("/api/documents")
+  await assertOK(res, "获取文档项目")
+  return res.json() as Promise<DocumentProjectRecord[]>
+}
+
+export async function fetchDocument(id: string): Promise<DocumentProjectRecord> {
+  const res = await apiFetch(`/api/documents/${encodeURIComponent(id)}`)
+  await assertOK(res, "获取文档项目")
+  return res.json() as Promise<DocumentProjectRecord>
+}
+
+export function uploadDocument(
+  file: File,
+  settings: DocumentRunSettings,
+  onProgress?: (loaded: number, total: number) => void,
+  signal?: AbortSignal,
+): Promise<DocumentProjectRecord> {
+  if (file.size > 1024 * 1024 * 1024) {
+    return Promise.reject(new Error("文档不能超过 1 GiB"))
+  }
+  const params = new URLSearchParams({
+    filename: file.name,
+    engines: settings.engines.join(","),
+    arbiter: settings.arbiter,
+    auto_arbitrate: String(settings.autoArbitrate),
+  })
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open("POST", `/api/documents?${params}`)
+    xhr.responseType = "json"
+    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream")
+    if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken)
+    xhr.upload.onprogress = (event) =>
+      onProgress?.(event.loaded, event.lengthComputable ? event.total : file.size)
+    xhr.onerror = () => reject(new Error("上传文档时连接中断"))
+    xhr.onabort = () => reject(new DOMException("上传已取消", "AbortError"))
+    xhr.onload = () => {
+      if (xhr.status === 401) {
+        csrfToken = ""
+        window.dispatchEvent(new CustomEvent("betterocr:unauthorized"))
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.response as DocumentProjectRecord)
+        return
+      }
+      const response = xhr.response as { error?: string } | null
+      reject(new Error(response?.error || `上传请求失败 (HTTP ${xhr.status})`))
+    }
+    const abort = () => xhr.abort()
+    signal?.addEventListener("abort", abort, { once: true })
+    xhr.onloadend = () => signal?.removeEventListener("abort", abort)
+    xhr.send(file)
+  })
+}
+
+export async function runDocument(
+  id: string,
+  settings: DocumentRunSettings,
+): Promise<DocumentProjectRecord> {
+  return requestJSON<DocumentProjectRecord>(
+    `/api/documents/${encodeURIComponent(id)}/run`,
+    "POST",
+    {
+      engines: settings.engines,
+      arbiter: settings.arbiter,
+      auto_arbitrate: settings.autoArbitrate,
+    },
+    "启动文档识别",
+  )
+}
+
+export async function cancelDocument(id: string): Promise<DocumentProjectRecord> {
+  const res = await apiFetch(`/api/documents/${encodeURIComponent(id)}/cancel`, {
+    method: "POST",
+  })
+  await assertOK(res, "取消文档任务")
+  return res.json() as Promise<DocumentProjectRecord>
+}
+
+export async function deleteDocument(id: string): Promise<void> {
+  const res = await apiFetch(`/api/documents/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  })
+  await assertOK(res, "删除文档项目")
+}
+
+export async function updateDocumentPageOrder(
+  id: string,
+  pageIDs: string[],
+): Promise<DocumentProjectRecord> {
+  return requestJSON<DocumentProjectRecord>(
+    `/api/documents/${encodeURIComponent(id)}/pages/order`,
+    "PUT",
+    { page_ids: pageIDs },
+    "调整页序",
+  )
+}
+
+export async function deleteDocumentPage(
+  documentID: string,
+  pageID: string,
+): Promise<DocumentProjectRecord> {
+  const res = await apiFetch(
+    `/api/documents/${encodeURIComponent(documentID)}/pages/${encodeURIComponent(pageID)}`,
+    { method: "DELETE" },
+  )
+  await assertOK(res, "删除页面")
+  return res.json() as Promise<DocumentProjectRecord>
+}
+
+export async function fetchDocumentPageResult(
+  documentID: string,
+  pageID: string,
+): Promise<Final> {
+  const res = await apiFetch(
+    `/api/documents/${encodeURIComponent(documentID)}/pages/${encodeURIComponent(pageID)}/result`,
+  )
+  await assertOK(res, "获取页面结果")
+  return res.json() as Promise<Final>
+}
+
+export async function updateDocumentPageResult(
+  documentID: string,
+  pageID: string,
+  result: Final,
+): Promise<DocumentProjectRecord> {
+  return requestJSON<DocumentProjectRecord>(
+    `/api/documents/${encodeURIComponent(documentID)}/pages/${encodeURIComponent(pageID)}/result`,
+    "PUT",
+    result,
+    "保存审计结果",
+  )
+}
+
+export async function fetchDocumentDisputes(
+  documentID: string,
+): Promise<DocumentDisputeItem[]> {
+  const res = await apiFetch(
+    `/api/documents/${encodeURIComponent(documentID)}/disputes`,
+  )
+  await assertOK(res, "获取统一审计清单")
+  return res.json() as Promise<DocumentDisputeItem[]>
+}
+
+export function documentPageImageURL(documentID: string, pageID: string): string {
+  return `/api/documents/${encodeURIComponent(documentID)}/pages/${encodeURIComponent(pageID)}/image`
+}
+
+export function documentExportURL(
+  documentID: string,
+  format: "text" | "audit",
+): string {
+  return `/api/documents/${encodeURIComponent(documentID)}/export/${format}`
+}
+
 export interface OCRRequest {
   image: File
   engines: string[]

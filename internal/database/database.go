@@ -77,13 +77,71 @@ type Task struct {
 	Error       string         `json:"error,omitempty"`
 }
 
+const (
+	DocumentPreparing  = "preparing"
+	DocumentReady      = "ready"
+	DocumentProcessing = "processing"
+	DocumentCompleted  = "completed"
+	DocumentFailed     = "failed"
+	DocumentCancelled  = "cancelled"
+
+	PagePreparing  = "preparing"
+	PageQueued     = "queued"
+	PageProcessing = "processing"
+	PageCompleted  = "completed"
+	PageFailed     = "failed"
+)
+
+// DocumentProject is lightweight project metadata. Source files, rendered
+// page images and full OCR results are stored separately on disk.
+type DocumentProject struct {
+	ID              string         `json:"id"`
+	UserID          string         `json:"user_id"`
+	Username        string         `json:"username"`
+	Name            string         `json:"name"`
+	SourceType      string         `json:"source_type"`
+	MimeType        string         `json:"mime_type"`
+	SizeBytes       int64          `json:"size_bytes"`
+	Status          string         `json:"status"`
+	PageCount       int            `json:"page_count"`
+	PreparedPages   int            `json:"prepared_pages"`
+	ProcessedPages  int            `json:"processed_pages"`
+	FailedPages     int            `json:"failed_pages"`
+	PendingDisputes int            `json:"pending_disputes"`
+	Engines         []string       `json:"engines"`
+	Arbiter         string         `json:"arbiter,omitempty"`
+	AutoArbitrate   bool           `json:"auto_arbitrate"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	CompletedAt     *time.Time     `json:"completed_at,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	Pages           []DocumentPage `json:"pages,omitempty"`
+}
+
+type DocumentPage struct {
+	ID              string    `json:"id"`
+	SourcePage      int       `json:"source_page"`
+	PageNumber      int       `json:"page_number"`
+	Status          string    `json:"status"`
+	ImageReady      bool      `json:"image_ready"`
+	ResultReady     bool      `json:"result_ready"`
+	Confidence      float64   `json:"confidence,omitempty"`
+	Segments        int       `json:"segments,omitempty"`
+	PendingDisputes int       `json:"pending_disputes,omitempty"`
+	DurationMS      int64     `json:"duration_ms,omitempty"`
+	Revision        int       `json:"revision"`
+	Error           string    `json:"error,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 type data struct {
-	Version     int           `json:"version"`
-	Initialized bool          `json:"initialized"`
-	Users       []storedUser  `json:"users"`
-	Sessions    []session     `json:"sessions"`
-	Tasks       []Task        `json:"tasks"`
-	Settings    config.Config `json:"settings"`
+	Version     int               `json:"version"`
+	Initialized bool              `json:"initialized"`
+	Users       []storedUser      `json:"users"`
+	Sessions    []session         `json:"sessions"`
+	Tasks       []Task            `json:"tasks"`
+	Documents   []DocumentProject `json:"documents"`
+	Settings    config.Config     `json:"settings"`
 }
 
 type Store struct {
@@ -105,7 +163,7 @@ func Open(path string, initialSettings config.Config) (*Store, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) || err == nil && len(strings.TrimSpace(string(raw))) == 0 {
 		store := &Store{path: path, data: data{
-			Version: 1, Initialized: false, Users: []storedUser{}, Sessions: []session{}, Tasks: []Task{}, Settings: initialSettings,
+			Version: 1, Initialized: false, Users: []storedUser{}, Sessions: []session{}, Tasks: []Task{}, Documents: []DocumentProject{}, Settings: initialSettings,
 		}}
 		if err := store.saveLocked(); err != nil {
 			return nil, fmt.Errorf("创建 JSON 数据库失败: %w", err)
@@ -470,6 +528,197 @@ func (s *Store) Tasks(userID string, all bool) []Task {
 		return []Task{}
 	}
 	return out
+}
+
+// Directory returns the database directory. Document payloads live beside the
+// JSON database so a custom -db path remains self-contained.
+func (s *Store) Directory() string {
+	return filepath.Dir(s.path)
+}
+
+func (s *Store) CreateDocument(
+	user User,
+	name, sourceType, mimeType string,
+	sizeBytes int64,
+	engines []string,
+	arbiterRef string,
+	autoArbitrate bool,
+) (DocumentProject, error) {
+	id, err := randomToken(12)
+	if err != nil {
+		return DocumentProject{}, err
+	}
+	now := time.Now().UTC()
+	document := DocumentProject{
+		ID: id, UserID: user.ID, Username: user.Username,
+		Name: strings.TrimSpace(name), SourceType: sourceType, MimeType: mimeType,
+		SizeBytes: sizeBytes, Status: DocumentPreparing,
+		Engines: append([]string(nil), engines...), Arbiter: strings.TrimSpace(arbiterRef),
+		AutoArbitrate: autoArbitrate, CreatedAt: now, UpdatedAt: now,
+		Pages: []DocumentPage{},
+	}
+	if document.Name == "" {
+		document.Name = "未命名文档"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Documents = append(s.data.Documents, document)
+	if err := s.saveLocked(); err != nil {
+		s.data.Documents = s.data.Documents[:len(s.data.Documents)-1]
+		return DocumentProject{}, err
+	}
+	return cloneDocument(document), nil
+}
+
+func (s *Store) Document(id string) (DocumentProject, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	index := slices.IndexFunc(s.data.Documents, func(document DocumentProject) bool { return document.ID == id })
+	if index < 0 {
+		return DocumentProject{}, false
+	}
+	return cloneDocument(s.data.Documents[index]), true
+}
+
+func (s *Store) Documents(userID string, all bool) []DocumentProject {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]DocumentProject, 0, len(s.data.Documents))
+	for _, document := range s.data.Documents {
+		if all || document.UserID == userID {
+			out = append(out, cloneDocument(document))
+		}
+	}
+	slices.SortFunc(out, func(a, b DocumentProject) int { return b.UpdatedAt.Compare(a.UpdatedAt) })
+	if out == nil {
+		return []DocumentProject{}
+	}
+	return out
+}
+
+// MutateDocument applies one atomic metadata update and persists it before
+// returning. The callback receives a private copy and cannot escape the lock.
+func (s *Store) MutateDocument(id string, mutate func(*DocumentProject) error) (DocumentProject, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index := slices.IndexFunc(s.data.Documents, func(document DocumentProject) bool { return document.ID == id })
+	if index < 0 {
+		return DocumentProject{}, errors.New("文档项目不存在")
+	}
+	previous := cloneDocument(s.data.Documents[index])
+	next := cloneDocument(previous)
+	if err := mutate(&next); err != nil {
+		return DocumentProject{}, err
+	}
+	recountDocument(&next)
+	next.UpdatedAt = time.Now().UTC()
+	s.data.Documents[index] = next
+	if err := s.saveLocked(); err != nil {
+		s.data.Documents[index] = previous
+		return DocumentProject{}, err
+	}
+	return cloneDocument(next), nil
+}
+
+func (s *Store) DeleteDocument(id string) (DocumentProject, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index := slices.IndexFunc(s.data.Documents, func(document DocumentProject) bool { return document.ID == id })
+	if index < 0 {
+		return DocumentProject{}, errors.New("文档项目不存在")
+	}
+	deleted := cloneDocument(s.data.Documents[index])
+	previous := append([]DocumentProject(nil), s.data.Documents...)
+	s.data.Documents = slices.Delete(s.data.Documents, index, index+1)
+	if err := s.saveLocked(); err != nil {
+		s.data.Documents = previous
+		return DocumentProject{}, err
+	}
+	return deleted, nil
+}
+
+type DocumentRecovery struct {
+	Prepare []string
+	Process []string
+}
+
+// RecoverDocuments converts interrupted page operations into resumable states
+// and returns the jobs that should be placed back on the background queue.
+func (s *Store) RecoverDocuments() (DocumentRecovery, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := make([]DocumentProject, len(s.data.Documents))
+	for i := range s.data.Documents {
+		previous[i] = cloneDocument(s.data.Documents[i])
+	}
+	var recovery DocumentRecovery
+	changed := false
+	for i := range s.data.Documents {
+		document := &s.data.Documents[i]
+		switch document.Status {
+		case DocumentPreparing:
+			recovery.Prepare = append(recovery.Prepare, document.ID)
+			for pageIndex := range document.Pages {
+				if document.Pages[pageIndex].ImageReady {
+					document.Pages[pageIndex].Status = PageQueued
+				} else {
+					document.Pages[pageIndex].Status = PagePreparing
+				}
+			}
+			changed = true
+		case DocumentProcessing:
+			recovery.Process = append(recovery.Process, document.ID)
+			for pageIndex := range document.Pages {
+				if document.Pages[pageIndex].Status == PageProcessing {
+					document.Pages[pageIndex].Status = PageQueued
+				}
+			}
+			document.Status = DocumentReady
+			changed = true
+		}
+		recountDocument(document)
+	}
+	if !changed {
+		return recovery, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		s.data.Documents = previous
+		return DocumentRecovery{}, err
+	}
+	return recovery, nil
+}
+
+func cloneDocument(source DocumentProject) DocumentProject {
+	cloned := source
+	cloned.Engines = append([]string(nil), source.Engines...)
+	cloned.Pages = append([]DocumentPage(nil), source.Pages...)
+	if source.CompletedAt != nil {
+		completed := *source.CompletedAt
+		cloned.CompletedAt = &completed
+	}
+	return cloned
+}
+
+func recountDocument(document *DocumentProject) {
+	document.PageCount = len(document.Pages)
+	document.PreparedPages = 0
+	document.ProcessedPages = 0
+	document.FailedPages = 0
+	document.PendingDisputes = 0
+	for pageIndex := range document.Pages {
+		page := &document.Pages[pageIndex]
+		page.PageNumber = pageIndex + 1
+		if page.ImageReady {
+			document.PreparedPages++
+		}
+		if page.Status == PageCompleted {
+			document.ProcessedPages++
+		}
+		if page.Status == PageFailed {
+			document.FailedPages++
+		}
+		document.PendingDisputes += page.PendingDisputes
+	}
 }
 
 func (s *Store) activeAdminsLocked() int {
