@@ -24,7 +24,7 @@ type documentAgentProgress struct {
 	Status          string    `json:"status"`
 	StartedAt       time.Time `json:"started_at"`
 	ElapsedMS       int64     `json:"elapsed_ms"`
-	FirstOutput     bool      `json:"first_output"`
+	FirstToken      bool      `json:"first_token"`
 	TTFTMS          int64     `json:"ttft_ms,omitempty"`
 	OutputChars     int       `json:"output_chars"`
 	EstimatedTokens int       `json:"estimated_tokens"`
@@ -35,6 +35,7 @@ type documentAgentProgress struct {
 	Attempt         int       `json:"attempt"`
 	MaxAttempts     int       `json:"max_attempts"`
 	LastError       string    `json:"last_error,omitempty"`
+	firstTokenAt    *time.Time
 	firstOutputAt   *time.Time
 	finishedAt      *time.Time
 	outputText      string
@@ -238,16 +239,20 @@ func (p *documentPageProgress) handle(event pipeline.Event) {
 		resetAgentAttempt(agent, now, event.Attempt, event.MaxAttempts)
 	case pipeline.EventDelta:
 		agent := p.agent(event.Stage, event.Agent, now)
+		if !agent.FirstToken {
+			firstTokenAt := now
+			agent.FirstToken = true
+			agent.firstTokenAt = &firstTokenAt
+			agent.TTFTMS = now.Sub(agent.StartedAt).Milliseconds()
+		}
 		if event.Kind == "thinking" {
 			agent.Status = "thinking"
 			agent.Thinking = appendProgressPreview(agent.Thinking, event.Text)
 		} else {
 			agent.Status = "streaming"
-			if !agent.FirstOutput {
+			if agent.firstOutputAt == nil {
 				firstOutputAt := now
-				agent.FirstOutput = true
 				agent.firstOutputAt = &firstOutputAt
-				agent.TTFTMS = now.Sub(agent.StartedAt).Milliseconds()
 			}
 			agent.OutputChars += utf8.RuneCountInString(event.Text)
 			agent.outputText += event.Text
@@ -294,7 +299,7 @@ func resetAgentAttempt(agent *documentAgentProgress, now time.Time, attempt, max
 	agent.Status = "waiting"
 	agent.StartedAt = now
 	agent.ElapsedMS = 0
-	agent.FirstOutput = false
+	agent.FirstToken = false
 	agent.TTFTMS = 0
 	agent.OutputChars = 0
 	agent.EstimatedTokens = 0
@@ -304,6 +309,7 @@ func resetAgentAttempt(agent *documentAgentProgress, now time.Time, attempt, max
 	agent.Error = ""
 	agent.Attempt = attempt
 	agent.MaxAttempts = maxAttempts
+	agent.firstTokenAt = nil
 	agent.firstOutputAt = nil
 	agent.finishedAt = nil
 	agent.outputText = ""

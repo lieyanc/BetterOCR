@@ -330,7 +330,7 @@ export interface DocumentAgentProgress {
     | "failed"
   started_at: string
   elapsed_ms: number
-  first_output: boolean
+  first_token: boolean
   ttft_ms?: number
   output_chars: number
   estimated_tokens: number

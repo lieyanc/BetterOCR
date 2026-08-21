@@ -317,10 +317,10 @@ func TestDocumentProgressStreamsWaitingOutputAndFinalStats(t *testing.T) {
 	var sawWaitingHeartbeat, sawOutputStats bool
 	for _, event := range events {
 		for _, agent := range event.Agents {
-			if !agent.FirstOutput && agent.ElapsedMS >= 900 {
+			if !agent.FirstToken && agent.ElapsedMS >= 900 {
 				sawWaitingHeartbeat = true
 			}
-			if agent.FirstOutput && agent.EstimatedTokens > 0 && agent.OutputChars > 0 && agent.TPS > 0 && strings.Contains(agent.Output, "实时输出") {
+			if agent.FirstToken && agent.EstimatedTokens > 0 && agent.OutputChars > 0 && agent.TPS > 0 && strings.Contains(agent.Output, "实时输出") {
 				sawOutputStats = true
 			}
 		}
@@ -364,7 +364,7 @@ func TestDocumentProgressResetsFailedAttemptPreviewBeforeRetry(t *testing.T) {
 	}
 	agent := progress.Agents[0]
 	if agent.Attempt != 2 || agent.MaxAttempts != 2 || agent.Output != "" ||
-		agent.OutputChars != 0 || agent.EstimatedTokens != 0 || agent.FirstOutput ||
+		agent.OutputChars != 0 || agent.EstimatedTokens != 0 || agent.FirstToken ||
 		agent.LastError != "deadline exceeded" {
 		t.Fatalf("retry progress = %+v", agent)
 	}
@@ -380,5 +380,33 @@ func TestDocumentProgressResetsFailedAttemptPreviewBeforeRetry(t *testing.T) {
 	agent = progress.Agents[0]
 	if agent.Status != "completed" || agent.Output != "成功文本" || strings.Contains(agent.Output, "失败尝试") {
 		t.Fatalf("completed retry progress = %+v", agent)
+	}
+}
+
+func TestDocumentProgressCountsThinkingAsFirstToken(t *testing.T) {
+	hub := newDocumentProgressHub()
+	tracker := hub.beginPage("doc-thinking", database.DocumentPage{ID: "page-1", PageNumber: 1}, 1)
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventAttemptStart, Stage: pipeline.StageEngine,
+		Agent: "engine-a", Attempt: 1, MaxAttempts: 1,
+	})
+	time.Sleep(2 * time.Millisecond)
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventDelta, Stage: pipeline.StageEngine,
+		Agent: "engine-a", Kind: "thinking", Text: "正在观察图片",
+	})
+
+	progress, ok := hub.current("doc-thinking")
+	if !ok || len(progress.Agents) != 1 {
+		t.Fatalf("progress = %+v, exists = %v", progress, ok)
+	}
+	agent := progress.Agents[0]
+	if !agent.FirstToken || agent.TTFTMS <= 0 || agent.Status != "thinking" ||
+		agent.Thinking != "正在观察图片" {
+		t.Fatalf("thinking progress = %+v", agent)
+	}
+	if agent.OutputChars != 0 || agent.EstimatedTokens != 0 || agent.TPS != 0 ||
+		agent.firstOutputAt != nil {
+		t.Fatalf("thinking must not count as OCR output throughput: %+v", agent)
 	}
 }

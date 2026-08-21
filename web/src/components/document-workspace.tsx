@@ -1270,10 +1270,10 @@ function DocumentLiveProgress({
     0,
   )
   const aggregateTPS = agents.reduce((sum, agent) => sum + agent.tps, 0)
-  const firstOutputs = agents.filter((agent) => agent.first_output)
-  const firstOutputMS =
-    firstOutputs.length > 0
-      ? Math.min(...firstOutputs.map((agent) => agent.ttft_ms ?? 0))
+  const firstTokens = agents.filter((agent) => agent.first_token)
+  const firstTokenMS =
+    firstTokens.length > 0
+      ? Math.min(...firstTokens.map((agent) => agent.ttft_ms ?? 0))
       : null
   const completed = progress?.completed_engines ?? 0
   const total = progress?.total_engines ?? 0
@@ -1295,11 +1295,11 @@ function DocumentLiveProgress({
             value={formatMilliseconds(progress?.elapsed_ms ?? 0)}
           />
           <LiveMetric
-            label="首字延迟"
+            label="首个 Token 延迟"
             value={
-              firstOutputMS === null
-                ? "等待首字"
-                : formatMilliseconds(firstOutputMS)
+              firstTokenMS === null
+                ? "等待首个 Token"
+                : formatMilliseconds(firstTokenMS)
             }
           />
           <LiveMetric
@@ -1368,9 +1368,9 @@ function LiveAgentProgress({ agent }: { agent: DocumentAgentProgress }) {
       </div>
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs tabular-nums text-muted-foreground">
         <span>
-          {agent.first_output
-            ? `首字 ${formatMilliseconds(agent.ttft_ms ?? 0)}`
-            : `等待首字 ${formatMilliseconds(agent.elapsed_ms)}`}
+          {agent.first_token
+            ? `首个 Token ${formatMilliseconds(agent.ttft_ms ?? 0)}`
+            : `等待首个 Token ${formatMilliseconds(agent.elapsed_ms)}`}
         </span>
         <span>估算 {agent.estimated_tokens} token</span>
         <span>
@@ -1451,7 +1451,7 @@ function progressStageText(progress: DocumentProgressEvent | null): string {
 function agentStatusText(agent: DocumentAgentProgress): string {
   switch (agent.status) {
     case "waiting":
-      return "等待首字"
+      return "等待首个 Token"
     case "thinking":
       return "思考中"
     case "streaming":
