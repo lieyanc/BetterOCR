@@ -138,6 +138,19 @@ func Load(path string) (Config, Action, error) {
 	return cfg, ActionNone, nil
 }
 
+// Save validates cfg and atomically persists it as the single configuration
+// source shared by CLI and Web mode.
+func Save(path string, cfg Config) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("配置文件路径不能为空")
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	return write(path, cfg)
+}
+
 // supplementProviderAliases 给 alias 为空(缺失或显式空)的 provider 补显示名:
 // 模板中有同 id 的 provider 就沿用模板 alias,否则回退 id 本身。
 // 返回是否有补全动作,供 Load 决定写回。
@@ -264,16 +277,38 @@ func fieldKeys() []string {
 	return keys
 }
 
-// write 落盘为缩进 JSON;配置内含 api_key,权限收紧到仅本用户可读写。
+// write 原子落盘为缩进 JSON;配置内含 api_key,权限收紧到仅本用户可读写。
 func write(path string, cfg Config) error {
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, append(out, '\n'), 0o600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".betterocr-config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(out, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o600)

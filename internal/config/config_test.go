@@ -205,6 +205,30 @@ func TestWriteTightensExistingFilePermissions(t *testing.T) {
 	}
 }
 
+func TestSaveRejectsInvalidConfigWithoutReplacingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := Default()
+	if err := Save(path, original); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := original
+	invalid.Engines = []string{"missing/model"}
+	if err := Save(path, invalid); err == nil {
+		t.Fatal("invalid configuration was saved")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("invalid save replaced the existing configuration")
+	}
+}
+
 func TestValidateAndResolve(t *testing.T) {
 	cfg := Config{
 		Providers: []model.Provider{localProvider("http://local/v1", "key")},

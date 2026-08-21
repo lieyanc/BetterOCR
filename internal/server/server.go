@@ -29,11 +29,13 @@ const maxImageBytes = 32 << 20
 type Server struct {
 	// Config contains the server-side provider catalog and credentials.
 	Config config.Config
+	// ConfigPath is the single configuration file edited by the admin API.
+	ConfigPath string
 	// Timeout 是单次识别的端到端超时,零值取 2 分钟。
 	Timeout time.Duration
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
-	// Store enables login, authorization, editable settings and task history.
+	// Store enables login, authorization and task history.
 	// A nil store keeps the handler useful for isolated package tests.
 	Store *database.Store
 	// DocumentRoot overrides the default directory beside database.json.
@@ -41,6 +43,7 @@ type Server struct {
 	// PDFRenderer is injectable for tests. Production uses embedded PDFium WASM.
 	PDFRenderer documents.PageRenderer
 
+	configMu        sync.RWMutex
 	documentOnce    sync.Once
 	documentManager *documentManager
 	documentInitErr error
@@ -93,20 +96,22 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) timeout() time.Duration {
-	if s.Store != nil {
-		return s.Store.Settings().Timeout()
-	}
 	if s.Timeout > 0 {
 		return s.Timeout
 	}
-	return 2 * time.Minute
+	return s.currentConfig().Timeout()
 }
 
 func (s *Server) currentConfig() config.Config {
-	if s.Store != nil {
-		return s.Store.Settings()
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	cloned := s.Config
+	cloned.Engines = append([]string(nil), s.Config.Engines...)
+	cloned.Providers = append([]model.Provider(nil), s.Config.Providers...)
+	for i := range cloned.Providers {
+		cloned.Providers[i].Models = append([]model.Definition(nil), s.Config.Providers[i].Models...)
 	}
-	return s.Config
+	return cloned
 }
 
 // configResponse exposes selectable metadata but never provider API keys.

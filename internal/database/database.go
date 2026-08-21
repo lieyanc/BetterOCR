@@ -20,11 +20,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
-	"github.com/lieyanc/BetterOCR/internal/config"
 )
 
 const (
 	DefaultPath     = "data/database.json"
+	databaseVersion = 2
 	passwordRounds  = 310_000
 	sessionLifetime = 7 * 24 * time.Hour
 )
@@ -141,13 +141,13 @@ type data struct {
 	Sessions    []session         `json:"sessions"`
 	Tasks       []Task            `json:"tasks"`
 	Documents   []DocumentProject `json:"documents"`
-	Settings    config.Config     `json:"settings"`
 }
 
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	data data
+	mu             sync.RWMutex
+	path           string
+	data           data
+	legacySettings json.RawMessage
 }
 
 var (
@@ -155,7 +155,7 @@ var (
 	ErrAlreadyInitialized = errors.New("系统已经初始化")
 )
 
-func Open(path string, initialSettings config.Config) (*Store, error) {
+func Open(path string) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, errors.New("JSON 数据库路径不能为空")
@@ -163,7 +163,7 @@ func Open(path string, initialSettings config.Config) (*Store, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) || err == nil && len(strings.TrimSpace(string(raw))) == 0 {
 		store := &Store{path: path, data: data{
-			Version: 1, Initialized: false, Users: []storedUser{}, Sessions: []session{}, Tasks: []Task{}, Documents: []DocumentProject{}, Settings: initialSettings,
+			Version: databaseVersion, Initialized: false, Users: []storedUser{}, Sessions: []session{}, Tasks: []Task{}, Documents: []DocumentProject{},
 		}}
 		if err := store.saveLocked(); err != nil {
 			return nil, fmt.Errorf("创建 JSON 数据库失败: %w", err)
@@ -177,13 +177,15 @@ func Open(path string, initialSettings config.Config) (*Store, error) {
 	if err := json.Unmarshal(raw, &loaded); err != nil {
 		return nil, fmt.Errorf("解析 JSON 数据库 %s 失败: %w", path, err)
 	}
-	if loaded.Version != 1 {
+	if loaded.Version != 1 && loaded.Version != databaseVersion {
 		return nil, fmt.Errorf("JSON 数据库版本 %d 不受支持", loaded.Version)
 	}
-	needsMigration := !loaded.Initialized && len(loaded.Users) > 0
-	if needsMigration {
+	needsRewrite := loaded.Version != databaseVersion
+	loaded.Version = databaseVersion
+	if !loaded.Initialized && len(loaded.Users) > 0 {
 		// Version 1 databases created before web setup did not carry this flag.
 		loaded.Initialized = true
+		needsRewrite = true
 	}
 	if loaded.Initialized {
 		activeAdmins := 0
@@ -198,19 +200,43 @@ func Open(path string, initialSettings config.Config) (*Store, error) {
 	} else if len(loaded.Users) != 0 {
 		return nil, errors.New("未初始化的 JSON 数据库不能包含用户")
 	}
-	if err := loaded.Settings.Validate(); err != nil {
-		return nil, fmt.Errorf("JSON 数据库中的设置无效: %w", err)
+	var legacy struct {
+		Settings json.RawMessage `json:"settings"`
 	}
-	store := &Store{path: path, data: loaded}
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return nil, fmt.Errorf("解析 JSON 数据库 %s 失败: %w", path, err)
+	}
+	store := &Store{path: path, data: loaded, legacySettings: append(json.RawMessage(nil), legacy.Settings...)}
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, err
 	}
-	if needsMigration {
+	// Legacy Web settings must first be migrated back to config.json by the
+	// caller. Until then, keep the old file intact so no configuration is lost.
+	if needsRewrite && len(store.legacySettings) == 0 {
 		if err := store.saveLocked(); err != nil {
 			return nil, fmt.Errorf("迁移 JSON 数据库失败: %w", err)
 		}
 	}
 	return store, nil
+}
+
+// LegacySettings returns the settings embedded by database version 1. New
+// databases never contain this field.
+func (s *Store) LegacySettings() json.RawMessage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append(json.RawMessage(nil), s.legacySettings...)
+}
+
+// DiscardLegacySettings rewrites the database without the obsolete settings
+// field after its value has been safely moved to the configuration file.
+func (s *Store) DiscardLegacySettings() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.legacySettings) == 0 {
+		return nil
+	}
+	return s.saveLocked()
 }
 
 func (s *Store) Initialized() bool {
@@ -244,30 +270,6 @@ func (s *Store) InitializeAdmin(username, password string) (User, error) {
 		return User{}, err
 	}
 	return admin.User, nil
-}
-
-func (s *Store) Settings() config.Config {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return cloneConfig(s.data.Settings)
-}
-
-func (s *Store) UpdateSettings(next config.Config) error {
-	if err := next.Validate(); err != nil {
-		return err
-	}
-	if strings.TrimSpace(next.ServeAddr) == "" {
-		return errors.New("serve_addr 不能为空")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	previous := s.data.Settings
-	s.data.Settings = cloneConfig(next)
-	if err := s.saveLocked(); err != nil {
-		s.data.Settings = previous
-		return err
-	}
-	return nil
 }
 
 func (s *Store) Login(username, password string) (User, string, string, error) {
@@ -811,13 +813,6 @@ func tokenHash(token string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-func cloneConfig(source config.Config) config.Config {
-	raw, _ := json.Marshal(source)
-	var cloned config.Config
-	_ = json.Unmarshal(raw, &cloned)
-	return cloned
-}
-
 func (s *Store) saveLocked() error {
 	out, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
@@ -851,5 +846,6 @@ func (s *Store) saveLocked() error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return err
 	}
+	s.legacySettings = nil
 	return os.Chmod(s.path, 0o600)
 }

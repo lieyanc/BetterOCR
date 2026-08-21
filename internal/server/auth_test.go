@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/database"
 )
 
 func TestAuthenticationAndRoleGuards(t *testing.T) {
 	cfg := serverConfig("http://127.0.0.1:1", "")
-	store, err := database.Open(filepath.Join(t.TempDir(), "database.json"), cfg)
+	store, err := database.Open(filepath.Join(t.TempDir(), "database.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +85,7 @@ func TestAuthenticatedOCRPersistsOwnedTask(t *testing.T) {
 	upstream, _ := fakeUpstream("recorded text")
 	defer upstream.Close()
 	cfg := serverConfig(upstream.URL, "server-key")
-	store, err := database.Open(filepath.Join(t.TempDir(), "database.json"), cfg)
+	store, err := database.Open(filepath.Join(t.TempDir(), "database.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +113,7 @@ func TestAuthenticatedOCRPersistsOwnedTask(t *testing.T) {
 
 func TestWebSetupStatusAndSingleInitialization(t *testing.T) {
 	cfg := serverConfig("http://127.0.0.1:1", "")
-	store, err := database.Open(filepath.Join(t.TempDir(), "database.json"), cfg)
+	store, err := database.Open(filepath.Join(t.TempDir(), "database.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +136,54 @@ func TestWebSetupStatusAndSingleInitialization(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("second setup status=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminSettingsPersistToSharedConfigOnly(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	databasePath := filepath.Join(root, "database.json")
+	cfg := serverConfig("http://127.0.0.1:1", "server-key")
+	cfg.ServeAddr = "127.0.0.1:8787"
+	cfg.TimeoutSeconds = 30
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	store, err := database.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Config: cfg, ConfigPath: configPath, Store: store}
+	handler := srv.Handler()
+	cookie, csrf := setupForTest(t, handler, "admin", "admin-password")
+
+	next := cfg
+	next.TimeoutSeconds = 45
+	body, err := json.Marshal(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := requestWithAuth(http.MethodPut, "/api/admin/settings", bytes.NewReader(body), cookie, csrf)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update settings status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	loaded, _, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.TimeoutSeconds != 45 || srv.currentConfig().TimeoutSeconds != 45 {
+		t.Fatalf("file timeout=%d server timeout=%d", loaded.TimeoutSeconds, srv.currentConfig().TimeoutSeconds)
+	}
+	databaseJSON, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(databaseJSON, []byte(`"settings"`)) || bytes.Contains(databaseJSON, []byte("server-key")) {
+		t.Fatalf("configuration leaked into database: %s", databaseJSON)
 	}
 }
 

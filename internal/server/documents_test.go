@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
-	"github.com/lieyanc/BetterOCR/internal/config"
 	"github.com/lieyanc/BetterOCR/internal/database"
 )
 
@@ -56,7 +55,7 @@ func TestDocumentUploadPreparationOwnershipAndPersistence(t *testing.T) {
 	defer upstream.Close()
 	cfg := serverConfig(upstream.URL, "server-key")
 	cfg.ServeAddr = "127.0.0.1:8787"
-	store, err := database.Open(filepath.Join(root, "database.json"), cfg)
+	store, err := database.Open(filepath.Join(root, "database.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +184,7 @@ func TestDocumentUploadPreparationOwnershipAndPersistence(t *testing.T) {
 		t.Fatalf("result file err=%v body=%s", err, resultJSON)
 	}
 
-	reopened, err := database.Open(filepath.Join(root, "database.json"), config.Default())
+	reopened, err := database.Open(filepath.Join(root, "database.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

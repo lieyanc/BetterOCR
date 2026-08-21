@@ -84,7 +84,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminSettings(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.Store.Settings())
+	writeJSON(w, http.StatusOK, s.currentConfig())
 }
 
 func (s *Server) handleUpdateAdminSettings(w http.ResponseWriter, r *http.Request) {
@@ -93,10 +93,21 @@ func (s *Server) handleUpdateAdminSettings(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.Store.UpdateSettings(next); err != nil {
+	if strings.TrimSpace(next.ServeAddr) == "" {
+		writeErr(w, http.StatusBadRequest, "serve_addr 不能为空")
+		return
+	}
+	if strings.TrimSpace(s.ConfigPath) == "" {
+		writeErr(w, http.StatusInternalServerError, "服务端未配置配置文件路径")
+		return
+	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	if err := config.Save(s.ConfigPath, next); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.Config = next
 	writeJSON(w, http.StatusOK, next)
 }
 

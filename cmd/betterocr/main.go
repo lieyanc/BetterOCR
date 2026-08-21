@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -27,7 +28,7 @@ import (
 func main() {
 	var (
 		configPath   = flag.String("config", config.DefaultPath, "JSON 配置文件路径;不存在时自动释放内置模板,缺字段时按模板补全写回")
-		databasePath = flag.String("db", database.DefaultPath, "Web 模式的 JSON 数据库路径(用户、会话、任务与可编辑设置)")
+		databasePath = flag.String("db", database.DefaultPath, "Web 模式的 JSON 数据库路径(用户、会话、任务与文档元数据)")
 		serveMode    = flag.Bool("serve", false, "以 Web 模式启动,监听配置中的 serve_addr;不带图片参数时也是 Web 模式,此旗标可省略")
 		pretty       = flag.Bool("pretty", false, "美化 JSON 输出(CLI 模式)")
 	)
@@ -67,7 +68,7 @@ func main() {
 
 	// 默认 Web 模式:不带任何位置参数时进入 Web 模式,-serve 显式声明效果相同
 	if *serveMode || flag.NArg() == 0 {
-		runServe(cfg, *databasePath)
+		runServe(cfg, *configPath, *databasePath)
 		return
 	}
 	image, err := os.ReadFile(flag.Arg(0))
@@ -118,8 +119,8 @@ func main() {
 	}
 }
 
-// runServe 启动 Web 模式:内嵌前端 + /api 接口,配置文件的值作为页面默认值。
-func runServe(cfg config.Config, databasePath string) {
+// runServe 启动 Web 模式。CLI 与 Web 始终共享同一个配置文件。
+func runServe(cfg config.Config, configPath, databasePath string) {
 	if databasePath == database.DefaultPath {
 		if moved, err := migrateLegacyFile("betterocr.db.json", database.DefaultPath); err != nil {
 			fatal("迁移旧 JSON 数据库失败:", err)
@@ -127,24 +128,51 @@ func runServe(cfg config.Config, databasePath string) {
 			fmt.Fprintf(os.Stderr, "已迁移旧 JSON 数据库到 %s\n", database.DefaultPath)
 		}
 	}
-	store, err := database.Open(databasePath, cfg)
+	store, err := database.Open(databasePath)
 	if err != nil {
 		fatal("打开 JSON 数据库失败:", err)
 	}
-	cfg = store.Settings()
+	cfg, migrated, err := migrateLegacyWebSettings(store, configPath, cfg)
+	if err != nil {
+		fatal("迁移旧 Web 配置失败:", err)
+	}
+	if migrated {
+		fmt.Fprintf(os.Stderr, "已将旧 Web 配置迁移到 %s，并从数据库移除 settings\n", configPath)
+	}
 	if cfg.ServeAddr == "" {
 		fatal("配置错误:", "serve_addr 为空,Web 模式无监听地址")
 	}
 	srv := &server.Server{
-		Config:  cfg,
-		Timeout: cfg.Timeout(),
-		Store:   store,
+		Config:     cfg,
+		ConfigPath: configPath,
+		Store:      store,
 	}
 	fmt.Fprintf(os.Stderr, "BetterOCR Web 模式已启动: http://%s\n", displayAddr(cfg.ServeAddr))
 	hs := &http.Server{Addr: cfg.ServeAddr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	if err := hs.ListenAndServe(); err != nil {
 		fatal("HTTP 服务失败:", err)
 	}
+}
+
+func migrateLegacyWebSettings(store *database.Store, configPath string, current config.Config) (config.Config, bool, error) {
+	raw := store.LegacySettings()
+	if len(raw) == 0 {
+		return current, false, nil
+	}
+	var legacy config.Config
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return current, false, err
+	}
+	if strings.TrimSpace(legacy.ServeAddr) == "" {
+		return current, false, errors.New("serve_addr 为空")
+	}
+	if err := config.Save(configPath, legacy); err != nil {
+		return current, false, err
+	}
+	if err := store.DiscardLegacySettings(); err != nil {
+		return current, false, err
+	}
+	return legacy, true, nil
 }
 
 func migrateLegacyFile(legacyPath, targetPath string) (bool, error) {

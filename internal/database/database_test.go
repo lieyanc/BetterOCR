@@ -1,6 +1,8 @@
 package database
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,12 +12,11 @@ import (
 	"time"
 
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
-	"github.com/lieyanc/BetterOCR/internal/config"
 )
 
 func TestStoreLifecycleAndPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database.json")
-	store, err := Open(path, config.Default())
+	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,19 +87,13 @@ func TestStoreLifecycleAndPermissions(t *testing.T) {
 	if tasks := store.Tasks(admin.ID, true); len(tasks) != 1 {
 		t.Fatalf("all tasks = %+v", tasks)
 	}
-	invalidSettings := store.Settings()
-	invalidSettings.ServeAddr = ""
-	if err := store.UpdateSettings(invalidSettings); err == nil {
-		t.Fatal("empty serve_addr was accepted")
-	}
-
 	if err := store.Logout(token); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok := store.Authenticate(token); ok {
 		t.Fatal("logged-out session still authenticates")
 	}
-	reopened, err := Open(path, config.Default())
+	reopened, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +103,7 @@ func TestStoreLifecycleAndPermissions(t *testing.T) {
 }
 
 func TestInitializeAdminAllowsOneConcurrentWinner(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "database.json"), config.Default())
+	store, err := Open(filepath.Join(t.TempDir(), "database.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +138,7 @@ func TestInitializeAdminAllowsOneConcurrentWinner(t *testing.T) {
 
 func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database.json")
-	store, err := Open(path, config.Default())
+	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +165,7 @@ func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := Open(path, config.Default())
+	reopened, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,5 +179,58 @@ func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
 	recovered, ok := reopened.Document(processing.ID)
 	if !ok || recovered.Status != DocumentReady || recovered.Pages[0].Status != PageCompleted || recovered.Pages[1].Status != PageQueued {
 		t.Fatalf("recovered = %+v ok=%v", recovered, ok)
+	}
+}
+
+func TestDatabaseNeverPersistsSettingsAndRemovesLegacyCopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"settings"`)) {
+		t.Fatalf("new database contains settings: %s", raw)
+	}
+
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy["version"] = json.RawMessage("1")
+	legacy["settings"] = json.RawMessage(`{"serve_addr":"127.0.0.1:8787"}`)
+	raw, err = json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.LegacySettings()) == 0 {
+		t.Fatal("legacy settings were not exposed for config migration")
+	}
+	if err := store.DiscardLegacySettings(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"settings"`)) {
+		t.Fatalf("legacy settings remain in database: %s", raw)
+	}
+	var migrated struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &migrated); err != nil || migrated.Version != databaseVersion {
+		t.Fatalf("migrated database version=%d err=%v", migrated.Version, err)
 	}
 }
