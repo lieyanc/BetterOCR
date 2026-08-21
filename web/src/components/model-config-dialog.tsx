@@ -34,6 +34,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 
 const noArbiter = "__none__"
 
@@ -83,12 +88,22 @@ export function ModelConfigDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogTrigger asChild>
-        <Button variant="outline" size="sm" disabled={!config}>
-          <Settings2 data-icon="inline-start" />
-          模型配置
-        </Button>
-      </DialogTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DialogTrigger asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!config}
+              aria-label="模型配置"
+            >
+              <Settings2 data-icon="inline-start" />
+              <span className="hidden sm:inline">模型配置</span>
+            </Button>
+          </DialogTrigger>
+        </TooltipTrigger>
+        <TooltipContent>模型配置</TooltipContent>
+      </Tooltip>
       <DialogContent className="flex max-h-[calc(100vh-2rem)] flex-col sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>模型配置</DialogTitle>
@@ -112,9 +127,15 @@ export function ModelConfigDialog({
                   </Badge>
                   <span
                     className="min-w-0 basis-full truncate text-left text-xs text-muted-foreground sm:flex-1 sm:basis-auto sm:text-right"
-                    title={provider.id === provider.alias ? provider.base_url : `${provider.id} · ${provider.base_url}`}
+                    title={
+                      provider.id === provider.alias
+                        ? provider.base_url
+                        : `${provider.id} · ${provider.base_url}`
+                    }
                   >
-                    {provider.id === provider.alias ? provider.base_url : `${provider.id} · ${provider.base_url}`}
+                    {provider.id === provider.alias
+                      ? provider.base_url
+                      : `${provider.id} · ${provider.base_url}`}
                   </span>
                 </div>
                 <FieldGroup data-slot="checkbox-group" className="gap-2">

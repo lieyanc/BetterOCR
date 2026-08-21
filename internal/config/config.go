@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -17,9 +18,9 @@ import (
 )
 
 // DefaultPath 是默认的配置文件路径(相对当前工作目录)。
-const DefaultPath = "betterocr.json"
+const DefaultPath = "data/config.json"
 
-// Config is the complete betterocr.json structure.
+// Config is the complete data/config.json structure.
 type Config struct {
 	// Providers contains model catalogs and server-side credentials.
 	Providers []model.Provider `json:"providers"`
@@ -267,6 +268,9 @@ func fieldKeys() []string {
 func write(path string, cfg Config) error {
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	if err := os.WriteFile(path, append(out, '\n'), 0o600); err != nil {

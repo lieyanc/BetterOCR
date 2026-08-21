@@ -42,14 +42,14 @@
 视觉模型 API。每个 Provider 独立配置 `base_url` / `api_key`,每个模型再选择
 自己的 API 类型,因此可以同时接入官方服务、兼容网关、vLLM 与 Ollama。
 
-全部运行参数来自 JSON 配置文件(默认 `./betterocr.json`,可用 `-config` 指定),
+全部运行参数来自 JSON 配置文件(默认 `./data/config.json`,可用 `-config` 指定),
 **不读取任何环境变量**。首次运行自动释放内置模板:
 
 ```bash
-go run ./cmd/betterocr invoice.png   # 首次运行:生成 betterocr.json 后退出
+go run ./cmd/betterocr invoice.png   # 首次运行:生成 data/config.json 后退出
 ```
 
-编辑生成的 `betterocr.json`(填入各 Provider 的密钥,按需调整模型):
+编辑生成的 `data/config.json`(填入各 Provider 的密钥,按需调整模型):
 
 ```json
 {
@@ -121,6 +121,22 @@ make build    # = cd web && npm install && npm run build,再 go build
 ./betterocr           # 不带图片参数即进入 Web 模式(-serve 可省略),监听配置中的 serve_addr,默认 127.0.0.1:8787
 ```
 
+首次进入 Web 模式会创建 `data/database.json` 并显示网页初始化表单。在页面中
+设置首个管理员用户名和密码后会自动登录，不再由终端生成或输出初始密码。
+可用 `-db` 指定其他 JSON 数据库路径；数据库文件以 `0600` 权限保存，并通过
+同目录临时文件原子替换。
+
+Web 界面启用基于角色的访问控制：
+
+| 角色 | 权限 |
+|------|------|
+| 管理员 | 识别图片、查看全部任务记录、创建/编辑/停用/删除用户、编辑完整系统设置 |
+| 普通用户 | 识别图片、仅查看自己的任务记录 |
+
+密码使用带随机盐的 PBKDF2-SHA256 哈希保存；登录会话使用 HttpOnly、SameSite
+Cookie，写操作额外校验 CSRF token。任务记录保存用户、文件名、模型、状态、
+耗时和识别结果，**不保存上传的原图**。
+
 浏览器打开 http://127.0.0.1:8787:拖拽 / 点击 / Ctrl+V 粘贴图片。顶部的
 「模型配置」菜单按 Provider 展示已配置模型,可点选多个基础模型和一个仲裁
 模型;识别时会分区实时显示各基础模型与仲裁模型的思考过程和主输出。思考内容
@@ -129,6 +145,10 @@ make build    # = cd web && npm install && npm run build,再 go build
 单独发起/重新发起仲裁,处理结果会立即反馈到合并文本。
 
 - Web 模式下 `engines` / `arbiter` 是页面默认选择;浏览器会在本机记住点选结果。
+- `data/config.json` 只用于首次创建数据库时初始化 Web 设置；之后管理员在页面中
+  保存的设置位于 JSON 数据库，并在下次启动时继续生效。`serve_addr` 修改后需重启。
+- 使用默认路径启动旧版本目录时，如果新文件尚不存在，根目录的
+  `betterocr.json` / `betterocr.db.json` 会自动迁移到 `data/`。
 - 三种模型 API 默认都发送 `stream: true`;兼容端点若忽略该参数并返回普通 JSON,
   仍可正常解析。`POST /api/ocr/stream` 以 NDJSON 输出带 `kind: thinking|output`
   的 `delta` 与最终 `result` 事件,
@@ -193,11 +213,12 @@ make build    # = cd web && npm install && npm run build,再 go build
 
 ## 配置与参数
 
-命令行只保留三个开关,识别参数全部在 JSON 配置文件里:
+命令行保留四个开关,识别参数全部在 JSON 配置文件或 Web JSON 数据库里:
 
 | 命令行参数 | 说明                                                           |
 |------------|----------------------------------------------------------------|
-| `-config`  | 配置文件路径,默认 `betterocr.json`;不存在时自动释放内置模板  |
+| `-config`  | 配置文件路径,默认 `data/config.json`;不存在时自动释放内置模板 |
+| `-db`      | Web JSON 数据库路径,默认 `data/database.json`                 |
 | `-serve`   | 以 Web 模式启动,监听配置中的 `serve_addr`;不带图片参数时默认即 Web 模式,可省略 |
 | `-pretty`  | 美化 JSON 输出(CLI 模式)                                     |
 

@@ -23,7 +23,7 @@ func localProvider(baseURL, apiKey string) model.Provider {
 }
 
 func TestLoadReleasesTemplateWhenMissing(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "betterocr.json")
+	path := filepath.Join(t.TempDir(), "data", "config.json")
 	cfg, action, err := Load(path)
 	if err != nil {
 		t.Fatal(err)

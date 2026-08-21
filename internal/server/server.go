@@ -15,6 +15,7 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/agents"
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
 	"github.com/lieyanc/BetterOCR/internal/config"
+	"github.com/lieyanc/BetterOCR/internal/database"
 	"github.com/lieyanc/BetterOCR/internal/model"
 	"github.com/lieyanc/BetterOCR/internal/pipeline"
 	"github.com/lieyanc/BetterOCR/web"
@@ -31,6 +32,9 @@ type Server struct {
 	Timeout time.Duration
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
+	// Store enables login, authorization, editable settings and task history.
+	// A nil store keeps the handler useful for isolated package tests.
+	Store *database.Store
 }
 
 // Handler 返回完整的 HTTP 处理器:/api/* 为接口,其余为内嵌前端。
@@ -40,10 +44,22 @@ func (s *Server) Handler() http.Handler {
 		panic(err) // embed 保证 dist 目录存在
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/config", s.handleConfig)
-	mux.HandleFunc("POST /api/ocr", s.handleOCR)
-	mux.HandleFunc("POST /api/ocr/stream", s.handleOCRStream)
-	mux.HandleFunc("POST /api/arbitrate/stream", s.handleArbitrateStream)
+	mux.HandleFunc("GET /api/setup/status", s.handleSetupStatus)
+	mux.HandleFunc("POST /api/setup", s.handleSetup)
+	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	mux.Handle("GET /api/auth/session", s.requireAuth(http.HandlerFunc(s.handleSession)))
+	mux.Handle("POST /api/auth/logout", s.requireAuth(http.HandlerFunc(s.handleLogout)))
+	mux.Handle("GET /api/config", s.requireAuth(http.HandlerFunc(s.handleConfig)))
+	mux.Handle("POST /api/ocr", s.requireAuth(http.HandlerFunc(s.handleOCR)))
+	mux.Handle("POST /api/ocr/stream", s.requireAuth(http.HandlerFunc(s.handleOCRStream)))
+	mux.Handle("POST /api/arbitrate/stream", s.requireAuth(http.HandlerFunc(s.handleArbitrateStream)))
+	mux.Handle("GET /api/tasks", s.requireAuth(http.HandlerFunc(s.handleTasks)))
+	mux.Handle("GET /api/admin/users", s.requireAdmin(http.HandlerFunc(s.handleUsers)))
+	mux.Handle("POST /api/admin/users", s.requireAdmin(http.HandlerFunc(s.handleCreateUser)))
+	mux.Handle("PUT /api/admin/users/{id}", s.requireAdmin(http.HandlerFunc(s.handleUpdateUser)))
+	mux.Handle("DELETE /api/admin/users/{id}", s.requireAdmin(http.HandlerFunc(s.handleDeleteUser)))
+	mux.Handle("GET /api/admin/settings", s.requireAdmin(http.HandlerFunc(s.handleAdminSettings)))
+	mux.Handle("PUT /api/admin/settings", s.requireAdmin(http.HandlerFunc(s.handleUpdateAdminSettings)))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "未知接口: "+r.URL.Path)
 	})
@@ -54,10 +70,20 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) timeout() time.Duration {
+	if s.Store != nil {
+		return s.Store.Settings().Timeout()
+	}
 	if s.Timeout > 0 {
 		return s.Timeout
 	}
 	return 2 * time.Minute
+}
+
+func (s *Server) currentConfig() config.Config {
+	if s.Store != nil {
+		return s.Store.Settings()
+	}
+	return s.Config
 }
 
 // configResponse exposes selectable metadata but never provider API keys.
@@ -77,12 +103,13 @@ type providerResponse struct {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
-	engines := s.Config.Engines
+	cfg := s.currentConfig()
+	engines := cfg.Engines
 	if engines == nil {
 		engines = []string{}
 	}
-	providers := make([]providerResponse, 0, len(s.Config.Providers))
-	for _, provider := range s.Config.Providers {
+	providers := make([]providerResponse, 0, len(cfg.Providers))
+	for _, provider := range cfg.Providers {
 		models := append([]model.Definition(nil), provider.Models...)
 		providers = append(providers, providerResponse{
 			ID: provider.ID, Alias: provider.DisplayName(), BaseURL: provider.BaseURL,
@@ -92,7 +119,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, configResponse{
 		Providers: providers,
 		Engines:   engines,
-		Arbiter:   s.Config.Arbiter,
+		Arbiter:   cfg.Arbiter,
 		TimeoutMS: s.timeout().Milliseconds(),
 	})
 }
@@ -105,18 +132,29 @@ func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	started := time.Now()
+	taskID, ok := s.startTask(w, r, runConfig)
+	if !ok {
+		return
+	}
+	if taskID != "" {
+		w.Header().Set("X-BetterOCR-Task-ID", taskID)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
 	defer cancel()
 	final, err := pipeline.Run(ctx, runConfig, image)
 	if err != nil {
+		s.finishTask(taskID, nil, err.Error(), time.Since(started))
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.finishTask(taskID, &final, "", time.Since(started))
 	writeJSON(w, http.StatusOK, final)
 }
 
 type streamEvent struct {
 	Type        string               `json:"type"`
+	TaskID      string               `json:"task_id,omitempty"`
 	Stage       string               `json:"stage,omitempty"`
 	Agent       string               `json:"agent,omitempty"`
 	Kind        string               `json:"kind,omitempty"`
@@ -134,6 +172,11 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	started := time.Now()
+	taskID, ok := s.startTask(w, r, runConfig)
+	if !ok {
+		return
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -165,7 +208,7 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeEvent(streamEvent{Type: "start"})
+	writeEvent(streamEvent{Type: "start", TaskID: taskID})
 	runConfig.OnDelta = func(delta pipeline.Delta) {
 		writeEvent(streamEvent{
 			Type: "delta", Stage: delta.Stage, Agent: delta.Agent, Kind: delta.Kind, Text: delta.Text,
@@ -173,10 +216,12 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 	}
 	final, err := pipeline.Run(ctx, runConfig, image)
 	if err != nil {
+		s.finishTask(taskID, nil, err.Error(), time.Since(started))
 		writeEvent(streamEvent{Type: "error", Error: err.Error()})
 		return
 	}
-	writeEvent(streamEvent{Type: "result", Result: &final})
+	s.finishTask(taskID, &final, "", time.Since(started))
+	writeEvent(streamEvent{Type: "result", TaskID: taskID, Result: &final})
 }
 
 // handleArbitrateStream only resolves the submitted disputed segments. It does
@@ -247,6 +292,7 @@ func (s *Server) handleArbitrateStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) parseArbitrationRequest(w http.ResponseWriter, r *http.Request) ([]byte, model.Resolved, []arbiter.Dispute, bool) {
+	cfg := s.currentConfig()
 	r.Body = http.MaxBytesReader(w, r.Body, maxImageBytes)
 	if err := r.ParseMultipartForm(maxImageBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "解析仲裁表单失败: "+err.Error())
@@ -267,12 +313,12 @@ func (s *Server) parseArbitrationRequest(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, "上传内容不是可识别的图片格式: "+ct)
 		return nil, model.Resolved{}, nil, false
 	}
-	arbiterRef := formOr(r, "arbiter", s.Config.Arbiter)
+	arbiterRef := formOr(r, "arbiter", cfg.Arbiter)
 	if arbiterRef == "" {
 		writeErr(w, http.StatusBadRequest, "未选择仲裁模型")
 		return nil, model.Resolved{}, nil, false
 	}
-	resolved, err := s.Config.Resolve(arbiterRef)
+	resolved, err := cfg.Resolve(arbiterRef)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return nil, model.Resolved{}, nil, false
@@ -296,6 +342,7 @@ func (s *Server) parseArbitrationRequest(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) parseOCRRequest(w http.ResponseWriter, r *http.Request) ([]byte, pipeline.Config, bool) {
+	cfg := s.currentConfig()
 	r.Body = http.MaxBytesReader(w, r.Body, maxImageBytes)
 	if err := r.ParseMultipartForm(maxImageBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "解析上传表单失败: "+err.Error())
@@ -317,19 +364,19 @@ func (s *Server) parseOCRRequest(w http.ResponseWriter, r *http.Request) ([]byte
 		return nil, pipeline.Config{}, false
 	}
 
-	engineRefs := pipeline.SplitList(formOr(r, "engines", strings.Join(s.Config.Engines, ",")))
+	engineRefs := pipeline.SplitList(formOr(r, "engines", strings.Join(cfg.Engines, ",")))
 	if len(engineRefs) == 0 {
 		writeErr(w, http.StatusBadRequest, "未指定引擎模型(engines)")
 		return nil, pipeline.Config{}, false
 	}
-	engines, err := s.Config.ResolveMany(engineRefs)
+	engines, err := cfg.ResolveMany(engineRefs)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return nil, pipeline.Config{}, false
 	}
 	var arbiterModel *model.Resolved
-	if arbiterRef := formOr(r, "arbiter", s.Config.Arbiter); arbiterRef != "" {
-		resolved, err := s.Config.Resolve(arbiterRef)
+	if arbiterRef := formOr(r, "arbiter", cfg.Arbiter); arbiterRef != "" {
+		resolved, err := cfg.Resolve(arbiterRef)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return nil, pipeline.Config{}, false

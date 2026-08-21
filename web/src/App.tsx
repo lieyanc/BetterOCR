@@ -7,6 +7,7 @@ import {
   ImagePlus,
   Layers3,
   Loader2,
+  LogOut,
   Moon,
   ScanText,
   Sun,
@@ -15,7 +16,11 @@ import {
 
 import {
   fetchConfig,
+  fetchSession,
+  fetchSetupStatus,
+  logout,
   runOCR,
+  type AuthSession,
   type Final,
   type OCRDelta,
   type ServerConfig,
@@ -28,6 +33,10 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Field, FieldLabel } from "@/components/ui/field"
 import { ModelConfigDialog } from "@/components/model-config-dialog"
 import { ResultWorkbench } from "@/components/result-workbench"
+import { AdminDialog } from "@/components/admin-dialog"
+import { LoginPage } from "@/components/login-page"
+import { SetupPage } from "@/components/setup-page"
+import { TaskHistoryDialog } from "@/components/task-history-dialog"
 import {
   Card,
   CardAction,
@@ -51,6 +60,93 @@ interface LiveOutput {
 }
 
 export default function App() {
+  const [session, setSession] = useState<AuthSession | null>(null)
+  const [checkingSession, setCheckingSession] = useState(true)
+  const [setupRequired, setSetupRequired] = useState(false)
+  const [startupError, setStartupError] = useState("")
+
+  useEffect(() => {
+    const unauthorized = () => setSession(null)
+    window.addEventListener("betterocr:unauthorized", unauthorized)
+    const start = async () => {
+      try {
+        const status = await fetchSetupStatus()
+        setSetupRequired(!status.initialized)
+        if (status.initialized) {
+          try {
+            setSession(await fetchSession())
+          } catch {
+            setSession(null)
+          }
+        }
+      } catch (cause) {
+        setStartupError(
+          cause instanceof Error ? cause.message : "连接 BetterOCR 失败",
+        )
+      } finally {
+        setCheckingSession(false)
+      }
+    }
+    void start()
+    return () =>
+      window.removeEventListener("betterocr:unauthorized", unauthorized)
+  }, [])
+
+  if (checkingSession) {
+    return (
+      <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
+        <Loader2 className="me-2 size-4 animate-spin" />
+        正在连接 BetterOCR
+      </div>
+    )
+  }
+
+  if (startupError) {
+    return (
+      <div className="flex min-h-screen items-center justify-center p-4">
+        <Alert variant="destructive" className="max-w-md">
+          <AlertCircle />
+          <AlertTitle>无法启动应用</AlertTitle>
+          <AlertDescription>{startupError}</AlertDescription>
+        </Alert>
+      </div>
+    )
+  }
+
+  if (setupRequired) {
+    return (
+      <SetupPage
+        onInitialized={(nextSession) => {
+          setSetupRequired(false)
+          setSession(nextSession)
+        }}
+      />
+    )
+  }
+
+  if (!session) return <LoginPage onLogin={setSession} />
+
+  return (
+    <OCRWorkspace
+      session={session}
+      onLogout={async () => {
+        try {
+          await logout()
+        } finally {
+          setSession(null)
+        }
+      }}
+    />
+  )
+}
+
+function OCRWorkspace({
+  session,
+  onLogout,
+}: {
+  session: AuthSession
+  onLogout: () => Promise<void>
+}) {
   // —— 主题 ——
   const [dark, setDark] = useState(() =>
     document.documentElement.classList.contains("dark"),
@@ -76,7 +172,7 @@ export default function App() {
   const [arbiter, setArbiter] = useState("")
   const [autoArbitrate, setAutoArbitrate] = useState(true)
 
-  useEffect(() => {
+  const loadConfig = useCallback(() => {
     fetchConfig()
       .then((c) => {
         const validRefs = new Set(
@@ -117,6 +213,12 @@ export default function App() {
         setError(cause instanceof Error ? cause.message : "加载模型配置失败")
       })
   }, [])
+
+  useEffect(() => {
+    void loadConfig()
+  }, [loadConfig])
+
+  useEffect(() => () => abortRef.current?.abort(), [])
 
   const modelIndex = useMemo(() => {
     const index = new Map<string, { alias: string; provider: string }>()
@@ -266,12 +368,22 @@ export default function App() {
             </span>
           </div>
           <div className="ms-auto flex items-center gap-1.5">
+            <TaskHistoryDialog user={session.user} />
+            {session.user.role === "admin" && (
+              <AdminDialog
+                currentUser={session.user}
+                onSettingsChanged={() => void loadConfig()}
+              />
+            )}
             <ModelConfigDialog
               config={cfg}
               engines={engines}
               arbiter={arbiter}
               onApply={applyModelSelection}
             />
+            <Badge variant="outline" className="hidden md:inline-flex">
+              {session.user.username}
+            </Badge>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -286,6 +398,19 @@ export default function App() {
               <TooltipContent>
                 {dark ? "切换到浅色" : "切换到深色"}
               </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => void onLogout()}
+                  aria-label="退出登录"
+                >
+                  <LogOut />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>退出登录</TooltipContent>
             </Tooltip>
           </div>
         </div>
@@ -522,7 +647,10 @@ function LiveOutputCard({ output }: { output: LiveOutput }) {
   return (
     <Card className="gap-3 py-4">
       <CardHeader className="px-4">
-        <CardTitle className="truncate text-sm font-medium" title={output.agent}>
+        <CardTitle
+          className="truncate text-sm font-medium"
+          title={output.agent}
+        >
           {output.agent}
         </CardTitle>
         <CardAction className="flex items-center gap-1.5">
@@ -551,7 +679,9 @@ function LiveOutputCard({ output }: { output: LiveOutput }) {
           </pre>
         </section>
         <section className="grid gap-1.5">
-          <div className="text-xs font-medium text-muted-foreground">主输出</div>
+          <div className="text-xs font-medium text-muted-foreground">
+            主输出
+          </div>
           <pre
             ref={answerRef}
             className="h-32 overflow-auto whitespace-pre-wrap break-words rounded-md border p-3 font-sans text-sm leading-6"
