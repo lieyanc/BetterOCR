@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -99,8 +100,10 @@ func serverConfig(baseURL, apiKey string) config.Config {
 				{ID: "big", Context: 128000, Alias: "Big", API: model.APIOpenAIChatCompletions},
 			},
 		}},
-		Engines: []string{"test/tiny-a", "test/tiny-b"},
-		Arbiter: "test/big",
+		Engines:              []string{"test/tiny-a", "test/tiny-b"},
+		Arbiter:              "test/big",
+		EngineTimeoutSeconds: 120, ArbiterTimeoutSeconds: 120,
+		EngineMaxAttempts: 2, ArbiterMaxAttempts: 2,
 	}
 }
 
@@ -193,6 +196,12 @@ func TestOCRStreamEmitsDeltasThenResult(t *testing.T) {
 	thinkingByAgent := make(map[string]string)
 	outputByAgent := make(map[string]string)
 	for _, event := range events[1 : len(events)-1] {
+		if event.Type == pipeline.EventAttemptStart {
+			if event.Attempt != 1 || event.MaxAttempts != 2 {
+				t.Errorf("unexpected attempt event: %+v", event)
+			}
+			continue
+		}
 		if event.Type != "delta" || event.Stage != pipeline.StageEngine || event.Agent == "" {
 			t.Errorf("unexpected progress event: %+v", event)
 		}
@@ -275,6 +284,73 @@ func TestManualArbitrationStream(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt missing %q: %s", want, prompt)
 		}
+	}
+}
+
+func TestManualArbitrationRetriesOnlyArbiter(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		attempt := calls
+		mu.Unlock()
+		if attempt == 1 {
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": "#0 正确句。"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	cfg := serverConfig(upstream.URL, "server-key")
+	cfg.ArbiterMaxAttempts = 2
+	disputes, _ := json.Marshal([]arbiter.Dispute{{
+		Segment:    0,
+		Candidates: []arbiter.Candidate{{Agent: "a", Text: "正确句。"}, {Agent: "b", Text: "正确信。"}},
+	}})
+	body, contentType := multipartBody(t, testPNG(t), map[string]string{
+		"arbiter": "test/big", "disputes": string(disputes),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/arbitrate/stream", body)
+	req.Header.Set("Content-Type", contentType)
+	recorder := httptest.NewRecorder()
+	(&Server{
+		Config: cfg, ArbiterTimeout: 40 * time.Millisecond,
+	}).Handler().ServeHTTP(recorder, req)
+	close(release)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", recorder.Code, recorder.Body)
+	}
+	var attempts []int
+	var result *streamEvent
+	for _, line := range strings.Split(strings.TrimSpace(recorder.Body.String()), "\n") {
+		var event streamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == pipeline.EventAttemptStart {
+			attempts = append(attempts, event.Attempt)
+		}
+		if event.Type == "result" {
+			copied := event
+			result = &copied
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 || !reflect.DeepEqual(attempts, []int{1, 2}) {
+		t.Fatalf("calls = %d attempts = %v stream = %s", calls, attempts, recorder.Body)
+	}
+	if result == nil || len(result.Resolutions) != 1 || result.Resolutions[0].Text != "正确句。" {
+		t.Fatalf("result = %+v", result)
 	}
 }
 
@@ -367,6 +443,12 @@ func TestConfigEndpoint(t *testing.T) {
 	}
 	if cfg.TimeoutMS != (45 * time.Second).Milliseconds() {
 		t.Errorf("timeout_ms = %d, want 45s", cfg.TimeoutMS)
+	}
+	if cfg.EngineTimeoutMS != (45*time.Second).Milliseconds() || cfg.ArbiterTimeoutMS != (45*time.Second).Milliseconds() {
+		t.Errorf("stage timeouts = (%d, %d), want 45s", cfg.EngineTimeoutMS, cfg.ArbiterTimeoutMS)
+	}
+	if cfg.EngineAttempts != 2 || cfg.ArbiterAttempts != 2 {
+		t.Errorf("stage attempts = (%d, %d), want (2, 2)", cfg.EngineAttempts, cfg.ArbiterAttempts)
 	}
 }
 

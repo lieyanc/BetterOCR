@@ -10,11 +10,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lieyanc/BetterOCR/internal/arbiter"
 	"github.com/lieyanc/BetterOCR/internal/database"
+	"github.com/lieyanc/BetterOCR/internal/pipeline"
 )
 
 type fakePageRenderer struct {
@@ -224,4 +226,159 @@ func waitForDocumentStatus(
 	}
 	t.Fatalf("document did not reach %s", want)
 	return database.DocumentProject{}
+}
+
+func TestDocumentProgressStreamsWaitingOutputAndFinalStats(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || !request.Stream {
+			http.Error(w, "expected streaming request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		controller := http.NewResponseController(w)
+		_ = controller.Flush()
+		time.Sleep(1100 * time.Millisecond)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"实时输出。\"}}]}\n\n"))
+		_ = controller.Flush()
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	root := t.TempDir()
+	store, err := database.Open(filepath.Join(root, "database.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InitializeAdmin("owner", "owner-password"); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Config: serverConfig(upstream.URL, "server-key"), Store: store,
+		DocumentRoot: filepath.Join(root, "documents"),
+	}
+	handler := srv.Handler()
+	cookie, csrf := loginForTest(t, handler, "owner", "owner-password")
+
+	upload := requestWithAuth(
+		http.MethodPost,
+		"/api/documents?filename=page.png&engines=test%2Ftiny-a%2Ctest%2Ftiny-b&arbiter=&auto_arbitrate=false",
+		bytes.NewReader(testPNG(t)), cookie, csrf,
+	)
+	upload.Header.Set("Content-Type", "image/png")
+	uploadRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(uploadRecorder, upload)
+	if uploadRecorder.Code != http.StatusCreated {
+		t.Fatalf("upload status=%d body=%s", uploadRecorder.Code, uploadRecorder.Body.String())
+	}
+	var document database.DocumentProject
+	if err := json.Unmarshal(uploadRecorder.Body.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	document = waitForDocumentStatus(t, handler, document.ID, cookie, database.DocumentReady)
+
+	runBody, _ := json.Marshal(map[string]any{
+		"engines": []string{"test/tiny-a", "test/tiny-b"}, "arbiter": "", "auto_arbitrate": false,
+	})
+	runRequest := requestWithAuth(
+		http.MethodPost, "/api/documents/"+document.ID+"/run",
+		bytes.NewReader(runBody), cookie, csrf,
+	)
+	runRequest.Header.Set("Content-Type", "application/json")
+	runRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(runRecorder, runRequest)
+	if runRecorder.Code != http.StatusAccepted {
+		t.Fatalf("run status=%d body=%s", runRecorder.Code, runRecorder.Body.String())
+	}
+
+	progressRequest := requestWithAuth(
+		http.MethodGet, "/api/documents/"+document.ID+"/events", nil, cookie, "",
+	)
+	progressRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(progressRecorder, progressRequest)
+	if progressRecorder.Code != http.StatusOK {
+		t.Fatalf("progress status=%d body=%s", progressRecorder.Code, progressRecorder.Body.String())
+	}
+	if contentType := progressRecorder.Header().Get("Content-Type"); !strings.Contains(contentType, "application/x-ndjson") {
+		t.Fatalf("progress content type = %q", contentType)
+	}
+
+	var events []documentProgressEvent
+	for _, line := range strings.Split(strings.TrimSpace(progressRecorder.Body.String()), "\n") {
+		var event documentProgressEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("invalid progress event %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	var sawWaitingHeartbeat, sawOutputStats bool
+	for _, event := range events {
+		for _, agent := range event.Agents {
+			if !agent.FirstOutput && agent.ElapsedMS >= 900 {
+				sawWaitingHeartbeat = true
+			}
+			if agent.FirstOutput && agent.EstimatedTokens > 0 && agent.OutputChars > 0 && agent.TPS > 0 && strings.Contains(agent.Output, "实时输出") {
+				sawOutputStats = true
+			}
+		}
+	}
+	if !sawWaitingHeartbeat || !sawOutputStats {
+		t.Fatalf("waiting=%v output=%v events=%+v", sawWaitingHeartbeat, sawOutputStats, events)
+	}
+	last := events[len(events)-1]
+	if last.DocumentStatus != database.DocumentCompleted || last.CompletedEngines != 2 {
+		t.Fatalf("last progress = %+v", last)
+	}
+}
+
+func TestDocumentProgressResetsFailedAttemptPreviewBeforeRetry(t *testing.T) {
+	hub := newDocumentProgressHub()
+	tracker := hub.beginPage("doc-1", database.DocumentPage{ID: "page-1", PageNumber: 1}, 1)
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventAgentStart, Stage: pipeline.StageEngine,
+		Agent: "engine-a", MaxAttempts: 2,
+	})
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventAttemptStart, Stage: pipeline.StageEngine,
+		Agent: "engine-a", Attempt: 1, MaxAttempts: 2,
+	})
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventDelta, Stage: pipeline.StageEngine,
+		Agent: "engine-a", Kind: "output", Text: "失败尝试的文本",
+	})
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventAttemptFailed, Stage: pipeline.StageEngine,
+		Agent: "engine-a", Attempt: 1, MaxAttempts: 2, Error: "deadline exceeded",
+	})
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventAttemptStart, Stage: pipeline.StageEngine,
+		Agent: "engine-a", Attempt: 2, MaxAttempts: 2,
+	})
+
+	progress, ok := hub.current("doc-1")
+	if !ok || len(progress.Agents) != 1 {
+		t.Fatalf("progress = %+v, exists = %v", progress, ok)
+	}
+	agent := progress.Agents[0]
+	if agent.Attempt != 2 || agent.MaxAttempts != 2 || agent.Output != "" ||
+		agent.OutputChars != 0 || agent.EstimatedTokens != 0 || agent.FirstOutput ||
+		agent.LastError != "deadline exceeded" {
+		t.Fatalf("retry progress = %+v", agent)
+	}
+
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventDelta, Stage: pipeline.StageEngine,
+		Agent: "engine-a", Kind: "output", Text: "成功文本",
+	})
+	tracker.handle(pipeline.Event{
+		Type: pipeline.EventAgentDone, Stage: pipeline.StageEngine, Agent: "engine-a",
+	})
+	progress, _ = hub.current("doc-1")
+	agent = progress.Agents[0]
+	if agent.Status != "completed" || agent.Output != "成功文本" || strings.Contains(agent.Output, "失败尝试") {
+		t.Fatalf("completed retry progress = %+v", agent)
+	}
 }

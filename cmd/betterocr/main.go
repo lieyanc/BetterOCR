@@ -79,8 +79,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "警告: 配置中 arbiter 为空,争议句段将使用本地候选;Web 模式下仍可人工合并")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout())
-	defer cancel()
 	engines, err := cfg.ResolveMany(cfg.Engines)
 	if err != nil {
 		fatal("配置错误:", err)
@@ -94,9 +92,13 @@ func main() {
 		arbiterModel = &resolved
 	}
 
-	final, err := pipeline.Run(ctx, pipeline.Config{
-		Engines: engines,
-		Arbiter: arbiterModel,
+	final, err := pipeline.Run(context.Background(), pipeline.Config{
+		Engines:            engines,
+		Arbiter:            arbiterModel,
+		EngineTimeout:      cfg.EngineTimeout(),
+		ArbiterTimeout:     cfg.ArbiterTimeout(),
+		EngineMaxAttempts:  cfg.EngineAttempts(),
+		ArbiterMaxAttempts: cfg.ArbiterAttempts(),
 	}, image)
 	if err != nil {
 		fatal("识别失败:", err)
@@ -167,6 +169,10 @@ func migrateLegacyWebSettings(store *database.Store, configPath string, current 
 		return current, false, errors.New("serve_addr 为空")
 	}
 	if err := config.Save(configPath, legacy); err != nil {
+		return current, false, err
+	}
+	legacy, _, err := config.Load(configPath)
+	if err != nil {
 		return current, false, err
 	}
 	if err := store.DiscardLegacySettings(); err != nil {

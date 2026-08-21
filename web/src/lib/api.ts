@@ -45,7 +45,9 @@ export interface Final {
 }
 
 export type ModelAPI =
-  "openai-chat-completions" | "openai-responses" | "anthropic-messages"
+  | "openai-chat-completions"
+  | "openai-responses"
+  | "anthropic-messages"
 
 export interface ProviderModel {
   id: string
@@ -67,6 +69,10 @@ export interface ServerConfig {
   engines: string[]
   arbiter: string
   timeout_ms: number
+  engine_timeout_ms: number
+  arbiter_timeout_ms: number
+  engine_max_attempts: number
+  arbiter_max_attempts: number
 }
 
 export type UserRole = "admin" | "user"
@@ -108,7 +114,10 @@ export interface AdminSettings {
   providers: SettingsProvider[]
   engines: string[]
   arbiter: string
-  timeout_seconds: number
+  engine_timeout_seconds: number
+  arbiter_timeout_seconds: number
+  engine_max_attempts: number
+  arbiter_max_attempts: number
   serve_addr: string
 }
 
@@ -300,16 +309,98 @@ export interface DocumentRunSettings {
   autoArbitrate: boolean
 }
 
+export type DocumentProgressStage =
+  | "queued"
+  | "loading"
+  | "engine"
+  | "merge"
+  | "arbiter"
+  | "saving"
+  | "complete"
+
+export interface DocumentAgentProgress {
+  agent: string
+  stage: "engine" | "arbiter"
+  status:
+    | "waiting"
+    | "thinking"
+    | "streaming"
+    | "retrying"
+    | "completed"
+    | "failed"
+  started_at: string
+  elapsed_ms: number
+  first_output: boolean
+  ttft_ms?: number
+  output_chars: number
+  estimated_tokens: number
+  tps: number
+  thinking?: string
+  output?: string
+  error?: string
+  attempt: number
+  max_attempts: number
+  last_error?: string
+}
+
+export interface DocumentProgressEvent {
+  type: "progress"
+  sequence: number
+  document_id: string
+  document_status: DocumentStatus
+  page_id?: string
+  page_number?: number
+  stage: DocumentProgressStage
+  status: "running" | DocumentStatus | DocumentPageStatus
+  started_at?: string
+  elapsed_ms: number
+  completed_engines: number
+  total_engines: number
+  agents: DocumentAgentProgress[]
+  error?: string
+}
+
 export async function fetchDocuments(): Promise<DocumentProjectRecord[]> {
   const res = await apiFetch("/api/documents")
   await assertOK(res, "获取文档项目")
   return res.json() as Promise<DocumentProjectRecord[]>
 }
 
-export async function fetchDocument(id: string): Promise<DocumentProjectRecord> {
+export async function fetchDocument(
+  id: string,
+): Promise<DocumentProjectRecord> {
   const res = await apiFetch(`/api/documents/${encodeURIComponent(id)}`)
   await assertOK(res, "获取文档项目")
   return res.json() as Promise<DocumentProjectRecord>
+}
+
+export async function streamDocumentProgress(
+  id: string,
+  onProgress: (progress: DocumentProgressEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/documents/${encodeURIComponent(id)}/events`,
+    { signal },
+  )
+  await assertOK(res, "订阅文档识别进度")
+  if (!res.body) throw new Error("浏览器未提供流式响应体")
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const consume = (line: string) => {
+    if (line.trim()) onProgress(JSON.parse(line) as DocumentProgressEvent)
+  }
+  while (true) {
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value, { stream: !done })
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    for (const line of lines) consume(line)
+    if (done) break
+  }
+  consume(buffer)
 }
 
 export function uploadDocument(
@@ -331,10 +422,16 @@ export function uploadDocument(
     const xhr = new XMLHttpRequest()
     xhr.open("POST", `/api/documents?${params}`)
     xhr.responseType = "json"
-    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream")
+    xhr.setRequestHeader(
+      "Content-Type",
+      file.type || "application/octet-stream",
+    )
     if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken)
     xhr.upload.onprogress = (event) =>
-      onProgress?.(event.loaded, event.lengthComputable ? event.total : file.size)
+      onProgress?.(
+        event.loaded,
+        event.lengthComputable ? event.total : file.size,
+      )
     xhr.onerror = () => reject(new Error("上传文档时连接中断"))
     xhr.onabort = () => reject(new DOMException("上传已取消", "AbortError"))
     xhr.onload = () => {
@@ -372,10 +469,15 @@ export async function runDocument(
   )
 }
 
-export async function cancelDocument(id: string): Promise<DocumentProjectRecord> {
-  const res = await apiFetch(`/api/documents/${encodeURIComponent(id)}/cancel`, {
-    method: "POST",
-  })
+export async function cancelDocument(
+  id: string,
+): Promise<DocumentProjectRecord> {
+  const res = await apiFetch(
+    `/api/documents/${encodeURIComponent(id)}/cancel`,
+    {
+      method: "POST",
+    },
+  )
   await assertOK(res, "取消文档任务")
   return res.json() as Promise<DocumentProjectRecord>
 }
@@ -445,7 +547,10 @@ export async function fetchDocumentDisputes(
   return res.json() as Promise<DocumentDisputeItem[]>
 }
 
-export function documentPageImageURL(documentID: string, pageID: string): string {
+export function documentPageImageURL(
+  documentID: string,
+  pageID: string,
+): string {
   return `/api/documents/${encodeURIComponent(documentID)}/pages/${encodeURIComponent(pageID)}/image`
 }
 
@@ -465,10 +570,15 @@ export interface OCRRequest {
 }
 
 export interface OCRDelta {
+  type: "delta" | "attempt_start" | "attempt_failed"
   stage: "engine" | "arbiter"
   agent: string
   kind: "thinking" | "output"
   text: string
+  attempt?: number
+  max_attempts?: number
+  reset?: boolean
+  error?: string
 }
 
 export interface Dispute {
@@ -486,7 +596,13 @@ export interface Resolution {
 }
 
 interface OCRStreamEvent {
-  type: "start" | "delta" | "result" | "error"
+  type:
+    | "start"
+    | "delta"
+    | "attempt_start"
+    | "attempt_failed"
+    | "result"
+    | "error"
   stage?: OCRDelta["stage"]
   agent?: string
   kind?: OCRDelta["kind"]
@@ -494,6 +610,8 @@ interface OCRStreamEvent {
   result?: Final
   resolutions?: Resolution[]
   error?: string
+  attempt?: number
+  max_attempts?: number
 }
 
 export async function runOCR(
@@ -604,10 +722,29 @@ async function consumeStream<T>(
       case "delta":
         if (event.stage && event.agent && event.text) {
           onDelta?.({
+            type: "delta",
             stage: event.stage,
             agent: event.agent,
             kind: event.kind ?? "output",
             text: event.text,
+            attempt: event.attempt,
+            max_attempts: event.max_attempts,
+          })
+        }
+        break
+      case "attempt_start":
+      case "attempt_failed":
+        if (event.stage && event.agent) {
+          onDelta?.({
+            type: event.type,
+            stage: event.stage,
+            agent: event.agent,
+            kind: "output",
+            text: "",
+            attempt: event.attempt,
+            max_attempts: event.max_attempts,
+            reset: event.type === "attempt_start",
+            error: event.error,
           })
         }
         break

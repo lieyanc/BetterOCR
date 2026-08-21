@@ -49,11 +49,12 @@ type documentManager struct {
 	store  *database.Store
 	root   string
 
-	ctx    context.Context
-	jobs   chan documentJob
-	mu     sync.Mutex
-	queued map[string]bool
-	runs   map[string]context.CancelFunc
+	ctx      context.Context
+	jobs     chan documentJob
+	mu       sync.Mutex
+	queued   map[string]bool
+	runs     map[string]context.CancelFunc
+	progress *documentProgressHub
 
 	rendererOnce sync.Once
 	renderer     documents.PageRenderer
@@ -77,7 +78,8 @@ func (s *Server) getDocumentManager() (*documentManager, error) {
 		manager := &documentManager{
 			server: s, store: s.Store, root: root, ctx: context.Background(),
 			jobs: make(chan documentJob, 128), queued: map[string]bool{},
-			runs: map[string]context.CancelFunc{}, renderer: s.PDFRenderer,
+			runs: map[string]context.CancelFunc{}, progress: newDocumentProgressHub(),
+			renderer: s.PDFRenderer,
 		}
 		s.documentManager = manager
 		go manager.worker()
@@ -133,6 +135,7 @@ func (m *documentManager) cancel(id string) {
 	if cancel != nil {
 		cancel()
 	}
+	m.progress.finishDocument(id, database.DocumentCancelled, "")
 }
 
 func (m *documentManager) worker() {
@@ -326,16 +329,21 @@ func (m *documentManager) finishPreparation(id string) {
 }
 
 func (m *documentManager) failDocument(id string, ctx context.Context, cause error) {
+	status := database.DocumentFailed
+	message := cause.Error()
 	_, _ = m.store.MutateDocument(id, func(document *database.DocumentProject) error {
 		if document.Status == database.DocumentCancelled || errors.Is(cause, context.Canceled) || ctx.Err() != nil {
 			document.Status = database.DocumentCancelled
 			document.Error = ""
+			status = database.DocumentCancelled
+			message = ""
 			return nil
 		}
 		document.Status = database.DocumentFailed
 		document.Error = cause.Error()
 		return nil
 	})
+	m.progress.finishDocument(id, status, message)
 }
 
 func (m *documentManager) process(ctx context.Context, id string) {
@@ -392,35 +400,48 @@ func (m *documentManager) process(ctx context.Context, id string) {
 			continue
 		}
 		started := time.Now()
+		progress := m.progress.beginPage(id, page, len(engines))
 		pageImage, readErr := os.ReadFile(m.pageImagePath(current, page))
 		if readErr != nil {
 			m.failPage(id, page.ID, readErr, time.Since(started), false)
+			progress.finish(database.PageFailed, readErr.Error())
 			continue
 		}
-		pageContext, cancel := context.WithTimeout(ctx, m.server.timeout())
-		final, runErr := pipeline.Run(pageContext, pipeline.Config{
+		cfg := m.server.currentConfig()
+		final, runErr := pipeline.Run(ctx, pipeline.Config{
 			Engines: engines, Arbiter: arbiterModel,
-			DeferArbitration: !document.AutoArbitrate,
-			HTTPClient:       m.server.HTTPClient,
+			DeferArbitration:   !document.AutoArbitrate,
+			HTTPClient:         m.server.HTTPClient,
+			EngineTimeout:      m.server.engineTimeout(),
+			ArbiterTimeout:     m.server.arbiterTimeout(),
+			EngineMaxAttempts:  cfg.EngineAttempts(),
+			ArbiterMaxAttempts: cfg.ArbiterAttempts(),
+			OnEvent:            progress.handle,
 		}, pageImage)
-		cancel()
 		if runErr != nil {
 			if ctx.Err() != nil {
 				m.failDocument(id, ctx, ctx.Err())
 				return
 			}
 			m.failPage(id, page.ID, runErr, time.Since(started), false)
+			progress.finish(database.PageFailed, runErr.Error())
 			continue
 		}
 		allFailed := final.Stats.Engines > 0 && final.Stats.FailedEngines == final.Stats.Engines
 		if err := writeJSONAtomic(m.resultPath(id, page.ID), final); err != nil {
 			m.failPage(id, page.ID, err, time.Since(started), false)
+			progress.finish(database.PageFailed, err.Error())
 			continue
 		}
 		m.completePage(id, page.ID, final, time.Since(started), allFailed)
+		if allFailed {
+			progress.finish(database.PageFailed, "所有引擎均失败,请检查 Provider 连接与模型配置")
+		} else {
+			progress.finish(database.PageCompleted, "")
+		}
 	}
 
-	_, _ = m.store.MutateDocument(id, func(current *database.DocumentProject) error {
+	completed, err := m.store.MutateDocument(id, func(current *database.DocumentProject) error {
 		if current.Status == database.DocumentCancelled {
 			return nil
 		}
@@ -434,6 +455,9 @@ func (m *documentManager) process(ctx context.Context, id string) {
 		}
 		return nil
 	})
+	if err == nil {
+		m.progress.finishDocument(id, completed.Status, completed.Error)
+	}
 }
 
 func (m *documentManager) resolveModels(document database.DocumentProject) ([]model.Resolved, *model.Resolved, error) {
@@ -669,6 +693,7 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "项目记录已删除,但文件清理失败: "+err.Error())
 		return
 	}
+	manager.progress.delete(document.ID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -724,7 +749,7 @@ func (s *Server) handleRunDocument(w http.ResponseWriter, r *http.Request) {
 		next.Engines = append([]string(nil), settings.Engines...)
 		next.Arbiter = settings.Arbiter
 		next.AutoArbitrate = settings.AutoArbitrate
-		next.Status = database.DocumentReady
+		next.Status = database.DocumentProcessing
 		next.CompletedAt = nil
 		next.Error = ""
 		hasPending := slices.ContainsFunc(next.Pages, func(page database.DocumentPage) bool {
@@ -747,6 +772,11 @@ func (s *Server) handleRunDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := manager.enqueue(documentJob{id: document.ID, kind: documentJobProcess}); err != nil {
+		_, _ = s.Store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
+			next.Status = database.DocumentReady
+			next.Error = err.Error()
+			return nil
+		})
 		writeErr(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}

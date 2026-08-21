@@ -92,7 +92,11 @@ func TestLoadSupplementsMissingFields(t *testing.T) {
 	if cfg.Arbiter != "" {
 		t.Errorf("显式空 arbiter 被改写: %q", cfg.Arbiter)
 	}
-	if cfg.TimeoutSeconds != Default().TimeoutSeconds || cfg.ServeAddr != Default().ServeAddr {
+	if cfg.EngineTimeoutSeconds != Default().EngineTimeoutSeconds ||
+		cfg.ArbiterTimeoutSeconds != Default().ArbiterTimeoutSeconds ||
+		cfg.EngineMaxAttempts != Default().EngineMaxAttempts ||
+		cfg.ArbiterMaxAttempts != Default().ArbiterMaxAttempts ||
+		cfg.ServeAddr != Default().ServeAddr {
 		t.Errorf("缺失字段未按模板补全: %+v", cfg)
 	}
 	_, action, err = Load(path)
@@ -133,7 +137,7 @@ func TestLoadSupplementsProviderAliases(t *testing.T) {
 
 func TestLoadKeepsExplicitProviderAlias(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	full := []byte(`{"providers":[{"id":"openai","alias":"My OpenAI","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`)
+	full := []byte(`{"providers":[{"id":"openai","alias":"My OpenAI","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +156,7 @@ func TestLoadKeepsExplicitProviderAlias(t *testing.T) {
 func TestLoadKeepsCompleteFileByteForByte(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
 	// 顶层字段与 provider alias 均齐全 → 原样使用,逐字节不变
-	full := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","timeout_seconds":30,"serve_addr":":1"}`)
+	full := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +164,7 @@ func TestLoadKeepsCompleteFileByteForByte(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action != ActionNone || cfg.Arbiter != "" || cfg.TimeoutSeconds != 30 {
+	if action != ActionNone || cfg.Arbiter != "" || cfg.EngineTimeoutSeconds != 30 || cfg.ArbiterTimeoutSeconds != 45 {
 		t.Errorf("load = (%+v, %v)", cfg, action)
 	}
 	raw, _ := os.ReadFile(path)
@@ -229,6 +233,23 @@ func TestSaveRejectsInvalidConfigWithoutReplacingFile(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidStagePolicies(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"negative engine timeout":   func(cfg *Config) { cfg.EngineTimeoutSeconds = -1 },
+		"negative arbiter timeout":  func(cfg *Config) { cfg.ArbiterTimeoutSeconds = -1 },
+		"too many engine attempts":  func(cfg *Config) { cfg.EngineMaxAttempts = 11 },
+		"negative arbiter attempts": func(cfg *Config) { cfg.ArbiterMaxAttempts = -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Default()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Validate accepted %+v", cfg)
+			}
+		})
+	}
+}
+
 func TestValidateAndResolve(t *testing.T) {
 	cfg := Config{
 		Providers: []model.Provider{localProvider("http://local/v1", "key")},
@@ -254,18 +275,56 @@ func TestValidateAndResolve(t *testing.T) {
 	}
 }
 
-func TestTimeout(t *testing.T) {
-	if got := (Config{TimeoutSeconds: 30}).Timeout(); got != 30*time.Second {
-		t.Errorf("Timeout(30) = %v", got)
+func TestStageTimeoutsAndAttempts(t *testing.T) {
+	cfg := Config{
+		EngineTimeoutSeconds: 30, ArbiterTimeoutSeconds: 45,
+		EngineMaxAttempts: 3, ArbiterMaxAttempts: 4,
 	}
-	if got := (Config{}).Timeout(); got != 2*time.Minute {
-		t.Errorf("Timeout(0) = %v, want 2m", got)
+	if got := cfg.EngineTimeout(); got != 30*time.Second {
+		t.Errorf("EngineTimeout = %v", got)
+	}
+	if got := cfg.ArbiterTimeout(); got != 45*time.Second {
+		t.Errorf("ArbiterTimeout = %v", got)
+	}
+	if cfg.EngineAttempts() != 3 || cfg.ArbiterAttempts() != 4 {
+		t.Errorf("attempts = (%d, %d)", cfg.EngineAttempts(), cfg.ArbiterAttempts())
+	}
+	legacy := Config{TimeoutSeconds: 77}
+	if legacy.EngineTimeout() != 77*time.Second || legacy.ArbiterTimeout() != 77*time.Second {
+		t.Errorf("legacy stage timeouts = (%v, %v)", legacy.EngineTimeout(), legacy.ArbiterTimeout())
+	}
+}
+
+func TestLoadMigratesLegacyTimeoutIntoIndependentStages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","timeout_seconds":77,"serve_addr":":1"}`)
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, action, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != ActionSupplemented || cfg.EngineTimeoutSeconds != 77 || cfg.ArbiterTimeoutSeconds != 77 {
+		t.Fatalf("migration = (%+v, %v)", cfg, action)
+	}
+	if cfg.EngineMaxAttempts != 2 || cfg.ArbiterMaxAttempts != 2 {
+		t.Fatalf("migrated attempts = (%d, %d)", cfg.EngineMaxAttempts, cfg.ArbiterMaxAttempts)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"timeout_seconds"`)) ||
+		!bytes.Contains(raw, []byte(`"engine_timeout_seconds": 77`)) ||
+		!bytes.Contains(raw, []byte(`"arbiter_timeout_seconds": 77`)) {
+		t.Fatalf("legacy timeout was not normalized: %s", raw)
 	}
 }
 
 func TestFieldKeysCoverAllFields(t *testing.T) {
 	keys := fieldKeys()
-	n := reflect.TypeOf(Config{}).NumField()
+	n := reflect.TypeOf(Config{}).NumField() - 1 // TimeoutSeconds is migration-only.
 	if len(keys) != n {
 		t.Errorf("fieldKeys 覆盖 %d 个字段,结构体有 %d 个", len(keys), n)
 	}

@@ -145,7 +145,10 @@ func TestAdminSettingsPersistToSharedConfigOnly(t *testing.T) {
 	databasePath := filepath.Join(root, "database.json")
 	cfg := serverConfig("http://127.0.0.1:1", "server-key")
 	cfg.ServeAddr = "127.0.0.1:8787"
-	cfg.TimeoutSeconds = 30
+	cfg.EngineTimeoutSeconds = 30
+	cfg.ArbiterTimeoutSeconds = 40
+	cfg.EngineMaxAttempts = 2
+	cfg.ArbiterMaxAttempts = 3
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +161,10 @@ func TestAdminSettingsPersistToSharedConfigOnly(t *testing.T) {
 	cookie, csrf := setupForTest(t, handler, "admin", "admin-password")
 
 	next := cfg
-	next.TimeoutSeconds = 45
+	next.EngineTimeoutSeconds = 45
+	next.ArbiterTimeoutSeconds = 60
+	next.EngineMaxAttempts = 4
+	next.ArbiterMaxAttempts = 5
 	body, err := json.Marshal(next)
 	if err != nil {
 		t.Fatal(err)
@@ -175,8 +181,11 @@ func TestAdminSettingsPersistToSharedConfigOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.TimeoutSeconds != 45 || srv.currentConfig().TimeoutSeconds != 45 {
-		t.Fatalf("file timeout=%d server timeout=%d", loaded.TimeoutSeconds, srv.currentConfig().TimeoutSeconds)
+	current := srv.currentConfig()
+	if loaded.EngineTimeoutSeconds != 45 || loaded.ArbiterTimeoutSeconds != 60 ||
+		loaded.EngineMaxAttempts != 4 || loaded.ArbiterMaxAttempts != 5 ||
+		current.EngineTimeoutSeconds != 45 || current.ArbiterTimeoutSeconds != 60 {
+		t.Fatalf("file settings=%+v server settings=%+v", loaded, current)
 	}
 	databaseJSON, err := os.ReadFile(databasePath)
 	if err != nil {

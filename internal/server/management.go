@@ -107,8 +107,13 @@ func (s *Server) handleUpdateAdminSettings(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.Config = next
-	writeJSON(w, http.StatusOK, next)
+	saved, _, err := config.Load(s.ConfigPath)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "重新加载配置失败: "+err.Error())
+		return
+	}
+	s.Config = saved
+	writeJSON(w, http.StatusOK, saved)
 }
 
 func (s *Server) startTask(w http.ResponseWriter, r *http.Request, runConfig pipeline.Config) (string, bool) {

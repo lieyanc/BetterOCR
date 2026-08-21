@@ -31,8 +31,11 @@ type Server struct {
 	Config config.Config
 	// ConfigPath is the single configuration file edited by the admin API.
 	ConfigPath string
-	// Timeout 是单次识别的端到端超时,零值取 2 分钟。
+	// Timeout is a legacy test override applied to both stages when set.
 	Timeout time.Duration
+	// EngineTimeout and ArbiterTimeout override their respective stage in tests.
+	EngineTimeout  time.Duration
+	ArbiterTimeout time.Duration
 	// HTTPClient 为 nil 时使用 http.DefaultClient。
 	HTTPClient *http.Client
 	// Store enables login, authorization and task history.
@@ -69,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/documents", s.requireAuth(http.HandlerFunc(s.handleDocuments)))
 	mux.Handle("POST /api/documents", s.requireAuth(http.HandlerFunc(s.handleCreateDocument)))
 	mux.Handle("GET /api/documents/{id}", s.requireAuth(http.HandlerFunc(s.handleDocument)))
+	mux.Handle("GET /api/documents/{id}/events", s.requireAuth(http.HandlerFunc(s.handleDocumentProgress)))
 	mux.Handle("DELETE /api/documents/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteDocument)))
 	mux.Handle("POST /api/documents/{id}/run", s.requireAuth(http.HandlerFunc(s.handleRunDocument)))
 	mux.Handle("POST /api/documents/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelDocument)))
@@ -95,11 +99,24 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-func (s *Server) timeout() time.Duration {
+func (s *Server) engineTimeout() time.Duration {
+	if s.EngineTimeout > 0 {
+		return s.EngineTimeout
+	}
 	if s.Timeout > 0 {
 		return s.Timeout
 	}
-	return s.currentConfig().Timeout()
+	return s.currentConfig().EngineTimeout()
+}
+
+func (s *Server) arbiterTimeout() time.Duration {
+	if s.ArbiterTimeout > 0 {
+		return s.ArbiterTimeout
+	}
+	if s.Timeout > 0 {
+		return s.Timeout
+	}
+	return s.currentConfig().ArbiterTimeout()
 }
 
 func (s *Server) currentConfig() config.Config {
@@ -116,10 +133,14 @@ func (s *Server) currentConfig() config.Config {
 
 // configResponse exposes selectable metadata but never provider API keys.
 type configResponse struct {
-	Providers []providerResponse `json:"providers"`
-	Engines   []string           `json:"engines"`
-	Arbiter   string             `json:"arbiter"`
-	TimeoutMS int64              `json:"timeout_ms"`
+	Providers        []providerResponse `json:"providers"`
+	Engines          []string           `json:"engines"`
+	Arbiter          string             `json:"arbiter"`
+	TimeoutMS        int64              `json:"timeout_ms"`
+	EngineTimeoutMS  int64              `json:"engine_timeout_ms"`
+	ArbiterTimeoutMS int64              `json:"arbiter_timeout_ms"`
+	EngineAttempts   int                `json:"engine_max_attempts"`
+	ArbiterAttempts  int                `json:"arbiter_max_attempts"`
 }
 
 type providerResponse struct {
@@ -148,7 +169,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 		Providers: providers,
 		Engines:   engines,
 		Arbiter:   cfg.Arbiter,
-		TimeoutMS: s.timeout().Milliseconds(),
+		// timeout_ms remains as a compatibility alias for engine_timeout_ms.
+		TimeoutMS:        s.engineTimeout().Milliseconds(),
+		EngineTimeoutMS:  s.engineTimeout().Milliseconds(),
+		ArbiterTimeoutMS: s.arbiterTimeout().Milliseconds(),
+		EngineAttempts:   cfg.EngineAttempts(),
+		ArbiterAttempts:  cfg.ArbiterAttempts(),
 	})
 }
 
@@ -168,9 +194,7 @@ func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
 	if taskID != "" {
 		w.Header().Set("X-BetterOCR-Task-ID", taskID)
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
-	defer cancel()
-	final, err := pipeline.Run(ctx, runConfig, image)
+	final, err := pipeline.Run(r.Context(), runConfig, image)
 	if err != nil {
 		s.finishTask(taskID, nil, err.Error(), time.Since(started))
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -187,6 +211,8 @@ type streamEvent struct {
 	Agent       string               `json:"agent,omitempty"`
 	Kind        string               `json:"kind,omitempty"`
 	Text        string               `json:"text,omitempty"`
+	Attempt     int                  `json:"attempt,omitempty"`
+	MaxAttempts int                  `json:"max_attempts,omitempty"`
 	Result      *arbiter.Final       `json:"result,omitempty"`
 	Resolutions []arbiter.Resolution `json:"resolutions,omitempty"`
 	Error       string               `json:"error,omitempty"`
@@ -211,7 +237,7 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	encoder := json.NewEncoder(w)
 	controller := http.NewResponseController(w)
-	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
+	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	var eventMu sync.Mutex
 	streamOK := true
@@ -237,10 +263,15 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeEvent(streamEvent{Type: "start", TaskID: taskID})
-	runConfig.OnDelta = func(delta pipeline.Delta) {
-		writeEvent(streamEvent{
-			Type: "delta", Stage: delta.Stage, Agent: delta.Agent, Kind: delta.Kind, Text: delta.Text,
-		})
+	runConfig.OnEvent = func(event pipeline.Event) {
+		switch event.Type {
+		case pipeline.EventDelta, pipeline.EventAttemptStart, pipeline.EventAttemptFailed:
+			writeEvent(streamEvent{
+				Type: event.Type, Stage: event.Stage, Agent: event.Agent,
+				Kind: event.Kind, Text: event.Text, Error: event.Error,
+				Attempt: event.Attempt, MaxAttempts: event.MaxAttempts,
+			})
+		}
 	}
 	final, err := pipeline.Run(ctx, runConfig, image)
 	if err != nil {
@@ -267,7 +298,7 @@ func (s *Server) handleArbitrateStream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	encoder := json.NewEncoder(w)
 	controller := http.NewResponseController(w)
-	ctx, cancel := context.WithTimeout(r.Context(), s.timeout())
+	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	streamOK := true
 	writeEvent := func(event streamEvent) {
@@ -290,14 +321,31 @@ func (s *Server) handleArbitrateStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	escalator := agents.NewVisionEscalator(resolvedModel, s.HTTPClient)
+	currentAttempt := 0
+	maxAttempts := s.currentConfig().ArbiterAttempts()
 	escalator.OnDelta = func(delta agents.StreamDelta) {
 		writeEvent(streamEvent{
 			Type: "delta", Stage: pipeline.StageArbiter, Agent: escalator.Name(),
 			Kind: string(delta.Kind), Text: delta.Text,
+			Attempt: currentAttempt, MaxAttempts: maxAttempts,
 		})
 	}
 	writeEvent(streamEvent{Type: "start"})
-	resolutions, err := escalator.Resolve(ctx, image, disputes)
+	resolutions, err := pipeline.ResolveWithRetry(
+		ctx, escalator, image, disputes, s.arbiterTimeout(), maxAttempts,
+		func(event pipeline.Event) {
+			if event.Type != pipeline.EventAttemptStart && event.Type != pipeline.EventAttemptFailed {
+				return
+			}
+			if event.Type == pipeline.EventAttemptStart {
+				currentAttempt = event.Attempt
+			}
+			writeEvent(streamEvent{
+				Type: event.Type, Stage: event.Stage, Agent: event.Agent, Error: event.Error,
+				Attempt: event.Attempt, MaxAttempts: event.MaxAttempts,
+			})
+		},
+	)
 	if err != nil {
 		writeEvent(streamEvent{Type: "error", Error: err.Error()})
 		return
@@ -412,10 +460,14 @@ func (s *Server) parseOCRRequest(w http.ResponseWriter, r *http.Request) ([]byte
 		arbiterModel = &resolved
 	}
 	return image, pipeline.Config{
-		Engines:          engines,
-		Arbiter:          arbiterModel,
-		DeferArbitration: strings.EqualFold(formOr(r, "auto_arbitrate", "true"), "false"),
-		HTTPClient:       s.HTTPClient,
+		Engines:            engines,
+		Arbiter:            arbiterModel,
+		DeferArbitration:   strings.EqualFold(formOr(r, "auto_arbitrate", "true"), "false"),
+		HTTPClient:         s.HTTPClient,
+		EngineTimeout:      s.engineTimeout(),
+		ArbiterTimeout:     s.arbiterTimeout(),
+		EngineMaxAttempts:  cfg.EngineAttempts(),
+		ArbiterMaxAttempts: cfg.ArbiterAttempts(),
 	}, true
 }
 

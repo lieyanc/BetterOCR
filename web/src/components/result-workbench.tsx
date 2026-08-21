@@ -39,7 +39,11 @@ import { Progress } from "@/components/ui/progress"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 
 const sourceMeta: Record<
   SegmentSource,
@@ -76,6 +80,11 @@ export function ResultWorkbench({
   const [arbiterOutput, setArbiterOutput] = useState("")
   const [feedback, setFeedback] = useState("")
   const [arbitrationError, setArbitrationError] = useState("")
+  const [arbiterAttempt, setArbiterAttempt] = useState({
+    attempt: 0,
+    max: 0,
+    lastError: "",
+  })
   const arbitrationAbort = useRef<AbortController | null>(null)
   const arbiterThinkingRef = useRef<HTMLPreElement>(null)
   const arbiterOutputRef = useRef<HTMLPreElement>(null)
@@ -90,21 +99,30 @@ export function ResultWorkbench({
   }, [arbiterThinking, arbiterOutput])
 
   const disputedIndexes = useMemo(
-    () => segments.flatMap((segment, index) => (segment.disputed ? [index] : [])),
+    () =>
+      segments.flatMap((segment, index) => (segment.disputed ? [index] : [])),
     [segments],
   )
   const pendingIndexes = useMemo(
-    () => disputedIndexes.filter((index) => segments[index].source === "fallback"),
+    () =>
+      disputedIndexes.filter((index) => segments[index].source === "fallback"),
     [disputedIndexes, segments],
   )
   const mergedText = useMemo(
-    () => segments.map((segment) => segment.text.trim()).filter(Boolean).join("\n"),
+    () =>
+      segments
+        .map((segment) => segment.text.trim())
+        .filter(Boolean)
+        .join("\n"),
     [segments],
   )
   const confidence = useMemo(() => {
     const visible = segments.filter((segment) => segment.text.trim())
     if (visible.length === 0) return 0
-    return visible.reduce((sum, segment) => sum + segment.confidence, 0) / visible.length
+    return (
+      visible.reduce((sum, segment) => sum + segment.confidence, 0) /
+      visible.length
+    )
   }, [segments])
   const effectiveFinal = useMemo(
     () => ({ ...final, text: mergedText, confidence, segments }),
@@ -159,6 +177,7 @@ export function ResultWorkbench({
     setEditing(null)
     setFeedback(`句段 ${index + 1} 已采用 ${candidate.agent} 的候选`)
     setArbitrationError("")
+    setArbiterAttempt({ attempt: 0, max: 0, lastError: "" })
   }
 
   const applyDraft = (index: number) => {
@@ -194,6 +213,23 @@ export function ResultWorkbench({
       const resolutions = await runArbitration(
         { image, arbiter, disputes, signal: controller.signal },
         (delta) => {
+          if (delta.type === "attempt_start") {
+            setArbiterThinking("")
+            setArbiterOutput("")
+            setArbiterAttempt((current) => ({
+              attempt: delta.attempt ?? current.attempt,
+              max: delta.max_attempts ?? current.max,
+              lastError: current.lastError,
+            }))
+            return
+          }
+          if (delta.type === "attempt_failed") {
+            setArbiterAttempt((current) => ({
+              ...current,
+              lastError: delta.error ?? "",
+            }))
+            return
+          }
           if (delta.kind === "thinking") {
             setArbiterThinking((current) => current + delta.text)
           } else {
@@ -201,7 +237,9 @@ export function ResultWorkbench({
           }
         },
       )
-      const byIndex = new Map(resolutions.map((resolution) => [resolution.segment, resolution]))
+      const byIndex = new Map(
+        resolutions.map((resolution) => [resolution.segment, resolution]),
+      )
       applySegments(
         segments.map((segment, index) => {
           const resolution = byIndex.get(index)
@@ -219,7 +257,10 @@ export function ResultWorkbench({
       if (resolutions.length > 0) {
         setArbiterOutput(
           resolutions
-            .map((resolution) => `句段 ${resolution.segment + 1}：${resolution.text}`)
+            .map(
+              (resolution) =>
+                `句段 ${resolution.segment + 1}：${resolution.text}`,
+            )
             .join("\n"),
         )
       }
@@ -232,7 +273,9 @@ export function ResultWorkbench({
       if (cause instanceof DOMException && cause.name === "AbortError") {
         setArbitrationError("仲裁已取消，原合并结果未改变")
       } else {
-        setArbitrationError(cause instanceof Error ? cause.message : String(cause))
+        setArbitrationError(
+          cause instanceof Error ? cause.message : String(cause),
+        )
       }
     } finally {
       setArbitrating([])
@@ -277,7 +320,9 @@ export function ResultWorkbench({
           <Alert>
             <AlertCircle />
             <AlertTitle>自动仲裁失败，争议已保留</AlertTitle>
-            <AlertDescription className="break-all">{stats.escalation_err}</AlertDescription>
+            <AlertDescription className="break-all">
+              {stats.escalation_err}
+            </AlertDescription>
           </Alert>
         )}
         {feedback && (
@@ -296,13 +341,22 @@ export function ResultWorkbench({
         )}
         {(arbitrating.length > 0 || arbiterThinking || arbiterOutput) && (
           <Alert>
-            {arbitrating.length > 0 ? <Loader2 className="animate-spin" /> : <Bot />}
+            {arbitrating.length > 0 ? (
+              <Loader2 className="animate-spin" />
+            ) : (
+              <Bot />
+            )}
             <AlertTitle>
               {arbitrating.length > 0
-                ? `正在仲裁 ${arbitrating.length} 个句段`
+                ? `正在仲裁 ${arbitrating.length} 个句段${arbiterAttempt.max > 1 ? ` · 尝试 ${arbiterAttempt.attempt || 1}/${arbiterAttempt.max}` : ""}`
                 : "最近一次仲裁输出"}
             </AlertTitle>
             <AlertDescription className="grid w-full gap-3">
+              {arbitrating.length > 0 && arbiterAttempt.lastError && (
+                <p className="break-all text-xs text-muted-foreground">
+                  上次尝试失败：{arbiterAttempt.lastError}
+                </p>
+              )}
               <section className="grid gap-1.5">
                 <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                   <BrainCircuit className="size-3.5" />
@@ -316,7 +370,9 @@ export function ResultWorkbench({
                 </pre>
               </section>
               <section className="grid gap-1.5">
-                <div className="text-xs font-medium text-muted-foreground">主输出</div>
+                <div className="text-xs font-medium text-muted-foreground">
+                  主输出
+                </div>
                 <pre
                   ref={arbiterOutputRef}
                   className="h-28 w-full overflow-auto whitespace-pre-wrap break-words rounded-md border p-3 font-sans text-xs leading-5"
@@ -347,10 +403,14 @@ export function ResultWorkbench({
               <span className="sm:hidden">合并</span>
               <span className="hidden sm:inline">合并文本</span>
             </TabsTrigger>
-            <TabsTrigger value="disputes">争议({disputedIndexes.length})</TabsTrigger>
+            <TabsTrigger value="disputes">
+              争议({disputedIndexes.length})
+            </TabsTrigger>
             <TabsTrigger value="segments">
               <span className="sm:hidden">全部({segments.length})</span>
-              <span className="hidden sm:inline">全部句段({segments.length})</span>
+              <span className="hidden sm:inline">
+                全部句段({segments.length})
+              </span>
             </TabsTrigger>
             <TabsTrigger value="engines">
               <span className="sm:hidden">原文</span>
@@ -364,7 +424,10 @@ export function ResultWorkbench({
               <pre className="max-h-[520px] min-h-28 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/40 p-4 pr-12 font-sans text-sm leading-7">
                 {mergedText || "(未识别到文本)"}
               </pre>
-              <CopyButton text={mergedText} className="absolute right-2 top-2" />
+              <CopyButton
+                text={mergedText}
+                className="absolute right-2 top-2"
+              />
             </div>
           </TabsContent>
 
@@ -385,7 +448,10 @@ export function ResultWorkbench({
                     onClick={() => void arbitrate(pendingIndexes)}
                   >
                     {arbitrating.length > 0 ? (
-                      <Loader2 data-icon="inline-start" className="animate-spin" />
+                      <Loader2
+                        data-icon="inline-start"
+                        className="animate-spin"
+                      />
                     ) : (
                       <Gavel data-icon="inline-start" />
                     )}
@@ -397,7 +463,9 @@ export function ResultWorkbench({
                 <Alert>
                   <AlertCircle />
                   <AlertTitle>未选择仲裁模型</AlertTitle>
-                  <AlertDescription>可以直接选择候选或自定义编辑。</AlertDescription>
+                  <AlertDescription>
+                    可以直接选择候选或自定义编辑。
+                  </AlertDescription>
                 </Alert>
               )}
               {disputedIndexes.length === 0 ? (
@@ -415,7 +483,9 @@ export function ResultWorkbench({
                       draft={editing === index ? draft : segments[index].text}
                       busy={arbitrating.includes(index)}
                       arbitrationDisabled={!arbiter || arbitrating.length > 0}
-                      onCandidate={(candidate) => chooseCandidate(index, candidate)}
+                      onCandidate={(candidate) =>
+                        chooseCandidate(index, candidate)
+                      }
                       onEdit={() => {
                         setEditing(index)
                         setDraft(segments[index].text)
@@ -500,7 +570,10 @@ function DisputeEditor({
   )
   const meta = sourceMeta[segment.source]
   return (
-    <section className="flex flex-col gap-3 border-b p-3 last:border-b-0" aria-label={`争议句段 ${index + 1}`}>
+    <section
+      className="flex flex-col gap-3 border-b p-3 last:border-b-0"
+      aria-label={`争议句段 ${index + 1}`}
+    >
       <div className="flex flex-wrap items-start gap-2">
         <span className="w-7 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
           {index + 1}
@@ -587,7 +660,13 @@ function DisputeEditor({
   )
 }
 
-function SegmentRow({ segment, index }: { segment: FinalSegment; index: number }) {
+function SegmentRow({
+  segment,
+  index,
+}: {
+  segment: FinalSegment
+  index: number
+}) {
   const meta = sourceMeta[segment.source]
   return (
     <div className="flex items-start gap-3 border-b px-3 py-2 text-sm last:border-b-0 hover:bg-muted/40">
@@ -598,10 +677,15 @@ function SegmentRow({ segment, index }: { segment: FinalSegment; index: number }
         {segment.text || "(已删除)"}
       </span>
       <div className="flex shrink-0 items-center gap-2">
-        <span className="hidden max-w-44 truncate text-xs text-muted-foreground md:inline" title={segment.from.join(", ")}>
+        <span
+          className="hidden max-w-44 truncate text-xs text-muted-foreground md:inline"
+          title={segment.from.join(", ")}
+        >
           {segment.from.join(" · ")}
         </span>
-        <span className="text-xs tabular-nums text-muted-foreground">{pct(segment.confidence)}</span>
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {pct(segment.confidence)}
+        </span>
         <Badge variant={meta.variant}>{meta.label}</Badge>
       </div>
     </div>
@@ -612,7 +696,10 @@ function EngineOutput({ result }: { result: EngineResult }) {
   return (
     <div className="flex flex-col gap-3 rounded-md border p-4">
       <div className="flex items-center gap-2">
-        <h3 className="min-w-0 flex-1 truncate text-sm font-medium" title={result.agent}>
+        <h3
+          className="min-w-0 flex-1 truncate text-sm font-medium"
+          title={result.agent}
+        >
           {result.agent}
         </h3>
         <Badge variant={result.err ? "destructive" : "secondary"}>
@@ -639,9 +726,9 @@ function CopyButton({
   className?: string
   labeled?: boolean
 }) {
-  const [status, setStatus] = useState<"idle" | "pending" | "success" | "error">(
-    "idle",
-  )
+  const [status, setStatus] = useState<
+    "idle" | "pending" | "success" | "error"
+  >("idle")
 
   useEffect(() => setStatus("idle"), [text])
 
@@ -658,14 +745,23 @@ function CopyButton({
   return (
     <div className={cn("flex items-center gap-2", className)}>
       {!labeled && status !== "idle" && (
-        <Badge variant={status === "error" ? "destructive" : "secondary"} role="status">
+        <Badge
+          variant={status === "error" ? "destructive" : "secondary"}
+          role="status"
+        >
           {label}
         </Badge>
       )}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
-            variant={status === "error" ? "destructive" : labeled ? "default" : "secondary"}
+            variant={
+              status === "error"
+                ? "destructive"
+                : labeled
+                  ? "default"
+                  : "secondary"
+            }
             size={labeled ? "sm" : "icon"}
             className={cn(!labeled && "size-8")}
             aria-label={label}
@@ -676,7 +772,10 @@ function CopyButton({
                 await Promise.race([
                   navigator.clipboard.writeText(text),
                   new Promise<void>((_, reject) =>
-                    window.setTimeout(() => reject(new Error("复制超时")), 1000),
+                    window.setTimeout(
+                      () => reject(new Error("复制超时")),
+                      1000,
+                    ),
                   ),
                 ])
                 setStatus("success")
@@ -687,7 +786,10 @@ function CopyButton({
             }}
           >
             {status === "pending" ? (
-              <Loader2 data-icon={labeled ? "inline-start" : undefined} className="animate-spin" />
+              <Loader2
+                data-icon={labeled ? "inline-start" : undefined}
+                className="animate-spin"
+              />
             ) : status === "success" ? (
               <Check data-icon={labeled ? "inline-start" : undefined} />
             ) : status === "error" ? (

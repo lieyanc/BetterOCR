@@ -20,6 +20,11 @@ import (
 // DefaultPath 是默认的配置文件路径(相对当前工作目录)。
 const DefaultPath = "data/config.json"
 
+const (
+	defaultTimeoutSeconds = 120
+	defaultMaxAttempts    = 2
+)
+
 // Config is the complete data/config.json structure.
 type Config struct {
 	// Providers contains model catalogs and server-side credentials.
@@ -29,8 +34,16 @@ type Config struct {
 	Engines []string `json:"engines"`
 	// Arbiter is a provider/model reference. Empty disables remote arbitration.
 	Arbiter string `json:"arbiter"`
-	// TimeoutSeconds 是单次识别的端到端超时,非正数按 120 处理。
-	TimeoutSeconds int `json:"timeout_seconds"`
+	// EngineTimeoutSeconds 是每个基础模型每次尝试的超时秒数。
+	EngineTimeoutSeconds int `json:"engine_timeout_seconds"`
+	// ArbiterTimeoutSeconds 是仲裁模型每次尝试的超时秒数。
+	ArbiterTimeoutSeconds int `json:"arbiter_timeout_seconds"`
+	// EngineMaxAttempts 是单个基础模型的最大尝试次数,1 表示不重试。
+	EngineMaxAttempts int `json:"engine_max_attempts"`
+	// ArbiterMaxAttempts 是仲裁模型的最大尝试次数,1 表示不重试。
+	ArbiterMaxAttempts int `json:"arbiter_max_attempts"`
+	// TimeoutSeconds 仅用于读取旧配置,规范写回时会移除。
+	TimeoutSeconds int `json:"timeout_seconds,omitempty" config:"legacy"`
 	// ServeAddr 是 -serve 模式的监听地址。
 	ServeAddr string `json:"serve_addr"`
 }
@@ -59,19 +72,55 @@ func Default() Config {
 				},
 			},
 		},
-		Engines:        []string{"openai/gpt-4.1-mini", "openai/gpt-4o-mini"},
-		Arbiter:        "anthropic/claude-sonnet-4-20250514",
-		TimeoutSeconds: 120,
-		ServeAddr:      "127.0.0.1:8787",
+		Engines:               []string{"openai/gpt-4.1-mini", "openai/gpt-4o-mini"},
+		Arbiter:               "anthropic/claude-sonnet-4-20250514",
+		EngineTimeoutSeconds:  defaultTimeoutSeconds,
+		ArbiterTimeoutSeconds: defaultTimeoutSeconds,
+		EngineMaxAttempts:     defaultMaxAttempts,
+		ArbiterMaxAttempts:    defaultMaxAttempts,
+		ServeAddr:             "127.0.0.1:8787",
 	}
 }
 
-// Timeout 把 TimeoutSeconds 换算成 time.Duration,非正数取默认 2 分钟。
-func (c Config) Timeout() time.Duration {
-	if c.TimeoutSeconds > 0 {
-		return time.Duration(c.TimeoutSeconds) * time.Second
+// EngineTimeout returns the independent timeout budget for each engine attempt.
+func (c Config) EngineTimeout() time.Duration {
+	return time.Duration(c.normalized().EngineTimeoutSeconds) * time.Second
+}
+
+// ArbiterTimeout returns the independent timeout budget for each arbiter attempt.
+func (c Config) ArbiterTimeout() time.Duration {
+	return time.Duration(c.normalized().ArbiterTimeoutSeconds) * time.Second
+}
+
+// EngineAttempts returns the maximum attempts for each individual engine.
+func (c Config) EngineAttempts() int { return c.normalized().EngineMaxAttempts }
+
+// ArbiterAttempts returns the maximum attempts for arbitration only.
+func (c Config) ArbiterAttempts() int { return c.normalized().ArbiterMaxAttempts }
+
+func (c Config) normalized() Config {
+	if c.EngineTimeoutSeconds == 0 {
+		if c.TimeoutSeconds > 0 {
+			c.EngineTimeoutSeconds = c.TimeoutSeconds
+		} else {
+			c.EngineTimeoutSeconds = defaultTimeoutSeconds
+		}
 	}
-	return 2 * time.Minute
+	if c.ArbiterTimeoutSeconds == 0 {
+		if c.TimeoutSeconds > 0 {
+			c.ArbiterTimeoutSeconds = c.TimeoutSeconds
+		} else {
+			c.ArbiterTimeoutSeconds = defaultTimeoutSeconds
+		}
+	}
+	if c.EngineMaxAttempts == 0 {
+		c.EngineMaxAttempts = defaultMaxAttempts
+	}
+	if c.ArbiterMaxAttempts == 0 {
+		c.ArbiterMaxAttempts = defaultMaxAttempts
+	}
+	c.TimeoutSeconds = 0
+	return c
 }
 
 // Action 描述 Load 对配置文件做了什么,供启动日志提示用户。
@@ -117,6 +166,16 @@ func Load(path string) (Config, Action, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, ActionNone, fmt.Errorf("解析 %s 失败(不会改动该文件): %w", path, err)
 	}
+	if _, legacy := present["timeout_seconds"]; legacy {
+		if _, current := present["engine_timeout_seconds"]; !current && cfg.TimeoutSeconds > 0 {
+			cfg.EngineTimeoutSeconds = cfg.TimeoutSeconds
+		}
+		if _, current := present["arbiter_timeout_seconds"]; !current && cfg.TimeoutSeconds > 0 {
+			cfg.ArbiterTimeoutSeconds = cfg.TimeoutSeconds
+		}
+		cfg.TimeoutSeconds = 0
+		supplemented = true
+	}
 	if _, ok := present["providers"]; !ok {
 		cfg.Providers = Default().Providers
 	} else if supplementProviderAliases(cfg.Providers) {
@@ -145,6 +204,7 @@ func Save(path string, cfg Config) error {
 	if path == "" {
 		return errors.New("配置文件路径不能为空")
 	}
+	cfg = cfg.normalized()
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -175,6 +235,19 @@ func supplementProviderAliases(providers []model.Provider) bool {
 
 // Validate checks provider/model identity and all configured selections.
 func (c Config) Validate() error {
+	c = c.normalized()
+	if c.EngineTimeoutSeconds <= 0 {
+		return errors.New("engine_timeout_seconds 必须大于 0")
+	}
+	if c.ArbiterTimeoutSeconds <= 0 {
+		return errors.New("arbiter_timeout_seconds 必须大于 0")
+	}
+	if c.EngineMaxAttempts < 1 || c.EngineMaxAttempts > 10 {
+		return errors.New("engine_max_attempts 必须在 1 到 10 之间")
+	}
+	if c.ArbiterMaxAttempts < 1 || c.ArbiterMaxAttempts > 10 {
+		return errors.New("arbiter_max_attempts 必须在 1 到 10 之间")
+	}
 	providers := make(map[string]struct{}, len(c.Providers))
 	refs := make(map[string]struct{})
 	for pi, provider := range c.Providers {
@@ -269,6 +342,9 @@ func fieldKeys() []string {
 	t := reflect.TypeOf(Config{})
 	keys := make([]string, 0, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Tag.Get("config") == "legacy" {
+			continue
+		}
 		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
 		if name != "" && name != "-" {
 			keys = append(keys, name)
@@ -279,6 +355,7 @@ func fieldKeys() []string {
 
 // write 原子落盘为缩进 JSON;配置内含 api_key,权限收紧到仅本用户可读写。
 func write(path string, cfg Config) error {
+	cfg = cfg.normalized()
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err

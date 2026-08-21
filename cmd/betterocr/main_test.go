@@ -55,6 +55,10 @@ func TestMigrateLegacyWebSettingsPrefersWebConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacyConfig := config.Default()
+	legacyConfig.EngineTimeoutSeconds = 0
+	legacyConfig.ArbiterTimeoutSeconds = 0
+	legacyConfig.EngineMaxAttempts = 0
+	legacyConfig.ArbiterMaxAttempts = 0
 	legacyConfig.TimeoutSeconds = 77
 	legacyDatabase["version"] = json.RawMessage("1")
 	legacyDatabase["settings"], err = json.Marshal(legacyConfig)
@@ -75,7 +79,7 @@ func TestMigrateLegacyWebSettingsPrefersWebConfiguration(t *testing.T) {
 
 	configPath := filepath.Join(root, "config.json")
 	current := config.Default()
-	current.TimeoutSeconds = 10
+	current.EngineTimeoutSeconds = 10
 	if err := config.Save(configPath, current); err != nil {
 		t.Fatal(err)
 	}
@@ -83,15 +87,18 @@ func TestMigrateLegacyWebSettingsPrefersWebConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !migrated || !reflect.DeepEqual(migratedConfig, legacyConfig) {
+	want := config.Default()
+	want.EngineTimeoutSeconds = 77
+	want.ArbiterTimeoutSeconds = 77
+	if !migrated || !reflect.DeepEqual(migratedConfig, want) {
 		t.Fatalf("migrated=%v config=%+v", migrated, migratedConfig)
 	}
 	loaded, _, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(loaded, legacyConfig) {
-		t.Fatalf("shared config=%+v want legacy Web config=%+v", loaded, legacyConfig)
+	if !reflect.DeepEqual(loaded, want) {
+		t.Fatalf("shared config=%+v want legacy Web config=%+v", loaded, want)
 	}
 	raw, err = os.ReadFile(databasePath)
 	if err != nil {

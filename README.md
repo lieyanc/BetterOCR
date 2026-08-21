@@ -91,7 +91,10 @@ go run ./cmd/betterocr invoice.png   # 首次运行:生成 data/config.json 后�
 	],
 	"engines": ["openai/gpt-4.1-mini", "openai/gpt-4o-mini"],
 	"arbiter": "anthropic/claude-sonnet-4-20250514",
-  "timeout_seconds": 120,
+  "engine_timeout_seconds": 120,
+  "arbiter_timeout_seconds": 120,
+  "engine_max_attempts": 2,
+  "arbiter_max_attempts": 2,
   "serve_addr": "127.0.0.1:8787"
 }
 ```
@@ -258,8 +261,11 @@ data/documents/<项目 ID>/
 | `models[].api`    | `openai-chat-completions`、`openai-responses` 或 `anthropic-messages` |
 | `engines`         | 基础模型引用数组;重复即多路采样(CLI 模式必填)              |
 | `arbiter`         | 仲裁模型引用;置空时争议句段等待人工合并                    |
-| `timeout_seconds` | 单次识别的端到端超时秒数,非正数按 120 处理                 |
-| `serve_addr`      | Web 模式监听地址,如 `127.0.0.1:8787`                       |
+| `engine_timeout_seconds`  | 每个基础模型每次尝试的独立超时秒数                         |
+| `arbiter_timeout_seconds` | 仲裁模型每次尝试的独立超时秒数                             |
+| `engine_max_attempts`     | 单个基础模型最大尝试次数,`1` 表示不重试                    |
+| `arbiter_max_attempts`    | 仲裁最大尝试次数,`1` 表示不重试                            |
+| `serve_addr`              | Web 模式监听地址,如 `127.0.0.1:8787`                       |
 
 启动时的配置文件处理:不存在 → 释放内置模板;缺字段 →
 按模板补全写回;解析或引用校验失败 → 报错且绝不改动原文件。不读取任何环境变量。
