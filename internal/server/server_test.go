@@ -470,3 +470,129 @@ func TestOCREscalationEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+func TestOCRStreamAutoArbitratesAllDisputesInOneRequest(t *testing.T) {
+	var mu sync.Mutex
+	arbiterCalls := 0
+	arbiterPrompt := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		content := map[string]string{
+			"tiny-a": "共同内容。发票编号042。应付金额128元。",
+			"tiny-b": "共同内容。发票编号O42。应付金额129元。",
+			"big":    "#1 发票编号042。\n#2 应付金额128元。",
+		}[req.Model]
+		if req.Model == "big" {
+			mu.Lock()
+			arbiterCalls++
+			arbiterPrompt = string(req.Messages[len(req.Messages)-1].Content)
+			mu.Unlock()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
+	body, contentType := multipartBody(t, testPNG(t), map[string]string{
+		"engines":        "test/tiny-a,test/tiny-b",
+		"arbiter":        "test/big",
+		"auto_arbitrate": "true",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/ocr/stream", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+
+	var final *arbiter.Final
+	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
+		var event streamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("invalid stream event %q: %v", line, err)
+		}
+		if event.Type == "result" {
+			final = event.Result
+		}
+	}
+	if final == nil {
+		t.Fatalf("stream did not return final result: %s", rec.Body)
+	}
+	if final.Stats.EscalatedSegments != 2 || final.Stats.FallbackSegments != 0 {
+		t.Fatalf("stats = %+v, want both disputes escalated", final.Stats)
+	}
+	if final.Text != "共同内容。\n发票编号042。\n应付金额128元。" {
+		t.Fatalf("text = %q", final.Text)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if arbiterCalls != 1 {
+		t.Fatalf("arbiter calls = %d, want one request for all disputes", arbiterCalls)
+	}
+	for _, want := range []string{"Disputed sentence segments (2)", "#1", "#2", "发票编号O42", "应付金额129元"} {
+		if !strings.Contains(arbiterPrompt, want) {
+			t.Errorf("arbiter prompt missing %q: %s", want, arbiterPrompt)
+		}
+	}
+}
+
+func TestOCRCanDeferAutomaticArbitration(t *testing.T) {
+	var mu sync.Mutex
+	arbiterCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+		}
+		if req.Model == "big" {
+			mu.Lock()
+			arbiterCalls++
+			mu.Unlock()
+		}
+		content := map[string]string{
+			"tiny-a": "发票编号042。",
+			"tiny-b": "发票编号O42。",
+			"big":    "#0 发票编号042。",
+		}[req.Model]
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := &Server{Config: serverConfig(upstream.URL, "server-key"), Timeout: 30 * time.Second}
+	rec := postOCR(t, srv.Handler(), testPNG(t), map[string]string{
+		"engines":        "test/tiny-a,test/tiny-b",
+		"arbiter":        "test/big",
+		"auto_arbitrate": "false",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	var final arbiter.Final
+	if err := json.Unmarshal(rec.Body.Bytes(), &final); err != nil {
+		t.Fatal(err)
+	}
+	if final.Stats.EscalatedSegments != 0 || final.Stats.FallbackSegments != 1 {
+		t.Fatalf("stats = %+v, want deferred dispute", final.Stats)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if arbiterCalls != 0 {
+		t.Fatalf("arbiter calls = %d, want none when automatic arbitration is disabled", arbiterCalls)
+	}
+}

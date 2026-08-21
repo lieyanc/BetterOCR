@@ -118,11 +118,32 @@ func (e *VisionEscalator) Resolve(ctx context.Context, image []byte, disputes []
 	if err != nil {
 		return nil, err
 	}
-	var out []arbiter.Resolution
+	expected := make(map[int]struct{}, len(disputes))
+	for _, dispute := range disputes {
+		expected[dispute.Segment] = struct{}{}
+	}
+	parsed := make(map[int]string, len(disputes))
 	for _, line := range strings.Split(stripFences(content), "\n") {
 		if segment, text, ok := parseRowLine(line); ok {
-			out = append(out, arbiter.Resolution{Segment: segment, Text: text})
+			if _, exists := expected[segment]; exists {
+				parsed[segment] = text
+			}
 		}
+	}
+	// 模型可能乱序、重复编号或夹带未请求的编号。批量仲裁的结果始终按
+	// 输入争议顺序返回,且每个争议最多一条,便于调用方一次性稳定回填。
+	out := make([]arbiter.Resolution, 0, len(parsed))
+	seen := make(map[int]struct{}, len(parsed))
+	for _, dispute := range disputes {
+		if _, exists := seen[dispute.Segment]; exists {
+			continue
+		}
+		text, exists := parsed[dispute.Segment]
+		if !exists {
+			continue
+		}
+		seen[dispute.Segment] = struct{}{}
+		out = append(out, arbiter.Resolution{Segment: dispute.Segment, Text: text})
 	}
 	// 一个句段编号都认不出来是真失败,必须报错:静默返回空会让全部争议
 	// 走本地兜底,而 Stats.EscalationErr 是空的——问题被藏起来了。

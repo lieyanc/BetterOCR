@@ -332,7 +332,7 @@ func TestEscalatorResolve(t *testing.T) {
 		gotBody = buf.String()
 		// 夹带寒暄与围栏,以及一行判定"图中不存在"的空裁定
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"output_text": "Sure, here you go:\n```\n#3 fixed line\n#4\n```",
+			"output_text": "Sure, here you go:\n```\n#4\n#99 ignore me\n#3 fixed line\n```",
 		})
 	}))
 	defer srv.Close()
@@ -341,13 +341,16 @@ func TestEscalatorResolve(t *testing.T) {
 	if esc.Name() != "arbiter:Vision (provider)" {
 		t.Errorf("Name = %q", esc.Name())
 	}
-	rs, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{{
-		Segment: 3, Before: "ctx above", After: "ctx below",
-		Candidates: []arbiter.Candidate{
-			{Agent: "a#1", Text: "f1xed line"},
-			{Agent: "b#1", Text: "fixed 1ine"},
+	rs, err := esc.Resolve(context.Background(), testPNG(t), []arbiter.Dispute{
+		{
+			Segment: 3, Before: "ctx above", After: "ctx below",
+			Candidates: []arbiter.Candidate{
+				{Agent: "a#1", Text: "f1xed line"},
+				{Agent: "b#1", Text: "fixed 1ine"},
+			},
 		},
-	}})
+		{Segment: 4, Candidates: []arbiter.Candidate{{Agent: "a#1", Text: "extra line"}}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

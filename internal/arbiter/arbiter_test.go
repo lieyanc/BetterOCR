@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/lieyanc/BetterOCR/internal/agent"
@@ -72,6 +73,41 @@ func TestFuseChineseSegmentsThreePaths(t *testing.T) {
 	wantStats := Stats{Engines: 3, Segments: 3, ConsensusSegments: 2, EscalatedSegments: 1, Escalator: "fake-arbiter"}
 	if final.Stats != wantStats {
 		t.Fatalf("stats = %+v, want %+v", final.Stats, wantStats)
+	}
+}
+
+func TestFuseBatchesAllDisputesInOneEscalation(t *testing.T) {
+	esc := &fakeEsc{fn: func(disputes []Dispute) ([]Resolution, error) {
+		resolutions := make([]Resolution, 0, len(disputes))
+		for _, dispute := range disputes {
+			resolutions = append(resolutions, Resolution{
+				Segment: dispute.Segment,
+				Text:    "裁定:" + dispute.Candidates[0].Text,
+			})
+		}
+		return resolutions, nil
+	}}
+	fuser := New()
+	fuser.Escalator = esc
+	final := fuser.Fuse(context.Background(), []byte("image"), []agent.Result{
+		result("a", "共同内容。发票编号042。应付金额128元。"),
+		result("b", "共同内容。发票编号O42。应付金额129元。"),
+	})
+
+	if len(esc.calls) != 1 {
+		t.Fatalf("arbiter calls = %d, want exactly one batch", len(esc.calls))
+	}
+	if got := esc.calls[0]; len(got) != 2 || got[0].Segment != 1 || got[1].Segment != 2 {
+		t.Fatalf("batched disputes = %+v, want segments 1 and 2", got)
+	}
+	if final.Stats.EscalatedSegments != 2 || final.Stats.FallbackSegments != 0 {
+		t.Fatalf("stats = %+v, want both disputes escalated", final.Stats)
+	}
+	for _, index := range []int{1, 2} {
+		segment := final.Segments[index]
+		if segment.Source != SourceEscalated || !strings.HasPrefix(segment.Text, "裁定:") {
+			t.Fatalf("segment %d = %+v, want escalated resolution", index, segment)
+		}
 	}
 }
 
