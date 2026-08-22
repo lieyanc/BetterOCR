@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/lieyanc/BetterOCR/internal/config"
@@ -41,6 +42,14 @@ func TestAuthenticationAndRoleGuards(t *testing.T) {
 	h.ServeHTTP(readerAdminRec, readerAdmin)
 	if readerAdminRec.Code != http.StatusForbidden {
 		t.Fatalf("reader admin status = %d body=%s", readerAdminRec.Code, readerAdminRec.Body)
+	}
+	selectionBody := bytes.NewReader([]byte(`{"engines":["test/tiny-a"],"arbiter":"","duplicate_checker":""}`))
+	readerSelection := requestWithAuth(http.MethodPut, "/api/admin/model-selection", selectionBody, readerCookie, readerCSRF)
+	readerSelection.Header.Set("Content-Type", "application/json")
+	readerSelectionRec := httptest.NewRecorder()
+	h.ServeHTTP(readerSelectionRec, readerSelection)
+	if readerSelectionRec.Code != http.StatusForbidden {
+		t.Fatalf("reader model selection status = %d body=%s", readerSelectionRec.Code, readerSelectionRec.Body)
 	}
 
 	createBody, _ := json.Marshal(map[string]any{"username": "second", "password": "second-password", "role": "user"})
@@ -193,6 +202,66 @@ func TestAdminSettingsPersistToSharedConfigOnly(t *testing.T) {
 	}
 	if bytes.Contains(databaseJSON, []byte(`"settings"`)) || bytes.Contains(databaseJSON, []byte("server-key")) {
 		t.Fatalf("configuration leaked into database: %s", databaseJSON)
+	}
+}
+
+func TestAdminModelSelectionPersistsWithoutOverwritingOtherSettings(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	cfg := serverConfig("http://127.0.0.1:1", "server-key")
+	cfg.ServeAddr = "127.0.0.1:8787"
+	cfg.EngineTimeoutSeconds = 37
+	cfg.ArbiterTimeoutSeconds = 53
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	savedConfig, _, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := database.Open(filepath.Join(root, "database.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Config: savedConfig, ConfigPath: configPath, Store: store}
+	handler := srv.Handler()
+	cookie, csrf := setupForTest(t, handler, "admin", "admin-password")
+
+	body := bytes.NewReader([]byte(`{"engines":["test/tiny-b"],"arbiter":"test/big","duplicate_checker":"test/tiny-a"}`))
+	request := requestWithAuth(http.MethodPut, "/api/admin/model-selection", body, cookie, csrf)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update model selection status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "server-key") {
+		t.Fatal("model selection response leaks the API key")
+	}
+
+	loaded, _, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := srv.currentConfig()
+	for name, got := range map[string]config.Config{"file": loaded, "server": current} {
+		if len(got.Engines) != 1 || got.Engines[0] != "test/tiny-b" ||
+			got.Arbiter != "test/big" || got.DuplicateChecker != "test/tiny-a" {
+			t.Errorf("%s model selection = %+v", name, got)
+		}
+		if got.Providers[0].APIKey != "server-key" || got.ServeAddr != "127.0.0.1:8787" ||
+			got.EngineTimeoutSeconds != 37 || got.ArbiterTimeoutSeconds != 53 {
+			t.Errorf("%s unrelated settings changed: %+v", name, got)
+		}
+	}
+
+	badBody := bytes.NewReader([]byte(`{"engines":["test/missing"],"arbiter":"","duplicate_checker":""}`))
+	badRequest := requestWithAuth(http.MethodPut, "/api/admin/model-selection", badBody, cookie, csrf)
+	badRequest.Header.Set("Content-Type", "application/json")
+	badRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(badRecorder, badRequest)
+	if badRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid model selection status=%d body=%s", badRecorder.Code, badRecorder.Body.String())
 	}
 }
 

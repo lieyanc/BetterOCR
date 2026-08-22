@@ -100,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/admin/users/{id}", s.requireAdmin(http.HandlerFunc(s.handleDeleteUser)))
 	mux.Handle("GET /api/admin/settings", s.requireAdmin(http.HandlerFunc(s.handleAdminSettings)))
 	mux.Handle("PUT /api/admin/settings", s.requireAdmin(http.HandlerFunc(s.handleUpdateAdminSettings)))
+	mux.Handle("PUT /api/admin/model-selection", s.requireAdmin(http.HandlerFunc(s.handleUpdateAdminModelSelection)))
 	// 只读的版本信息不鉴权(便于探活与排障);三个变更动作全部要求管理员,
 	// 状态查询同样限管理员,与本项目其余接口的一致口径。
 	mux.HandleFunc("GET /api/version", s.handleVersion)

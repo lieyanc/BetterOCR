@@ -79,6 +79,12 @@ export interface ServerConfig {
   arbiter_max_attempts: number
 }
 
+export interface ModelSelectionSettings {
+  engines: string[]
+  arbiter: string
+  duplicate_checker: string
+}
+
 export type UserRole = "admin" | "user"
 
 export interface User {
@@ -320,6 +326,17 @@ export async function updateAdminSettings(
     "PUT",
     settings,
     "保存系统设置",
+  )
+}
+
+export async function updateAdminModelSelection(
+  settings: ModelSelectionSettings,
+): Promise<ModelSelectionSettings> {
+  return requestJSON<ModelSelectionSettings>(
+    "/api/admin/model-selection",
+    "PUT",
+    settings,
+    "保存默认模型配置",
   )
 }
 

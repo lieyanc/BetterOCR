@@ -16,6 +16,7 @@ import {
   fetchSession,
   fetchSetupStatus,
   logout,
+  updateAdminModelSelection,
   type AuthSession,
   type ServerConfig,
 } from "@/lib/api"
@@ -178,11 +179,32 @@ function OCRWorkspace({
     return index
   }, [cfg])
 
-  const applyModelSelection = (
+  const applyModelSelection = async (
     nextEngines: string[],
     nextArbiter: string,
     nextDuplicateChecker: string,
+    saveAsDefault: boolean,
   ) => {
+    if (saveAsDefault) {
+      const saved = await updateAdminModelSelection({
+        engines: nextEngines,
+        arbiter: nextArbiter,
+        duplicate_checker: nextDuplicateChecker,
+      })
+      nextEngines = saved.engines
+      nextArbiter = saved.arbiter
+      nextDuplicateChecker = saved.duplicate_checker
+      setCfg((current) =>
+        current
+          ? {
+              ...current,
+              engines: saved.engines,
+              arbiter: saved.arbiter,
+              duplicate_checker: saved.duplicate_checker,
+            }
+          : current,
+      )
+    }
     setEngines(nextEngines)
     setArbiter(nextArbiter)
     setDuplicateChecker(nextDuplicateChecker)
@@ -222,6 +244,7 @@ function OCRWorkspace({
               engines={engines}
               arbiter={arbiter}
               duplicateChecker={duplicateChecker}
+              canSaveDefaults={session.user.role === "admin"}
               onApply={applyModelSelection}
             />
             <Badge variant="outline" className="hidden md:inline-flex">

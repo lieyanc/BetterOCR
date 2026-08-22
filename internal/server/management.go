@@ -116,6 +116,55 @@ func (s *Server) handleUpdateAdminSettings(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, saved)
 }
 
+type modelSelectionSettings struct {
+	Engines          []string `json:"engines"`
+	Arbiter          string   `json:"arbiter"`
+	DuplicateChecker string   `json:"duplicate_checker"`
+}
+
+func (s *Server) handleUpdateAdminModelSelection(w http.ResponseWriter, r *http.Request) {
+	var selection modelSelectionSettings
+	if err := decodeJSON(w, r, &selection); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(selection.Engines) == 0 {
+		writeErr(w, http.StatusBadRequest, "请至少选择一个基础模型")
+		return
+	}
+	if strings.TrimSpace(s.ConfigPath) == "" {
+		writeErr(w, http.StatusInternalServerError, "服务端未配置配置文件路径")
+		return
+	}
+	for i := range selection.Engines {
+		selection.Engines[i] = strings.TrimSpace(selection.Engines[i])
+	}
+	selection.Arbiter = strings.TrimSpace(selection.Arbiter)
+	selection.DuplicateChecker = strings.TrimSpace(selection.DuplicateChecker)
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	next := s.Config
+	next.Engines = append([]string(nil), selection.Engines...)
+	next.Arbiter = selection.Arbiter
+	next.DuplicateChecker = selection.DuplicateChecker
+	if err := config.Save(s.ConfigPath, next); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	saved, _, err := config.Load(s.ConfigPath)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "重新加载配置失败: "+err.Error())
+		return
+	}
+	s.Config = saved
+	writeJSON(w, http.StatusOK, modelSelectionSettings{
+		Engines:          append([]string(nil), saved.Engines...),
+		Arbiter:          saved.Arbiter,
+		DuplicateChecker: saved.DuplicateChecker,
+	})
+}
+
 func (s *Server) startTask(w http.ResponseWriter, r *http.Request, runConfig pipeline.Config) (string, bool) {
 	if s.Store == nil {
 		return "", true

@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { KeyRound, Settings2 } from "lucide-react"
+import { KeyRound, Loader2, Settings2 } from "lucide-react"
 
 import type { ModelAPI, ServerConfig } from "@/lib/api"
 import { Badge } from "@/components/ui/badge"
@@ -18,6 +18,7 @@ import {
   Field,
   FieldContent,
   FieldDescription,
+  FieldError,
   FieldGroup,
   FieldLabel,
   FieldLegend,
@@ -60,11 +61,13 @@ interface ModelConfigDialogProps {
   engines: string[]
   arbiter: string
   duplicateChecker: string
+  canSaveDefaults?: boolean
   onApply: (
     engines: string[],
     arbiter: string,
     duplicateChecker: string,
-  ) => void
+    saveAsDefault: boolean,
+  ) => Promise<void> | void
 }
 
 export function ModelConfigDialog({
@@ -72,6 +75,7 @@ export function ModelConfigDialog({
   engines,
   arbiter,
   duplicateChecker,
+  canSaveDefaults = false,
   onApply,
 }: ModelConfigDialogProps) {
   const [open, setOpen] = useState(false)
@@ -79,12 +83,17 @@ export function ModelConfigDialog({
   const [draftArbiter, setDraftArbiter] = useState(arbiter)
   const [draftDuplicateChecker, setDraftDuplicateChecker] =
     useState(duplicateChecker)
+  const [saveAsDefault, setSaveAsDefault] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState("")
 
   const handleOpenChange = (next: boolean) => {
     if (next) {
       setDraftEngines(engines)
       setDraftArbiter(arbiter)
       setDraftDuplicateChecker(duplicateChecker)
+      setSaveAsDefault(false)
+      setError("")
     }
     setOpen(next)
   }
@@ -93,6 +102,24 @@ export function ModelConfigDialog({
     setDraftEngines((current) =>
       checked ? [...current, ref] : current.filter((item) => item !== ref),
     )
+  }
+
+  const apply = async () => {
+    setSaving(true)
+    setError("")
+    try {
+      await onApply(
+        draftEngines,
+        draftArbiter,
+        draftDuplicateChecker,
+        saveAsDefault,
+      )
+      setOpen(false)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "保存模型配置失败")
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -164,6 +191,7 @@ export function ModelConfigDialog({
                           <Checkbox
                             id={`engine-${ref}`}
                             checked={checked}
+                            disabled={saving}
                             onCheckedChange={(value) =>
                               toggleEngine(ref, value === true)
                             }
@@ -203,6 +231,7 @@ export function ModelConfigDialog({
           <FieldLabel htmlFor="arbiter-model">仲裁模型</FieldLabel>
           <Select
             value={draftArbiter || noArbiter}
+            disabled={saving}
             onValueChange={(value) =>
               setDraftArbiter(value === noArbiter ? "" : value)
             }
@@ -237,6 +266,7 @@ export function ModelConfigDialog({
           </FieldLabel>
           <Select
             value={draftDuplicateChecker || noArbiter}
+            disabled={saving}
             onValueChange={(value) =>
               setDraftDuplicateChecker(value === noArbiter ? "" : value)
             }
@@ -265,13 +295,32 @@ export function ModelConfigDialog({
           </Select>
         </Field>
 
-        <DialogFooter className="shrink-0 items-center sm:justify-between">
-          <p className="text-xs text-muted-foreground">
-            已选 {draftEngines.length} 个基础模型
-          </p>
+        <DialogFooter className="shrink-0 sm:items-end sm:justify-between">
+          <div className="flex min-w-0 flex-1 flex-col gap-2">
+            <p className="text-xs text-muted-foreground">
+              已选 {draftEngines.length} 个基础模型
+            </p>
+            {canSaveDefaults && (
+              <Field orientation="horizontal" className="w-fit">
+                <Checkbox
+                  id="save-model-selection-defaults"
+                  checked={saveAsDefault}
+                  onCheckedChange={(checked) =>
+                    setSaveAsDefault(checked === true)
+                  }
+                  disabled={saving}
+                />
+                <FieldLabel htmlFor="save-model-selection-defaults">
+                  写入服务端配置并设为用户默认
+                </FieldLabel>
+              </Field>
+            )}
+            <FieldError>{error}</FieldError>
+          </div>
           <div className="flex gap-2">
             <Button
               variant="outline"
+              disabled={saving}
               onClick={() => {
                 setDraftEngines(config?.engines ?? [])
                 setDraftArbiter(config?.arbiter ?? "")
@@ -281,17 +330,17 @@ export function ModelConfigDialog({
               恢复默认
             </Button>
             <Button
-              disabled={draftEngines.length === 0}
-              onClick={() => {
-                onApply(
-                  draftEngines,
-                  draftArbiter,
-                  draftDuplicateChecker,
-                )
-                setOpen(false)
-              }}
+              disabled={draftEngines.length === 0 || saving}
+              onClick={() => void apply()}
             >
-              应用
+              {saving && (
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+              )}
+              {saving
+                ? "正在保存"
+                : saveAsDefault
+                  ? "保存并应用"
+                  : "应用"}
             </Button>
           </div>
         </DialogFooter>
