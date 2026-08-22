@@ -113,15 +113,15 @@ export function ModelConfigDialog({
         </TooltipTrigger>
         <TooltipContent>模型配置</TooltipContent>
       </Tooltip>
-      <DialogContent className="flex max-h-[calc(100vh-2rem)] flex-col sm:max-w-2xl">
-        <DialogHeader>
+      <DialogContent className="flex h-[min(46rem,calc(100dvh-2rem))] flex-col overflow-hidden sm:max-w-2xl">
+        <DialogHeader className="shrink-0">
           <DialogTitle>模型配置</DialogTitle>
           <DialogDescription>
             从服务端配置的 Provider 中选择并发识别模型与分歧仲裁模型。
           </DialogDescription>
         </DialogHeader>
 
-        <ScrollArea className="h-[min(52vh,30rem)] min-h-0 flex-1 pr-3 sm:h-[min(58vh,34rem)]">
+        <ScrollArea className="min-h-0 flex-1 overflow-hidden pr-3">
           <FieldSet className="gap-5">
             <FieldLegend className="sr-only">基础模型</FieldLegend>
             {config?.providers.map((provider) => (
@@ -199,7 +199,7 @@ export function ModelConfigDialog({
           </FieldSet>
         </ScrollArea>
 
-        <Field>
+        <Field className="shrink-0">
           <FieldLabel htmlFor="arbiter-model">仲裁模型</FieldLabel>
           <Select
             value={draftArbiter || noArbiter}
@@ -231,7 +231,7 @@ export function ModelConfigDialog({
           </Select>
         </Field>
 
-        <Field>
+        <Field className="shrink-0">
           <FieldLabel htmlFor="duplicate-checker-model">
             Fast Model
           </FieldLabel>
@@ -265,7 +265,7 @@ export function ModelConfigDialog({
           </Select>
         </Field>
 
-        <DialogFooter className="items-center sm:justify-between">
+        <DialogFooter className="shrink-0 items-center sm:justify-between">
           <p className="text-xs text-muted-foreground">
             已选 {draftEngines.length} 个基础模型
           </p>
