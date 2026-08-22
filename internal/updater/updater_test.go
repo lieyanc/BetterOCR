@@ -412,11 +412,13 @@ func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 }
 
-// TestApplyUpdateChecksInstallDirBeforeShuttingDown pins the ordering that
-// keeps a doomed update from costing an outage: BeforeExec tears down the HTTP
-// listener, so an unwritable install directory has to be detected before it
-// runs. Otherwise the swap fails with the service already stopped.
-func TestApplyUpdateChecksInstallDirBeforeShuttingDown(t *testing.T) {
+// TestPreflightApplyRejectsUnwritableInstallDirWithoutNotifying pins two
+// properties of the pre-apply check. It has to run before BeforeExec, because
+// that hook tears down the HTTP listener and an unwritable install directory
+// would otherwise cost an outage. And it must not report an exec failure: the
+// host is still serving and nobody is waiting on that channel, so a buffered
+// error would sit there and abort the next successful restart instead.
+func TestPreflightApplyRejectsUnwritableInstallDirWithoutNotifying(t *testing.T) {
 	installDir := t.TempDir()
 	fakeExec := filepath.Join(installDir, "betterocr")
 	if err := os.WriteFile(fakeExec, []byte("binary"), 0o755); err != nil {
@@ -432,26 +434,38 @@ func TestApplyUpdateChecksInstallDirBeforeShuttingDown(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(installDir, 0o700) })
 
 	u := testUpdater(Config{})
-	shutdownCalled := false
-	u.hooks.BeforeExec = func(string) error {
-		shutdownCalled = true
-		return nil
+	shutdownCalled, notified := false, false
+	u.hooks.BeforeExec = func(string) error { shutdownCalled = true; return nil }
+	u.hooks.OnExecFailure = func(error) { notified = true }
+
+	u.status.State = "ready"
+	u.pendingBinaryPath = filepath.Join(t.TempDir(), "betterocr-dev")
+	u.pendingTag = "dev"
+	if err := u.ApplyPending(context.Background()); err != nil {
+		t.Fatalf("ApplyPending returned error: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && u.Status().State != "failed" {
+		time.Sleep(20 * time.Millisecond)
 	}
 
-	err := u.applyUpdate(filepath.Join(t.TempDir(), "betterocr-dev"), "dev")
-	if err == nil || !strings.Contains(err.Error(), "not writable") {
-		t.Fatalf("applyUpdate error = %v, want one reporting an unwritable install directory", err)
+	status := u.Status()
+	if status.State != "failed" || !strings.Contains(status.Error, "not writable") {
+		t.Fatalf("status = %+v, want failed with an unwritable-directory error", status)
 	}
 	if shutdownCalled {
-		t.Fatal("BeforeExec ran despite a known-unwritable install directory, so the listener closed for nothing")
+		t.Error("BeforeExec ran despite a known-unwritable install directory, so the listener closed for nothing")
+	}
+	if notified {
+		t.Error("OnExecFailure fired while the server was still serving; that error would abort the next restart")
 	}
 
 	// 目录恢复可写后同一个检查必须放行,否则等于永久禁用自更新。
 	if err := os.Chmod(installDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkInstallDirWritable(); err != nil {
-		t.Fatalf("checkInstallDirWritable on a writable directory = %v", err)
+	if err := u.preflightApply(); err != nil {
+		t.Fatalf("preflightApply on a writable directory = %v", err)
 	}
 	left, err := os.ReadDir(installDir)
 	if err != nil {

@@ -219,6 +219,10 @@ func (u *Updater) ApplyPending(_ context.Context) error {
 			u.setError("apply canceled while waiting for idle: " + err.Error())
 			return
 		}
+		if err := u.preflightApply(); err != nil {
+			u.setError("apply failed: " + err.Error())
+			return
+		}
 		if err := u.applyUpdate(path, tag); err != nil {
 			u.notifyExecFailure(err)
 			u.setError("apply failed: " + err.Error())
@@ -358,6 +362,10 @@ func (u *Updater) performUpdate(ctx context.Context) {
 		u.mu.Unlock()
 		if err := u.waitForIdle(ctx); err != nil {
 			u.setError("apply canceled while waiting for idle: " + err.Error())
+			return
+		}
+		if err := u.preflightApply(); err != nil {
+			u.setError("apply failed: " + err.Error())
 			return
 		}
 		if err := u.applyUpdate(binaryPath, release.TagName); err != nil {
@@ -940,17 +948,21 @@ func (u *Updater) applyUpdate(newBinaryPath, tag string) error {
 	u.status.Progress = progressApplying
 	u.mu.Unlock()
 
-	// 换二进制靠在安装目录里改名,先探一次可写性。等 BeforeExec 关掉监听之后
-	// 才发现目录只读,一次本该只是报错的更新就变成了服务中断;Windows 更糟,
-	// 换文件的脚本在进程退出后才跑,失败时没人再把服务拉起来。
-	if err := checkInstallDirWritable(); err != nil {
-		return err
-	}
-
 	if runtime.GOOS == "windows" {
 		return u.applyUpdateWindows(newBinaryPath, tag)
 	}
 	return u.applyUpdateUnix(newBinaryPath, tag)
+}
+
+// preflightApply 在关闭监听之前检查换二进制必需的前提条件。它的失败不算
+// "进程替换失败":监听还在、宿主也没在等 exec 结果,所以调用方只能记错误,
+// 绝不能通知 OnExecFailure —— 那个错误会一直留在 channel 里,把下一次本来
+// 成功的更新变成启动失败。
+func (u *Updater) preflightApply() error {
+	// 换二进制靠在安装目录里改名。等 BeforeExec 关掉监听之后才发现目录只读,
+	// 一次本该只是报错的更新就变成了服务中断;Windows 更糟,换文件的脚本在
+	// 进程退出后才跑,失败时没人再把服务拉起来。
+	return checkInstallDirWritable()
 }
 
 // executablePath 指向当前进程的可执行文件,测试里换成临时目录中的假二进制。

@@ -185,6 +185,12 @@ func runServe(cfg config.Config, configPath, databasePath string) {
 		log.New(os.Stderr, "", log.LstdFlags),
 		updater.RestartHooks{
 			BeforeExec: func(tag string) error {
+				// 关闭监听后 main 会阻塞读 restartErr,所以先把可能残留的旧
+				// 错误倒掉:否则一次早先失败的更新会让这次成功的重启误判。
+				select {
+				case <-restartErr:
+				default:
+				}
 				// 停后台检查并优雅关闭监听,再交出进程镜像。
 				cancelBackground()
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)

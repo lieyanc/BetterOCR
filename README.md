@@ -362,7 +362,7 @@ push v* tag     → meta          → test → build             → release-pro
 - 无启动崩溃自动回滚:备份在 exec 前就已删除。
 - 二进制所在目录必须可写(换文件靠在该目录里改名)。不可写时更新在关闭监听
   **之前**就失败,服务继续正常提供,状态显示 `apply failed: install directory
-  ... is not writable`;下一次周期检查会重试,期间会重新下载一次。
+  ... is not writable`;修好权限后重试即可,无需重启进程。
 - 本地裸编译(`Version == "dev"`)总被判定为"有更新",这是刻意的。
 - `source: github` 拿不到 Release 说明(那是 REST API 数据),界面显示"暂无发布说明"。
 
