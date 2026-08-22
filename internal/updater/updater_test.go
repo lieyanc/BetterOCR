@@ -143,6 +143,64 @@ func TestCheckOnlyAcrossSourcesAndChannels(t *testing.T) {
 	}
 }
 
+// TestCheckOnlyFallsBackToTargetCommitish covers the degraded proxy path seen
+// in production: the mirror rate-limits version.json, so the only commit left
+// is the release's target_commitish — a full 40-character SHA that has to be
+// compared against the short SHA baked in by ldflags. Getting this wrong makes
+// the client re-download the same release on every check, forever.
+func TestCheckOnlyFallsBackToTargetCommitish(t *testing.T) {
+	const fullSHA = "4fe05ea4cd9e60136ed3e216aa392da242d2c735"
+	cases := []struct {
+		name         string
+		localCommit  string
+		metadataCode int
+		wantUpdate   bool
+	}{
+		{"same commit as running build", fullSHA[:7], http.StatusTooManyRequests, false},
+		{"different commit", "old0000", http.StatusTooManyRequests, true},
+		{"same commit with version.json missing", fullSHA[:7], http.StatusNotFound, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestVersion(t, "dev-0001-20260822-"+tc.localCommit, tc.localCommit)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/releases/owner/repo/dev":
+					_ = json.NewEncoder(w).Encode(releaseInfo{
+						TagName:         "dev",
+						TargetCommitish: fullSHA,
+						Prerelease:      true,
+						Assets: []assetInfo{{
+							Name:               "version.json",
+							BrowserDownloadURL: "https://github.com/owner/repo/releases/download/dev/version.json",
+						}},
+					})
+				case "/download/owner/repo/dev/version.json":
+					w.WriteHeader(tc.metadataCode)
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+
+			result, err := testUpdater(Config{
+				Channel: "dev", Source: "proxy", ProxyBaseURL: server.URL, Repo: "owner/repo",
+			}).CheckOnly(context.Background())
+			if err != nil {
+				t.Fatalf("CheckOnly returned error: %v", err)
+			}
+			if result.HasUpdate != tc.wantUpdate {
+				t.Fatalf("HasUpdate = %v, want %v (result %+v)", result.HasUpdate, tc.wantUpdate, result)
+			}
+			// 展示版本降级成 tag 是可以接受的,但不能因此误判要不要更新。
+			if result.LatestVersion != "dev" {
+				t.Fatalf("LatestVersion = %q, want the tag as a fallback", result.LatestVersion)
+			}
+		})
+	}
+}
+
 func TestCheckOnlyReportsNoReleaseWithoutError(t *testing.T) {
 	setTestVersion(t, "v1.0.0", "")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
