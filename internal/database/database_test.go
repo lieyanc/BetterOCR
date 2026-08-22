@@ -178,8 +178,57 @@ func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
 		t.Fatalf("recovery = %+v", recovery)
 	}
 	recovered, ok := reopened.Document(processing.ID)
-	if !ok || recovered.Status != DocumentReady || recovered.Pages[0].Status != PageCompleted || recovered.Pages[1].Status != PageQueued {
+	if !ok || recovered.Status != DocumentProcessing || recovered.Pages[0].Status != PageCompleted || recovered.Pages[1].Status != PageQueued {
 		t.Fatalf("recovered = %+v ok=%v", recovered, ok)
+	}
+}
+
+func TestOpenMigratesIdleQueuedPagesToReady(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := store.InitializeAdmin("admin", "admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idle, err := store.CreateDocument(admin, "idle.pdf", "pdf", "application/pdf", 1, []string{"openai/test"}, "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateDocument(idle.ID, func(document *DocumentProject) error {
+		document.Status = DocumentReady
+		document.Pages = []DocumentPage{{ID: "page-000001", Status: PageQueued, ImageReady: true}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy data
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Version = 2
+	raw, err = json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, ok := migrated.Document(idle.ID)
+	if !ok || document.Pages[0].Status != PageReady {
+		t.Fatalf("migrated document = %+v, ok=%v", document, ok)
 	}
 }
 

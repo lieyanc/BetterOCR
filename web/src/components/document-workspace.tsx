@@ -12,6 +12,8 @@ import {
   FileText,
   FolderOpen,
   ListChecks,
+  ListPlus,
+  ListX,
   Loader2,
   Play,
   RotateCcw,
@@ -54,6 +56,7 @@ import {
 } from "@/components/ui/tooltip"
 import {
   cancelDocument,
+  dequeueDocumentPages,
   deleteDocument,
   deleteDocumentPage,
   documentExportURL,
@@ -62,6 +65,7 @@ import {
   fetchDocumentDisputes,
   fetchDocumentPageResult,
   fetchDocuments,
+  queueDocumentPages,
   runDocument,
   streamDocumentProgress,
   updateDocumentPageOrder,
@@ -92,6 +96,7 @@ export function DocumentWorkspace({
   const [loadingProjects, setLoadingProjects] = useState(true)
   const [openingProject, setOpeningProject] = useState(false)
   const [selectedPageID, setSelectedPageID] = useState("")
+  const [managedPageIDs, setManagedPageIDs] = useState<string[]>([])
   const [selectedResult, setSelectedResult] = useState<Final | null>(null)
   const [selectedImage, setSelectedImage] = useState<File | null>(null)
   const [loadingPage, setLoadingPage] = useState(false)
@@ -149,6 +154,9 @@ export function DocumentWorkspace({
         ? current
         : (next.pages?.[0]?.id ?? ""),
     )
+    setManagedPageIDs((current) =>
+      current.filter((id) => next.pages?.some((page) => page.id === id)),
+    )
   }, [])
 
   const openProject = useCallback(
@@ -157,6 +165,7 @@ export function DocumentWorkspace({
       setError("")
       setView("page")
       setOpenDisputes(false)
+      setManagedPageIDs([])
       try {
         mergeProject(await fetchDocument(id))
       } catch (cause) {
@@ -250,6 +259,28 @@ export function DocumentWorkspace({
   const selectedPage = project?.pages?.[selectedIndex] ?? null
   const selectedPageProgress =
     liveProgress?.page_id === selectedPage?.id ? liveProgress : null
+  const manageablePages =
+    project?.pages?.filter(
+      (page) =>
+        page.image_ready &&
+        page.status !== "preparing" &&
+        page.status !== "processing",
+    ) ?? []
+  const managedPages = manageablePages.filter((page) =>
+    managedPageIDs.includes(page.id),
+  )
+  const runnableManagedPageIDs = managedPages
+    .filter((page) => page.status !== "queued")
+    .map((page) => page.id)
+  const queuedManagedPageIDs = managedPages
+    .filter((page) => page.status === "queued")
+    .map((page) => page.id)
+  const failedPageIDs =
+    project?.pages
+      ?.filter((page) => page.status === "failed")
+      .map((page) => page.id) ?? []
+  const queuedPageCount =
+    project?.pages?.filter((page) => page.status === "queued").length ?? 0
 
   useEffect(() => {
     setSelectedResult(null)
@@ -379,6 +410,55 @@ export function DocumentWorkspace({
           duplicateChecker,
           autoArbitrate,
         }),
+      )
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setAction("")
+    }
+  }
+
+  const pageQueueSettings = () =>
+    project?.status === "processing"
+      ? {
+          engines: project.engines,
+          arbiter: project.arbiter ?? "",
+          duplicateChecker: project.duplicate_checker ?? "",
+          autoArbitrate: project.auto_arbitrate,
+        }
+      : { engines, arbiter, duplicateChecker, autoArbitrate }
+
+  const queuePages = async (pageIDs: string[], actionName: string) => {
+    if (!project || pageIDs.length === 0 || action) return
+    const settings = pageQueueSettings()
+    if (settings.engines.length === 0) {
+      setError("请至少选择一个基础模型")
+      return
+    }
+    setAction(actionName)
+    setError("")
+    try {
+      mergeProject(
+        await queueDocumentPages(project.id, pageIDs, settings),
+      )
+      setManagedPageIDs((current) =>
+        current.filter((id) => !pageIDs.includes(id)),
+      )
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setAction("")
+    }
+  }
+
+  const dequeuePages = async (pageIDs: string[]) => {
+    if (!project || pageIDs.length === 0 || action) return
+    setAction("dequeue-pages")
+    setError("")
+    try {
+      mergeProject(await dequeueDocumentPages(project.id, pageIDs))
+      setManagedPageIDs((current) =>
+        current.filter((id) => !pageIDs.includes(id)),
       )
     } catch (cause) {
       setError(errorMessage(cause))
@@ -625,6 +705,26 @@ export function DocumentWorkspace({
                     自动仲裁
                   </FieldLabel>
                 </Field>
+                {failedPageIDs.length > 0 && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() =>
+                      void queuePages(failedPageIDs, "retry-failed-pages")
+                    }
+                  >
+                    {action === "retry-failed-pages" ? (
+                      <Loader2
+                        data-icon="inline-start"
+                        className="animate-spin"
+                      />
+                    ) : (
+                      <RotateCcw data-icon="inline-start" />
+                    )}
+                    重试失败页 ({failedPageIDs.length})
+                  </Button>
+                )}
                 {project.status === "processing" ? (
                   <Button
                     variant="outline"
@@ -686,11 +786,25 @@ export function DocumentWorkspace({
               </Empty>
             ) : project.pages && project.pages.length > 0 ? (
               <div className="grid min-w-0 gap-4 lg:grid-cols-[14rem_minmax(0,1fr)]">
+                <PageQueueToolbar
+                  pages={project.pages}
+                  selectedCount={managedPages.length}
+                  runnableCount={runnableManagedPageIDs.length}
+                  queuedSelectedCount={queuedManagedPageIDs.length}
+                  queuedCount={queuedPageCount}
+                  busy={busy}
+                  onQueue={() =>
+                    void queuePages(runnableManagedPageIDs, "queue-pages")
+                  }
+                  onDequeue={() => void dequeuePages(queuedManagedPageIDs)}
+                />
                 <PageNavigator
                   pages={project.pages}
                   documentID={project.id}
                   selectedPageID={selectedPageID}
-                  busy={
+                  managedPageIDs={managedPageIDs}
+                  busy={busy || project.status === "preparing"}
+                  structureBusy={
                     busy ||
                     project.status === "preparing" ||
                     project.status === "processing"
@@ -699,6 +813,20 @@ export function DocumentWorkspace({
                     setOpenDisputes(false)
                     setSelectedPageID(id)
                   }}
+                  onManage={(id, checked) =>
+                    setManagedPageIDs((current) =>
+                      checked
+                        ? current.includes(id)
+                          ? current
+                          : [...current, id]
+                        : current.filter((candidate) => candidate !== id),
+                    )
+                  }
+                  onManageAll={(checked) =>
+                    setManagedPageIDs(
+                      checked ? manageablePages.map((page) => page.id) : [],
+                    )
+                  }
                   onMove={(direction) => void movePage(direction)}
                   onRemove={() => void removePage()}
                 />
@@ -752,6 +880,64 @@ export function DocumentWorkspace({
                           </span>
                         ) : null}
                         <PageStatusBadge page={selectedPage} />
+                        {selectedPage.status === "queued" ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="取消本页排队"
+                                disabled={busy}
+                                onClick={() =>
+                                  void dequeuePages([selectedPage.id])
+                                }
+                              >
+                                {action === "dequeue-pages" ? (
+                                  <Loader2 className="animate-spin" />
+                                ) : (
+                                  <ListX />
+                                )}
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>取消本页排队</TooltipContent>
+                          </Tooltip>
+                        ) : selectedPage.image_ready &&
+                          selectedPage.status !== "preparing" &&
+                          selectedPage.status !== "processing" ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label={
+                                  selectedPage.status === "ready"
+                                    ? "识别本页"
+                                    : "重新识别本页"
+                                }
+                                disabled={busy}
+                                onClick={() =>
+                                  void queuePages(
+                                    [selectedPage.id],
+                                    "queue-current-page",
+                                  )
+                                }
+                              >
+                                {action === "queue-current-page" ? (
+                                  <Loader2 className="animate-spin" />
+                                ) : selectedPage.status === "ready" ? (
+                                  <Play />
+                                ) : (
+                                  <RotateCcw />
+                                )}
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {selectedPage.status === "ready"
+                                ? "识别本页"
+                                : "重新识别本页"}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : null}
                       </div>
                     </div>
 
@@ -1045,74 +1231,191 @@ function ProjectHome({
   )
 }
 
+function PageQueueToolbar({
+  pages,
+  selectedCount,
+  runnableCount,
+  queuedSelectedCount,
+  queuedCount,
+  busy,
+  onQueue,
+  onDequeue,
+}: {
+  pages: DocumentPageRecord[]
+  selectedCount: number
+  runnableCount: number
+  queuedSelectedCount: number
+  queuedCount: number
+  busy: boolean
+  onQueue: () => void
+  onDequeue: () => void
+}) {
+  const readyCount = pages.filter((page) => page.status === "ready").length
+  const processingCount = pages.filter(
+    (page) => page.status === "processing",
+  ).length
+  const failedCount = pages.filter((page) => page.status === "failed").length
+  return (
+    <div className="flex min-h-11 flex-wrap items-center justify-between gap-2 border-y px-1 py-2 lg:col-span-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-medium">页面队列</span>
+        <Badge variant="outline">待处理 {readyCount}</Badge>
+        <Badge variant={queuedCount > 0 ? "secondary" : "outline"}>
+          排队 {queuedCount}
+        </Badge>
+        {processingCount > 0 && <Badge>处理中 {processingCount}</Badge>}
+        {failedCount > 0 && (
+          <Badge variant="destructive">失败 {failedCount}</Badge>
+        )}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs tabular-nums text-muted-foreground">
+          已选 {selectedCount}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy || queuedSelectedCount === 0}
+          onClick={onDequeue}
+        >
+          <ListX data-icon="inline-start" />
+          取消排队 ({queuedSelectedCount})
+        </Button>
+        <Button
+          size="sm"
+          disabled={busy || runnableCount === 0}
+          onClick={onQueue}
+        >
+          <ListPlus data-icon="inline-start" />
+          加入队列 ({runnableCount})
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 function PageNavigator({
   pages,
   documentID,
   selectedPageID,
+  managedPageIDs,
   busy,
+  structureBusy,
   onSelect,
+  onManage,
+  onManageAll,
   onMove,
   onRemove,
 }: {
   pages: DocumentPageRecord[]
   documentID: string
   selectedPageID: string
+  managedPageIDs: string[]
   busy: boolean
+  structureBusy: boolean
   onSelect: (id: string) => void
+  onManage: (id: string, checked: boolean) => void
+  onManageAll: (checked: boolean) => void
   onMove: (direction: -1 | 1) => void
   onRemove: () => void
 }) {
   const selectedIndex = pages.findIndex((page) => page.id === selectedPageID)
+  const manageablePages = pages.filter(
+    (page) =>
+      page.image_ready &&
+      page.status !== "preparing" &&
+      page.status !== "processing",
+  )
+  const selectedManageableCount = manageablePages.filter((page) =>
+    managedPageIDs.includes(page.id),
+  ).length
+  const allManaged =
+    manageablePages.length > 0 &&
+    selectedManageableCount === manageablePages.length
   return (
     <aside className="overflow-hidden rounded-md border lg:sticky lg:top-20 lg:self-start">
       <div className="flex items-center justify-between border-b px-3 py-2">
-        <h2 className="text-sm font-semibold">页面</h2>
+        <div className="flex items-center gap-2">
+          <Checkbox
+            aria-label="选择全部可管理页面"
+            checked={
+              allManaged
+                ? true
+                : selectedManageableCount > 0
+                  ? "indeterminate"
+                  : false
+            }
+            disabled={busy || manageablePages.length === 0}
+            onCheckedChange={(checked) => onManageAll(checked === true)}
+          />
+          <h2 className="text-sm font-semibold">页面</h2>
+        </div>
         <span className="text-xs tabular-nums text-muted-foreground">
-          {pages.length}
+          {selectedManageableCount > 0
+            ? `${selectedManageableCount} / ${pages.length}`
+            : pages.length}
         </span>
       </div>
       <ScrollArea className="h-36 lg:h-[calc(100vh-17rem)] lg:min-h-80 lg:max-h-[46rem]">
         <div className="flex w-max gap-2 p-2 lg:w-auto lg:flex-col">
-          {pages.map((page) => (
-            <button
-              key={page.id}
-              type="button"
-              className={cn(
-                "flex w-44 shrink-0 items-center gap-2 rounded-md border p-2 text-left transition-colors lg:w-full",
-                page.id === selectedPageID
-                  ? "border-primary bg-accent"
-                  : "hover:bg-muted/60",
-              )}
-              aria-current={page.id === selectedPageID ? "page" : undefined}
-              onClick={() => onSelect(page.id)}
-            >
-              {page.image_ready ? (
-                <img
-                  src={documentPageImageURL(documentID, page.id)}
-                  alt=""
-                  loading="lazy"
-                  className="h-14 w-11 shrink-0 rounded-sm border bg-background object-cover"
+          {pages.map((page) => {
+            const manageable =
+              page.image_ready &&
+              page.status !== "preparing" &&
+              page.status !== "processing"
+            return (
+              <div
+                key={page.id}
+                className={cn(
+                  "flex w-44 shrink-0 items-center gap-2 rounded-md border p-2 text-left transition-colors lg:w-full",
+                  page.id === selectedPageID
+                    ? "border-primary bg-accent"
+                    : "hover:bg-muted/60",
+                )}
+              >
+                <Checkbox
+                  aria-label={`选择第 ${page.page_number} 页`}
+                  checked={managedPageIDs.includes(page.id)}
+                  disabled={busy || !manageable}
+                  onCheckedChange={(checked) =>
+                    onManage(page.id, checked === true)
+                  }
                 />
-              ) : (
-                <span className="flex h-14 w-11 shrink-0 items-center justify-center rounded-sm border bg-muted">
-                  <Loader2 className="size-4 animate-spin" />
-                </span>
-              )}
-              <span className="flex min-w-0 flex-1 flex-col gap-1">
-                <span className="text-sm font-medium tabular-nums">
-                  第 {page.page_number} 页
-                </span>
-                <span className="truncate text-xs text-muted-foreground">
-                  {page.source_page !== page.page_number &&
-                    `原第 ${page.source_page} 页 · `}
-                  {pageStatusText(page)}
-                </span>
-              </span>
-              {page.status === "processing" && (
-                <Loader2 className="size-4 animate-spin" />
-              )}
-            </button>
-          ))}
+                <button
+                  type="button"
+                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  aria-current={page.id === selectedPageID ? "page" : undefined}
+                  onClick={() => onSelect(page.id)}
+                >
+                  {page.image_ready ? (
+                    <img
+                      src={documentPageImageURL(documentID, page.id)}
+                      alt=""
+                      loading="lazy"
+                      className="h-14 w-11 shrink-0 rounded-sm border bg-background object-cover"
+                    />
+                  ) : (
+                    <span className="flex h-14 w-11 shrink-0 items-center justify-center rounded-sm border bg-muted">
+                      <Loader2 className="size-4 animate-spin" />
+                    </span>
+                  )}
+                  <span className="flex min-w-0 flex-1 flex-col gap-1">
+                    <span className="text-sm font-medium tabular-nums">
+                      第 {page.page_number} 页
+                    </span>
+                    <span className="truncate text-xs text-muted-foreground">
+                      {page.source_page !== page.page_number &&
+                        `原第 ${page.source_page} 页 · `}
+                      {pageStatusText(page)}
+                    </span>
+                  </span>
+                  {page.status === "processing" && (
+                    <Loader2 className="size-4 animate-spin" />
+                  )}
+                </button>
+              </div>
+            )
+          })}
         </div>
         <ScrollBar orientation="horizontal" className="lg:hidden" />
       </ScrollArea>
@@ -1124,7 +1427,7 @@ function PageNavigator({
               size="icon"
               className="size-8"
               aria-label="页面前移"
-              disabled={busy || selectedIndex <= 0}
+              disabled={structureBusy || selectedIndex <= 0}
               onClick={() => onMove(-1)}
             >
               <ArrowUp className="max-lg:-rotate-90" />
@@ -1140,7 +1443,9 @@ function PageNavigator({
               className="size-8"
               aria-label="页面后移"
               disabled={
-                busy || selectedIndex < 0 || selectedIndex >= pages.length - 1
+                structureBusy ||
+                selectedIndex < 0 ||
+                selectedIndex >= pages.length - 1
               }
               onClick={() => onMove(1)}
             >
@@ -1156,7 +1461,7 @@ function PageNavigator({
               size="icon"
               className="size-8"
               aria-label="删除当前页"
-              disabled={busy || pages.length <= 1}
+              disabled={structureBusy || pages.length <= 1}
               onClick={onRemove}
             >
               <Trash2 />
@@ -1568,13 +1873,14 @@ function PageStatusBadge({ page }: { page: DocumentPageRecord }) {
       </Badge>
     )
   if (page.status === "failed") return <Badge variant="destructive">失败</Badge>
+  if (page.status === "queued") return <Badge variant="secondary">排队中</Badge>
   if (page.status === "completed")
     return (
       <Badge variant="secondary">
         {(page.pending_disputes ?? 0) > 0 ? "待审计" : "已完成"}
       </Badge>
     )
-  return <Badge variant="outline">未识别</Badge>
+  return <Badge variant="outline">待识别</Badge>
 }
 
 function pageStatusText(page: DocumentPageRecord): string {
@@ -1584,8 +1890,9 @@ function pageStatusText(page: DocumentPageRecord): string {
       : "已完成"
   if (page.status === "processing") return "识别中"
   if (page.status === "preparing") return "生成页图"
+  if (page.status === "queued") return "排队等待"
   if (page.status === "failed") return "识别失败"
-  return "等待识别"
+  return "待识别"
 }
 
 function terminalPageCount(pages: DocumentPageRecord[]): number {

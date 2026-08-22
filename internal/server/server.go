@@ -84,6 +84,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/documents/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteDocument)))
 	mux.Handle("POST /api/documents/{id}/run", s.requireAuth(http.HandlerFunc(s.handleRunDocument)))
 	mux.Handle("POST /api/documents/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelDocument)))
+	mux.Handle("POST /api/documents/{id}/pages/queue", s.requireAuth(http.HandlerFunc(s.handleQueueDocumentPages)))
+	mux.Handle("POST /api/documents/{id}/pages/dequeue", s.requireAuth(http.HandlerFunc(s.handleDequeueDocumentPages)))
 	mux.Handle("PUT /api/documents/{id}/pages/order", s.requireAuth(http.HandlerFunc(s.handleDocumentPageOrder)))
 	mux.Handle("GET /api/documents/{id}/pages/{pageID}/image", s.requireAuth(http.HandlerFunc(s.handleDocumentPageImage)))
 	mux.Handle("GET /api/documents/{id}/pages/{pageID}/result", s.requireAuth(http.HandlerFunc(s.handleDocumentPageResult)))

@@ -24,7 +24,7 @@ import (
 
 const (
 	DefaultPath     = "data/database.json"
-	databaseVersion = 2
+	databaseVersion = 3
 	passwordRounds  = 310_000
 	sessionLifetime = 7 * 24 * time.Hour
 )
@@ -87,6 +87,7 @@ const (
 	DocumentCancelled  = "cancelled"
 
 	PagePreparing  = "preparing"
+	PageReady      = "ready"
 	PageQueued     = "queued"
 	PageProcessing = "processing"
 	PageCompleted  = "completed"
@@ -179,10 +180,25 @@ func Open(path string) (*Store, error) {
 	if err := json.Unmarshal(raw, &loaded); err != nil {
 		return nil, fmt.Errorf("解析 JSON 数据库 %s 失败: %w", path, err)
 	}
-	if loaded.Version != 1 && loaded.Version != databaseVersion {
+	if loaded.Version < 1 || loaded.Version > databaseVersion {
 		return nil, fmt.Errorf("JSON 数据库版本 %d 不受支持", loaded.Version)
 	}
 	needsRewrite := loaded.Version != databaseVersion
+	if loaded.Version < 3 {
+		// Before v3, prepared but not scheduled pages were also called queued.
+		// Preserve actual interrupted queues while making idle documents manageable.
+		for documentIndex := range loaded.Documents {
+			document := &loaded.Documents[documentIndex]
+			if document.Status == DocumentProcessing {
+				continue
+			}
+			for pageIndex := range document.Pages {
+				if document.Pages[pageIndex].Status == PageQueued {
+					document.Pages[pageIndex].Status = PageReady
+				}
+			}
+		}
+	}
 	loaded.Version = databaseVersion
 	if !loaded.Initialized && len(loaded.Users) > 0 {
 		// Version 1 databases created before web setup did not carry this flag.
@@ -695,7 +711,7 @@ func (s *Store) RecoverDocuments() (DocumentRecovery, error) {
 			recovery.Prepare = append(recovery.Prepare, document.ID)
 			for pageIndex := range document.Pages {
 				if document.Pages[pageIndex].ImageReady {
-					document.Pages[pageIndex].Status = PageQueued
+					document.Pages[pageIndex].Status = PageReady
 				} else {
 					document.Pages[pageIndex].Status = PagePreparing
 				}
@@ -708,7 +724,7 @@ func (s *Store) RecoverDocuments() (DocumentRecovery, error) {
 					document.Pages[pageIndex].Status = PageQueued
 				}
 			}
-			document.Status = DocumentReady
+			document.Status = DocumentProcessing
 			changed = true
 		}
 		recountDocument(document)

@@ -339,6 +339,7 @@ export type DocumentStatus =
 
 export type DocumentPageStatus =
   | "preparing"
+  | "ready"
   | "queued"
   | "processing"
   | "completed"
@@ -560,6 +561,37 @@ export async function runDocument(
       auto_arbitrate: settings.autoArbitrate,
     },
     "启动文档识别",
+  )
+}
+
+export async function queueDocumentPages(
+  id: string,
+  pageIDs: string[],
+  settings: DocumentRunSettings,
+): Promise<DocumentProjectRecord> {
+  return requestJSON<DocumentProjectRecord>(
+    `/api/documents/${encodeURIComponent(id)}/pages/queue`,
+    "POST",
+    {
+      page_ids: pageIDs,
+      engines: settings.engines,
+      arbiter: settings.arbiter,
+      duplicate_checker: settings.duplicateChecker,
+      auto_arbitrate: settings.autoArbitrate,
+    },
+    "加入页面识别队列",
+  )
+}
+
+export async function dequeueDocumentPages(
+  id: string,
+  pageIDs: string[],
+): Promise<DocumentProjectRecord> {
+  return requestJSON<DocumentProjectRecord>(
+    `/api/documents/${encodeURIComponent(id)}/pages/dequeue`,
+    "POST",
+    { page_ids: pageIDs },
+    "取消页面排队",
   )
 }
 

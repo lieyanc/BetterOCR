@@ -111,19 +111,16 @@ func (m *documentManager) pdfRenderer() (documents.PageRenderer, error) {
 func (m *documentManager) enqueue(job documentJob) error {
 	key := string(job.kind) + ":" + job.id
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.queued[key] {
-		m.mu.Unlock()
 		return nil
 	}
 	m.queued[key] = true
-	m.mu.Unlock()
 	select {
 	case m.jobs <- job:
 		return nil
 	default:
-		m.mu.Lock()
 		delete(m.queued, key)
-		m.mu.Unlock()
 		return errors.New("文档后台队列已满,请稍后重试")
 	}
 }
@@ -146,7 +143,22 @@ func (m *documentManager) cancel(id string) {
 }
 
 func (m *documentManager) worker() {
-	for job := range m.jobs {
+	// A process job handles one page. Continuations normally go back to the
+	// channel tail for cross-document fairness; if the channel fills while a
+	// page is running, keep them locally until the buffered queue drains.
+	deferred := make([]documentJob, 0)
+	for {
+		var job documentJob
+		if len(deferred) == 0 {
+			job = <-m.jobs
+		} else {
+			select {
+			case job = <-m.jobs:
+			default:
+				job = deferred[0]
+				deferred = deferred[1:]
+			}
+		}
 		ctx, cancel := context.WithCancel(m.ctx)
 		m.mu.Lock()
 		m.runs[job.id] = cancel
@@ -161,10 +173,27 @@ func (m *documentManager) worker() {
 
 		cancel()
 		m.mu.Lock()
+		continueProcess := job.kind == documentJobProcess && m.hasQueuedPages(job.id)
 		delete(m.runs, job.id)
-		delete(m.queued, string(job.kind)+":"+job.id)
+		key := string(job.kind) + ":" + job.id
+		if continueProcess {
+			select {
+			case m.jobs <- job:
+			default:
+				deferred = append(deferred, job)
+			}
+		} else {
+			delete(m.queued, key)
+		}
 		m.mu.Unlock()
 	}
+}
+
+func (m *documentManager) hasQueuedPages(id string) bool {
+	document, ok := m.store.Document(id)
+	return ok && document.Status == database.DocumentProcessing && slices.ContainsFunc(document.Pages, func(page database.DocumentPage) bool {
+		return page.ImageReady && page.Status == database.PageQueued
+	})
 }
 
 func (m *documentManager) projectDir(documentID string) string {
@@ -268,7 +297,7 @@ func (m *documentManager) prepare(ctx context.Context, id string) {
 					return errors.New("页面记录不存在")
 				}
 				next.Pages[pageIndex].ImageReady = true
-				next.Pages[pageIndex].Status = database.PageQueued
+				next.Pages[pageIndex].Status = database.PageReady
 				next.Pages[pageIndex].Error = ""
 				next.Pages[pageIndex].UpdatedAt = time.Now().UTC()
 				return nil
@@ -313,7 +342,7 @@ func (m *documentManager) prepareImage(ctx context.Context, document database.Do
 	}
 	_, err = m.store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
 		next.Pages[0].ImageReady = true
-		next.Pages[0].Status = database.PageQueued
+		next.Pages[0].Status = database.PageReady
 		next.Pages[0].UpdatedAt = time.Now().UTC()
 		return nil
 	})
@@ -331,6 +360,11 @@ func (m *documentManager) finishPreparation(id string) {
 		}
 		document.Status = database.DocumentReady
 		document.Error = ""
+		for index := range document.Pages {
+			if document.Pages[index].ImageReady && (document.Pages[index].Status == database.PagePreparing || document.Pages[index].Status == database.PageQueued) {
+				document.Pages[index].Status = database.PageReady
+			}
+		}
 		return nil
 	})
 }
@@ -358,112 +392,125 @@ func (m *documentManager) process(ctx context.Context, id string) {
 	if !ok || document.Status == database.DocumentCancelled || document.PreparedPages == 0 {
 		return
 	}
+	pageIndex := slices.IndexFunc(document.Pages, func(page database.DocumentPage) bool {
+		return page.ImageReady && page.Status == database.PageQueued
+	})
+	if pageIndex < 0 {
+		m.finishProcessingBatch(id)
+		return
+	}
 	engines, arbiterModel, duplicateChecker, err := m.resolveModels(document)
 	if err != nil {
 		m.failDocument(id, ctx, err)
 		return
 	}
+	pageID := document.Pages[pageIndex].ID
+	var page database.DocumentPage
 	document, err = m.store.MutateDocument(id, func(current *database.DocumentProject) error {
 		if current.Status == database.DocumentCancelled {
 			return context.Canceled
 		}
+		index := slices.IndexFunc(current.Pages, func(candidate database.DocumentPage) bool {
+			return candidate.ID == pageID
+		})
+		if index < 0 || current.Pages[index].Status != database.PageQueued || !current.Pages[index].ImageReady {
+			return errors.New("待识别页面已从队列移除")
+		}
 		current.Status = database.DocumentProcessing
 		current.CompletedAt = nil
 		current.Error = ""
+		current.Pages[index].Status = database.PageProcessing
+		current.Pages[index].Error = ""
+		current.Pages[index].UpdatedAt = time.Now().UTC()
+		page = current.Pages[index]
 		return nil
 	})
 	if err != nil {
+		m.finishProcessingBatch(id)
 		return
 	}
 
-	for _, pageSnapshot := range document.Pages {
-		if err := ctx.Err(); err != nil {
-			m.failDocument(id, ctx, err)
-			return
-		}
-		current, ok := m.store.Document(id)
-		if !ok || current.Status == database.DocumentCancelled {
-			return
-		}
-		pageIndex := slices.IndexFunc(current.Pages, func(page database.DocumentPage) bool { return page.ID == pageSnapshot.ID })
-		if pageIndex < 0 {
-			continue
-		}
-		page := current.Pages[pageIndex]
-		if !page.ImageReady || page.Status == database.PageCompleted {
-			continue
-		}
-		_, err := m.store.MutateDocument(id, func(next *database.DocumentProject) error {
-			index := slices.IndexFunc(next.Pages, func(candidate database.DocumentPage) bool { return candidate.ID == page.ID })
-			if index < 0 {
-				return errors.New("页面记录不存在")
-			}
-			next.Pages[index].Status = database.PageProcessing
-			next.Pages[index].Error = ""
-			next.Pages[index].UpdatedAt = time.Now().UTC()
-			return nil
-		})
-		if err != nil {
-			continue
-		}
-		started := time.Now()
-		progress := m.progress.beginPage(id, page, len(engines))
-		pageImage, readErr := os.ReadFile(m.pageImagePath(current, page))
-		if readErr != nil {
-			m.failPage(id, page.ID, readErr, time.Since(started), false)
-			progress.finish(database.PageFailed, readErr.Error())
-			continue
-		}
-		cfg := m.server.currentConfig()
-		final, runErr := pipeline.Run(ctx, pipeline.Config{
-			Engines: engines, Arbiter: arbiterModel, DuplicateChecker: duplicateChecker,
-			DeferArbitration:   !document.AutoArbitrate,
-			HTTPClient:         m.server.HTTPClient,
-			EngineTimeout:      m.server.engineTimeout(),
-			ArbiterTimeout:     m.server.arbiterTimeout(),
-			EngineMaxAttempts:  cfg.EngineAttempts(),
-			ArbiterMaxAttempts: cfg.ArbiterAttempts(),
-			OnEvent:            progress.handle,
-		}, pageImage)
-		if runErr != nil {
-			if ctx.Err() != nil {
-				m.failDocument(id, ctx, ctx.Err())
-				return
-			}
-			m.failPage(id, page.ID, runErr, time.Since(started), false)
-			progress.finish(database.PageFailed, runErr.Error())
-			continue
-		}
-		allFailed := final.Stats.Engines > 0 && final.Stats.FailedEngines == final.Stats.Engines
-		if err := writeJSONAtomic(m.resultPath(id, page.ID), final); err != nil {
-			m.failPage(id, page.ID, err, time.Since(started), false)
-			progress.finish(database.PageFailed, err.Error())
-			continue
-		}
-		m.completePage(id, page.ID, final, time.Since(started), allFailed)
-		if allFailed {
-			progress.finish(database.PageFailed, "所有引擎均失败,请检查 Provider 连接与模型配置")
-		} else {
-			progress.finish(database.PageCompleted, "")
-		}
+	if err := ctx.Err(); err != nil {
+		m.failDocument(id, ctx, err)
+		return
 	}
+	started := time.Now()
+	progress := m.progress.beginPage(id, page, len(engines))
+	pageImage, readErr := os.ReadFile(m.pageImagePath(document, page))
+	if readErr != nil {
+		m.failPage(id, page.ID, readErr, time.Since(started), false)
+		progress.finish(database.PageFailed, readErr.Error())
+		m.finishProcessingBatch(id)
+		return
+	}
+	cfg := m.server.currentConfig()
+	final, runErr := pipeline.Run(ctx, pipeline.Config{
+		Engines: engines, Arbiter: arbiterModel, DuplicateChecker: duplicateChecker,
+		DeferArbitration:   !document.AutoArbitrate,
+		HTTPClient:         m.server.HTTPClient,
+		EngineTimeout:      m.server.engineTimeout(),
+		ArbiterTimeout:     m.server.arbiterTimeout(),
+		EngineMaxAttempts:  cfg.EngineAttempts(),
+		ArbiterMaxAttempts: cfg.ArbiterAttempts(),
+		OnEvent:            progress.handle,
+	}, pageImage)
+	if runErr != nil {
+		if ctx.Err() != nil {
+			m.failDocument(id, ctx, ctx.Err())
+			return
+		}
+		m.failPage(id, page.ID, runErr, time.Since(started), false)
+		progress.finish(database.PageFailed, runErr.Error())
+		m.finishProcessingBatch(id)
+		return
+	}
+	allFailed := final.Stats.Engines > 0 && final.Stats.FailedEngines == final.Stats.Engines
+	if err := writeJSONAtomic(m.resultPath(id, page.ID), final); err != nil {
+		m.failPage(id, page.ID, err, time.Since(started), false)
+		progress.finish(database.PageFailed, err.Error())
+		m.finishProcessingBatch(id)
+		return
+	}
+	m.completePage(id, page.ID, final, time.Since(started), allFailed)
+	if allFailed {
+		progress.finish(database.PageFailed, "所有引擎均失败,请检查 Provider 连接与模型配置")
+	} else {
+		progress.finish(database.PageCompleted, "")
+	}
+	m.finishProcessingBatch(id)
+}
 
-	completed, err := m.store.MutateDocument(id, func(current *database.DocumentProject) error {
-		if current.Status == database.DocumentCancelled {
+func (m *documentManager) finishProcessingBatch(id string) {
+	document, err := m.store.MutateDocument(id, func(current *database.DocumentProject) error {
+		if current.Status == database.DocumentCancelled || current.Status == database.DocumentFailed {
 			return nil
 		}
-		now := time.Now().UTC()
-		current.Status = database.DocumentCompleted
-		current.CompletedAt = &now
+		if slices.ContainsFunc(current.Pages, func(page database.DocumentPage) bool {
+			return page.Status == database.PageQueued || page.Status == database.PageProcessing
+		}) {
+			current.Status = database.DocumentProcessing
+			current.CompletedAt = nil
+			return nil
+		}
+		if slices.ContainsFunc(current.Pages, func(page database.DocumentPage) bool {
+			return page.Status == database.PageReady || page.Status == database.PagePreparing
+		}) {
+			current.Status = database.DocumentReady
+			current.CompletedAt = nil
+		} else {
+			now := time.Now().UTC()
+			current.Status = database.DocumentCompleted
+			current.CompletedAt = &now
+		}
 		if current.FailedPages > 0 {
-			current.Error = fmt.Sprintf("%d 页处理失败,可重新运行失败页面", current.FailedPages)
+			current.Error = fmt.Sprintf("%d 页处理失败,可单独或批量重试", current.FailedPages)
 		} else {
 			current.Error = ""
 		}
 		return nil
 	})
-	if err == nil {
-		m.progress.finishDocument(id, completed.Status, completed.Error)
+	if err == nil && document.Status != database.DocumentProcessing {
+		m.progress.finishDocument(id, document.Status, document.Error)
 	}
 }
 
@@ -651,6 +698,11 @@ type documentRunSettings struct {
 	AutoArbitrate    bool     `json:"auto_arbitrate"`
 }
 
+type documentPageQueueRequest struct {
+	documentRunSettings
+	PageIDs []string `json:"page_ids"`
+}
+
 func (s *Server) documentSettingsFromQuery(r *http.Request) (documentRunSettings, error) {
 	cfg := s.currentConfig()
 	engines := pipeline.SplitList(r.URL.Query().Get("engines"))
@@ -691,6 +743,94 @@ func (s *Server) validateDocumentSettings(settings documentRunSettings) error {
 		}
 	}
 	return nil
+}
+
+func documentSettingsMatch(document database.DocumentProject, settings documentRunSettings) bool {
+	return slices.Equal(document.Engines, settings.Engines) &&
+		document.Arbiter == settings.Arbiter &&
+		document.DuplicateChecker == settings.DuplicateChecker &&
+		document.AutoArbitrate == settings.AutoArbitrate
+}
+
+func resetPageForQueue(page *database.DocumentPage) {
+	page.Status = database.PageQueued
+	page.ResultReady = false
+	page.Confidence = 0
+	page.Segments = 0
+	page.PendingDisputes = 0
+	page.DurationMS = 0
+	page.Error = ""
+	page.UpdatedAt = time.Now().UTC()
+}
+
+func (m *documentManager) queuePages(
+	document database.DocumentProject,
+	settings documentRunSettings,
+	pageIDs []string,
+) (database.DocumentProject, error) {
+	if len(pageIDs) == 0 {
+		return database.DocumentProject{}, errors.New("请至少选择一个页面")
+	}
+	if document.Status == database.DocumentProcessing && !documentSettingsMatch(document, settings) {
+		return database.DocumentProject{}, errors.New("文档已有识别任务,新增页面必须沿用当前模型配置")
+	}
+	selected := make(map[string]struct{}, len(pageIDs))
+	for _, id := range pageIDs {
+		if id == "" {
+			return database.DocumentProject{}, errors.New("页面 ID 不能为空")
+		}
+		if _, exists := selected[id]; exists {
+			return database.DocumentProject{}, errors.New("页面列表包含重复项")
+		}
+		selected[id] = struct{}{}
+	}
+	previous := document
+	updated, err := m.store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
+		if next.Status == database.DocumentPreparing {
+			return errors.New("页面仍在服务端准备中")
+		}
+		seen := 0
+		for index := range next.Pages {
+			page := &next.Pages[index]
+			if _, ok := selected[page.ID]; !ok {
+				continue
+			}
+			seen++
+			if !page.ImageReady || page.Status == database.PagePreparing {
+				return fmt.Errorf("第 %d 页尚未准备完成", page.PageNumber)
+			}
+			if page.Status == database.PageProcessing {
+				return fmt.Errorf("第 %d 页正在识别", page.PageNumber)
+			}
+			if page.Status != database.PageQueued {
+				resetPageForQueue(page)
+			}
+		}
+		if seen != len(selected) {
+			return errors.New("页面列表包含不存在的页面")
+		}
+		if next.Status != database.DocumentProcessing {
+			next.Engines = append([]string(nil), settings.Engines...)
+			next.Arbiter = settings.Arbiter
+			next.DuplicateChecker = settings.DuplicateChecker
+			next.AutoArbitrate = settings.AutoArbitrate
+		}
+		next.Status = database.DocumentProcessing
+		next.CompletedAt = nil
+		next.Error = ""
+		return nil
+	})
+	if err != nil {
+		return database.DocumentProject{}, err
+	}
+	if err := m.enqueue(documentJob{id: document.ID, kind: documentJobProcess}); err != nil {
+		_, _ = m.store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
+			*next = previous
+			return nil
+		})
+		return database.DocumentProject{}, err
+	}
+	return updated, nil
 }
 
 func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request) {
@@ -734,14 +874,6 @@ func (s *Server) handleRunDocument(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if document.Status == database.DocumentPreparing {
-		writeErr(w, http.StatusConflict, "页面仍在服务端准备中")
-		return
-	}
-	if document.Status == database.DocumentProcessing {
-		writeJSON(w, http.StatusOK, document)
-		return
-	}
 	var settings documentRunSettings
 	if err := decodeJSON(w, r, &settings); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -749,6 +881,14 @@ func (s *Server) handleRunDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.validateDocumentSettings(settings); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if document.Status == database.DocumentPreparing {
+		writeErr(w, http.StatusConflict, "页面仍在服务端准备中")
+		return
+	}
+	if document.Status == database.DocumentProcessing {
+		writeJSON(w, http.StatusOK, document)
 		return
 	}
 	if document.PreparedPages != document.PageCount || document.PageCount == 0 {
@@ -773,43 +913,122 @@ func (s *Server) handleRunDocument(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, document)
 		return
 	}
-	document, err = s.Store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
-		next.Engines = append([]string(nil), settings.Engines...)
-		next.Arbiter = settings.Arbiter
-		next.DuplicateChecker = settings.DuplicateChecker
-		next.AutoArbitrate = settings.AutoArbitrate
-		next.Status = database.DocumentProcessing
-		next.CompletedAt = nil
-		next.Error = ""
-		hasPending := slices.ContainsFunc(next.Pages, func(page database.DocumentPage) bool {
-			return page.Status != database.PageCompleted && page.Status != database.PageFailed
-		})
+	pageIDs := make([]string, 0, len(document.Pages))
+	for _, page := range document.Pages {
+		if page.Status == database.PageReady || page.Status == database.PageFailed || page.Status == database.PageQueued {
+			pageIDs = append(pageIDs, page.ID)
+		}
+	}
+	if len(pageIDs) == 0 {
+		for _, page := range document.Pages {
+			if page.ImageReady && page.Status == database.PageCompleted {
+				pageIDs = append(pageIDs, page.ID)
+			}
+		}
+	}
+	document, err = manager.queuePages(document, settings, pageIDs)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, document)
+}
+
+func (s *Server) handleQueueDocumentPages(w http.ResponseWriter, r *http.Request) {
+	manager, err := s.getDocumentManager()
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	document, ok := s.ownedDocument(w, r)
+	if !ok {
+		return
+	}
+	var request documentPageQueueRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.validateDocumentSettings(request.documentRunSettings); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	document, err = manager.queuePages(document, request.documentRunSettings, request.PageIDs)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, document)
+}
+
+func (s *Server) handleDequeueDocumentPages(w http.ResponseWriter, r *http.Request) {
+	document, ok := s.ownedDocument(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		PageIDs []string `json:"page_ids"`
+	}
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(request.PageIDs) == 0 {
+		writeErr(w, http.StatusBadRequest, "请至少选择一个页面")
+		return
+	}
+	selected := make(map[string]struct{}, len(request.PageIDs))
+	for _, id := range request.PageIDs {
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "页面 ID 不能为空")
+			return
+		}
+		if _, exists := selected[id]; exists {
+			writeErr(w, http.StatusBadRequest, "页面列表包含重复项")
+			return
+		}
+		selected[id] = struct{}{}
+	}
+	document, err := s.Store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
+		seen := 0
 		for index := range next.Pages {
-			if next.Pages[index].Status == database.PageFailed {
-				next.Pages[index].Status = database.PageQueued
-				next.Pages[index].ResultReady = false
-				next.Pages[index].Error = ""
-			} else if !hasPending && next.FailedPages == 0 && next.Pages[index].Status == database.PageCompleted {
-				next.Pages[index].Status = database.PageQueued
-				next.Pages[index].ResultReady = false
+			page := &next.Pages[index]
+			if _, ok := selected[page.ID]; !ok {
+				continue
+			}
+			seen++
+			if page.Status == database.PageProcessing {
+				return fmt.Errorf("第 %d 页已经开始识别,只能停止整个文档", page.PageNumber)
+			}
+			if page.Status == database.PageQueued {
+				page.Status = database.PageReady
+				page.UpdatedAt = time.Now().UTC()
+			}
+		}
+		if seen != len(selected) {
+			return errors.New("页面列表包含不存在的页面")
+		}
+		if !slices.ContainsFunc(next.Pages, func(page database.DocumentPage) bool {
+			return page.Status == database.PageQueued || page.Status == database.PageProcessing
+		}) {
+			if slices.ContainsFunc(next.Pages, func(page database.DocumentPage) bool {
+				return page.Status == database.PageReady || page.Status == database.PagePreparing
+			}) {
+				next.Status = database.DocumentReady
+				next.CompletedAt = nil
+			} else {
+				now := time.Now().UTC()
+				next.Status = database.DocumentCompleted
+				next.CompletedAt = &now
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
-	if err := manager.enqueue(documentJob{id: document.ID, kind: documentJobProcess}); err != nil {
-		_, _ = s.Store.MutateDocument(document.ID, func(next *database.DocumentProject) error {
-			next.Status = database.DocumentReady
-			next.Error = err.Error()
-			return nil
-		})
-		writeErr(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusAccepted, document)
+	writeJSON(w, http.StatusOK, document)
 }
 
 func (s *Server) handleCancelDocument(w http.ResponseWriter, r *http.Request) {
@@ -826,8 +1045,8 @@ func (s *Server) handleCancelDocument(w http.ResponseWriter, r *http.Request) {
 		next.Status = database.DocumentCancelled
 		next.Error = ""
 		for index := range next.Pages {
-			if next.Pages[index].Status == database.PageProcessing {
-				next.Pages[index].Status = database.PageQueued
+			if next.Pages[index].Status == database.PageProcessing || next.Pages[index].Status == database.PageQueued {
+				next.Pages[index].Status = database.PageReady
 			}
 		}
 		return nil

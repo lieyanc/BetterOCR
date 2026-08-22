@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -102,7 +103,7 @@ func TestDocumentUploadPreparationOwnershipAndPersistence(t *testing.T) {
 		t.Fatalf("prepared document = %+v", document)
 	}
 	for _, page := range document.Pages {
-		if !page.ImageReady || page.Status != database.PageQueued {
+		if !page.ImageReady || page.Status != database.PageReady {
 			t.Fatalf("page = %+v", page)
 		}
 		if _, err := os.Stat(filepath.Join(root, "documents", document.ID, "pages", page.ID+".jpg")); err != nil {
@@ -156,6 +157,31 @@ func TestDocumentUploadPreparationOwnershipAndPersistence(t *testing.T) {
 		}
 	}
 
+	retryBody, _ := json.Marshal(map[string]any{
+		"page_ids": []string{reversed[1]}, "engines": []string{"test/tiny-a", "test/tiny-b"},
+		"arbiter": "", "duplicate_checker": "", "auto_arbitrate": false,
+	})
+	retryRequest := requestWithAuth(
+		http.MethodPost, "/api/documents/"+document.ID+"/pages/queue",
+		bytes.NewReader(retryBody), ownerCookie, ownerCSRF,
+	)
+	retryRequest.Header.Set("Content-Type", "application/json")
+	retryRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(retryRecorder, retryRequest)
+	if retryRecorder.Code != http.StatusAccepted {
+		t.Fatalf("retry status=%d body=%s", retryRecorder.Code, retryRecorder.Body.String())
+	}
+	document = waitForDocumentStatus(t, handler, document.ID, ownerCookie, database.DocumentCompleted)
+	for _, page := range document.Pages {
+		wantRevision := 1
+		if page.ID == reversed[1] {
+			wantRevision = 2
+		}
+		if page.Revision != wantRevision {
+			t.Fatalf("page %s revision=%d, want %d", page.ID, page.Revision, wantRevision)
+		}
+	}
+
 	final := arbiter.Final{
 		Text:       "result-must-not-live-in-database-json",
 		Confidence: 0.9,
@@ -194,6 +220,93 @@ func TestDocumentUploadPreparationOwnershipAndPersistence(t *testing.T) {
 	persisted, ok := reopened.Document(document.ID)
 	if !ok || persisted.Pages[0].ID != reversed[0] || persisted.PendingDisputes != 1 {
 		t.Fatalf("persisted = %+v ok=%v", persisted, ok)
+	}
+}
+
+func TestQueuedDocumentPageCanBeRemovedBeforeProcessing(t *testing.T) {
+	root := t.TempDir()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": "ok"}}},
+		})
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		upstream.Close()
+	}()
+	cfg := serverConfig(upstream.URL, "server-key")
+	store, err := database.Open(filepath.Join(root, "database.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InitializeAdmin("owner", "owner-password"); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Config: cfg, Store: store, DocumentRoot: filepath.Join(root, "documents"),
+		PDFRenderer: &fakePageRenderer{pages: 3},
+	}
+	handler := srv.Handler()
+	cookie, csrf := loginForTest(t, handler, "owner", "owner-password")
+	upload := requestWithAuth(
+		http.MethodPost, "/api/documents?filename=queue.pdf&engines=test%2Ftiny-a&arbiter=&auto_arbitrate=false",
+		bytes.NewReader([]byte("%PDF-1.4\nqueue-test")), cookie, csrf,
+	)
+	upload.Header.Set("Content-Type", "application/pdf")
+	uploadRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(uploadRecorder, upload)
+	if uploadRecorder.Code != http.StatusCreated {
+		t.Fatalf("upload status=%d body=%s", uploadRecorder.Code, uploadRecorder.Body.String())
+	}
+	var created database.DocumentProject
+	if err := json.Unmarshal(uploadRecorder.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	document := waitForDocumentStatus(t, handler, created.ID, cookie, database.DocumentReady)
+	runBody, _ := json.Marshal(map[string]any{
+		"engines": []string{"test/tiny-a"}, "arbiter": "", "duplicate_checker": "", "auto_arbitrate": false,
+	})
+	runRequest := requestWithAuth(
+		http.MethodPost, "/api/documents/"+document.ID+"/run", bytes.NewReader(runBody), cookie, csrf,
+	)
+	runRequest.Header.Set("Content-Type", "application/json")
+	runRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(runRecorder, runRequest)
+	if runRecorder.Code != http.StatusAccepted {
+		t.Fatalf("run status=%d body=%s", runRecorder.Code, runRecorder.Body.String())
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first page did not start")
+	}
+
+	dequeueBody, _ := json.Marshal(map[string]any{"page_ids": []string{document.Pages[2].ID}})
+	dequeueRequest := requestWithAuth(
+		http.MethodPost, "/api/documents/"+document.ID+"/pages/dequeue",
+		bytes.NewReader(dequeueBody), cookie, csrf,
+	)
+	dequeueRequest.Header.Set("Content-Type", "application/json")
+	dequeueRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(dequeueRecorder, dequeueRequest)
+	if dequeueRecorder.Code != http.StatusOK {
+		t.Fatalf("dequeue status=%d body=%s", dequeueRecorder.Code, dequeueRecorder.Body.String())
+	}
+	releaseOnce.Do(func() { close(release) })
+	document = waitForDocumentStatus(t, handler, document.ID, cookie, database.DocumentReady)
+	if document.Pages[0].Revision != 1 || document.Pages[1].Revision != 1 {
+		t.Fatalf("processed revisions = %d, %d", document.Pages[0].Revision, document.Pages[1].Revision)
+	}
+	if page := document.Pages[2]; page.Status != database.PageReady || page.Revision != 0 || page.ResultReady {
+		t.Fatalf("dequeued page = %+v", page)
 	}
 }
 
