@@ -8,7 +8,6 @@ import {
   LogOut,
   Moon,
   ScanSearch,
-  ScanText,
   Sun,
 } from "lucide-react"
 
@@ -26,6 +25,7 @@ import { Button } from "@/components/ui/button"
 import { DocumentWorkspace } from "@/components/document-workspace"
 import { ModelConfigDialog } from "@/components/model-config-dialog"
 import { AdminDialog } from "@/components/admin-dialog"
+import { BrandHeader } from "@/components/brand-header"
 import { LoginPage } from "@/components/login-page"
 import { SetupPage } from "@/components/setup-page"
 import { TaskHistoryDialog } from "@/components/task-history-dialog"
@@ -186,17 +186,11 @@ function OCRWorkspace({
     <div className="min-h-screen">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-7xl items-center gap-3 px-4 md:px-6">
-          <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <ScanText className="size-4.5" />
-          </div>
-          <div className="min-w-0 flex-1 sm:flex-none">
-            <span className="text-sm font-semibold leading-none">
-              BetterOCR
-            </span>
-            <span className="hidden text-xs text-muted-foreground sm:block">
-              全文识别 · 中文句段动态融合
-            </span>
-          </div>
+          <BrandHeader
+            tagline="全文识别 · 中文句段动态融合"
+            compactOnMobile
+            className="flex-1"
+          />
           <div className="ms-auto flex items-center gap-1.5">
             <TaskHistoryDialog user={session.user} />
             {session.user.role === "admin" && (

@@ -1,7 +1,8 @@
 import { useState, type FormEvent } from "react"
-import { Loader2, ScanText, UserRoundPlus } from "lucide-react"
+import { Loader2, UserRoundPlus } from "lucide-react"
 
 import { initialize, type AuthSession } from "@/lib/api"
+import { BrandHeader } from "@/components/brand-header"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -52,15 +53,7 @@ export function SetupPage({
     <div className="flex min-h-screen flex-col bg-muted/30">
       <header className="border-b bg-background">
         <div className="mx-auto flex h-14 max-w-5xl items-center gap-3 px-4 md:px-6">
-          <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <ScanText className="size-4.5" />
-          </div>
-          <div>
-            <p className="text-sm font-semibold leading-none">BetterOCR</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              多引擎 OCR 融合工作台
-            </p>
-          </div>
+          <BrandHeader tagline="多引擎 OCR 融合工作台" />
         </div>
       </header>
       <main className="flex flex-1 items-center justify-center p-4">
