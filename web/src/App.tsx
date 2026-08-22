@@ -24,7 +24,10 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { DocumentWorkspace } from "@/components/document-workspace"
 import { ModelConfigDialog } from "@/components/model-config-dialog"
-import { AdminDialog } from "@/components/admin-dialog"
+import {
+  AdminDialog,
+  type AdminDialogTab,
+} from "@/components/admin-dialog"
 import { BrandHeader } from "@/components/brand-header"
 import { LoginPage } from "@/components/login-page"
 import { SetupPage } from "@/components/setup-page"
@@ -135,6 +138,9 @@ function OCRWorkspace({
   }
 
   const [error, setError] = useState("")
+  const [adminDialogOpen, setAdminDialogOpen] = useState(false)
+  const [adminDialogTab, setAdminDialogTab] =
+    useState<AdminDialogTab>("users")
 
   // —— 服务端模型目录与本地选择 ——
   const [cfg, setCfg] = useState<ServerConfig | null>(null)
@@ -189,6 +195,14 @@ function OCRWorkspace({
           <BrandHeader
             tagline="全文识别 · 中文句段动态融合"
             compactOnMobile
+            onVersionClick={
+              session.user.role === "admin"
+                ? () => {
+                    setAdminDialogTab("update")
+                    setAdminDialogOpen(true)
+                  }
+                : undefined
+            }
             className="flex-1"
           />
           <div className="ms-auto flex items-center gap-1.5">
@@ -197,6 +211,10 @@ function OCRWorkspace({
               <AdminDialog
                 currentUser={session.user}
                 onSettingsChanged={() => void loadConfig()}
+                open={adminDialogOpen}
+                onOpenChange={setAdminDialogOpen}
+                tab={adminDialogTab}
+                onTabChange={setAdminDialogTab}
               />
             )}
             <ModelConfigDialog

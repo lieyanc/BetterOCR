@@ -70,14 +70,23 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 
+export type AdminDialogTab = "users" | "settings" | "update"
+
 export function AdminDialog({
   currentUser,
   onSettingsChanged,
+  open,
+  onOpenChange,
+  tab,
+  onTabChange,
 }: {
   currentUser: User
   onSettingsChanged: () => void
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  tab: AdminDialogTab
+  onTabChange: (tab: AdminDialogTab) => void
 }) {
-  const [open, setOpen] = useState(false)
   const [users, setUsers] = useState<User[]>([])
   const [settingsText, setSettingsText] = useState("")
   const [loading, setLoading] = useState(false)
@@ -125,11 +134,16 @@ export function AdminDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <Tooltip>
         <TooltipTrigger asChild>
           <DialogTrigger asChild>
-            <Button variant="ghost" size="sm" aria-label="管理">
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="管理"
+              onClick={() => onTabChange("users")}
+            >
               <ShieldCheck data-icon="inline-start" />
               <span className="hidden sm:inline">管理</span>
             </Button>
@@ -158,7 +172,11 @@ export function AdminDialog({
           </Alert>
         )}
 
-        <Tabs defaultValue="users" className="min-h-0 flex-1">
+        <Tabs
+          value={tab}
+          onValueChange={(value) => onTabChange(value as AdminDialogTab)}
+          className="min-h-0 flex-1"
+        >
           <TabsList>
             <TabsTrigger value="users">
               <Users />

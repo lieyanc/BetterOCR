@@ -14,10 +14,12 @@ import { cn } from "@/lib/utils"
 export function BrandHeader({
   tagline,
   compactOnMobile = false,
+  onVersionClick,
   className,
 }: {
   tagline: string
   compactOnMobile?: boolean
+  onVersionClick?: () => void
   className?: string
 }) {
   const [version, setVersion] = useState<VersionInfo | null>(null)
@@ -55,11 +57,27 @@ export function BrandHeader({
           {tagline}
         </p>
       </div>
-      {version?.version && (
-        <Badge variant="secondary" className="hidden sm:inline-flex">
-          {version.version}
-        </Badge>
-      )}
+      {version?.version &&
+        (onVersionClick ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="hidden sm:inline-flex"
+                onClick={onVersionClick}
+                aria-label={`查看 ${version.version} 的应用更新`}
+              >
+                {version.version}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>查看应用更新</TooltipContent>
+          </Tooltip>
+        ) : (
+          <Badge variant="secondary" className="hidden sm:inline-flex">
+            {version.version}
+          </Badge>
+        ))}
       {repo && (
         <Tooltip>
           <TooltipTrigger asChild>
