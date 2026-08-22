@@ -84,12 +84,14 @@ interface DocumentWorkspaceProps {
   engines: string[]
   arbiter: string
   duplicateChecker: string
+  onModelSelectionConsumed?: () => void
 }
 
 export function DocumentWorkspace({
   engines,
   arbiter,
   duplicateChecker,
+  onModelSelectionConsumed,
 }: DocumentWorkspaceProps) {
   const [projects, setProjects] = useState<DocumentProjectRecord[]>([])
   const [project, setProject] = useState<DocumentProjectRecord | null>(null)
@@ -411,6 +413,7 @@ export function DocumentWorkspace({
           autoArbitrate,
         }),
       )
+      onModelSelectionConsumed?.()
     } catch (cause) {
       setError(errorMessage(cause))
     } finally {
@@ -430,6 +433,7 @@ export function DocumentWorkspace({
 
   const queuePages = async (pageIDs: string[], actionName: string) => {
     if (!project || pageIDs.length === 0 || action) return
+    const usesCurrentSelection = project.status !== "processing"
     const settings = pageQueueSettings()
     if (settings.engines.length === 0) {
       setError("请至少选择一个基础模型")
@@ -444,6 +448,7 @@ export function DocumentWorkspace({
       setManagedPageIDs((current) =>
         current.filter((id) => !pageIDs.includes(id)),
       )
+      if (usesCurrentSelection) onModelSelectionConsumed?.()
     } catch (cause) {
       setError(errorMessage(cause))
     } finally {

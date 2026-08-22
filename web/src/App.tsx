@@ -35,8 +35,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 
-const selectionStorageKey = "betterocr-model-selection"
-
 export default function App() {
   const [session, setSession] = useState<AuthSession | null>(null)
   const [checkingSession, setCheckingSession] = useState(true)
@@ -147,49 +145,10 @@ function OCRWorkspace({
   const loadConfig = useCallback(() => {
     fetchConfig()
       .then((c) => {
-        const validRefs = new Set(
-          c.providers.flatMap((provider) =>
-            provider.models.map((model) => `${provider.id}/${model.id}`),
-          ),
-        )
-        let nextEngines = c.engines
-        let nextArbiter = c.arbiter
-        let nextDuplicateChecker = c.duplicate_checker ?? ""
-        try {
-          const saved = JSON.parse(
-            localStorage.getItem(selectionStorageKey) ?? "null",
-          ) as {
-            engines?: unknown
-            arbiter?: unknown
-            duplicateChecker?: unknown
-          } | null
-          if (Array.isArray(saved?.engines)) {
-            const filtered = saved.engines.filter(
-              (ref): ref is string =>
-                typeof ref === "string" && validRefs.has(ref),
-            )
-            if (filtered.length > 0) nextEngines = filtered
-          }
-          if (
-            typeof saved?.arbiter === "string" &&
-            (saved.arbiter === "" || validRefs.has(saved.arbiter))
-          ) {
-            nextArbiter = saved.arbiter
-          }
-          if (
-            typeof saved?.duplicateChecker === "string" &&
-            (saved.duplicateChecker === "" ||
-              validRefs.has(saved.duplicateChecker))
-          ) {
-            nextDuplicateChecker = saved.duplicateChecker
-          }
-        } catch {
-          localStorage.removeItem(selectionStorageKey)
-        }
         setCfg(c)
-        setEngines(nextEngines)
-        setArbiter(nextArbiter)
-        setDuplicateChecker(nextDuplicateChecker)
+        setEngines(c.engines)
+        setArbiter(c.arbiter)
+        setDuplicateChecker(c.duplicate_checker ?? "")
       })
       .catch((cause) => {
         setError(cause instanceof Error ? cause.message : "加载模型配置失败")
@@ -221,14 +180,6 @@ function OCRWorkspace({
     setEngines(nextEngines)
     setArbiter(nextArbiter)
     setDuplicateChecker(nextDuplicateChecker)
-    localStorage.setItem(
-      selectionStorageKey,
-      JSON.stringify({
-        engines: nextEngines,
-        arbiter: nextArbiter,
-        duplicateChecker: nextDuplicateChecker,
-      }),
-    )
   }
 
   return (
@@ -369,6 +320,9 @@ function OCRWorkspace({
           engines={engines}
           arbiter={arbiter}
           duplicateChecker={duplicateChecker}
+          onModelSelectionConsumed={
+            session.user.role === "user" ? () => void loadConfig() : undefined
+          }
         />
       </main>
     </div>
