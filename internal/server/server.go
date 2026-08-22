@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lieyanc/BetterOCR/internal/agents"
@@ -19,6 +20,7 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/documents"
 	"github.com/lieyanc/BetterOCR/internal/model"
 	"github.com/lieyanc/BetterOCR/internal/pipeline"
+	"github.com/lieyanc/BetterOCR/internal/updater"
 	"github.com/lieyanc/BetterOCR/web"
 )
 
@@ -45,11 +47,17 @@ type Server struct {
 	DocumentRoot string
 	// PDFRenderer is injectable for tests. Production uses embedded PDFium WASM.
 	PDFRenderer documents.PageRenderer
+	// Updater serves the OTA endpoints. A nil updater leaves them answering 503,
+	// which is what CLI-only and test handlers want.
+	Updater *updater.Updater
 
 	configMu        sync.RWMutex
 	documentOnce    sync.Once
 	documentManager *documentManager
 	documentInitErr error
+	// inFlightOCR counts recognitions running outside the document queue, so an
+	// update never restarts the process mid-recognition.
+	inFlightOCR atomic.Int64
 }
 
 // Handler 返回完整的 HTTP 处理器:/api/* 为接口,其余为内嵌前端。
@@ -90,6 +98,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/admin/users/{id}", s.requireAdmin(http.HandlerFunc(s.handleDeleteUser)))
 	mux.Handle("GET /api/admin/settings", s.requireAdmin(http.HandlerFunc(s.handleAdminSettings)))
 	mux.Handle("PUT /api/admin/settings", s.requireAdmin(http.HandlerFunc(s.handleUpdateAdminSettings)))
+	// 只读的版本信息不鉴权(便于探活与排障);三个变更动作全部要求管理员,
+	// 状态查询同样限管理员,与本项目其余接口的一致口径。
+	mux.HandleFunc("GET /api/version", s.handleVersion)
+	mux.Handle("GET /api/update/status", s.requireAdmin(http.HandlerFunc(s.handleUpdateStatus)))
+	mux.Handle("POST /api/update/check", s.requireAdmin(http.HandlerFunc(s.handleUpdateCheck)))
+	mux.Handle("POST /api/update/apply", s.requireAdmin(http.HandlerFunc(s.handleUpdateApply)))
+	mux.Handle("POST /api/update/dismiss", s.requireAdmin(http.HandlerFunc(s.handleUpdateDismiss)))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "未知接口: "+r.URL.Path)
 	})
@@ -97,6 +112,35 @@ func (s *Server) Handler() http.Handler {
 	// ServeMux 会判定为歧义模式而 panic;方法检查移到 handler 内部。
 	mux.Handle("/", staticHandler(dist))
 	return mux
+}
+
+// Prepare starts the document worker before the first request arrives, so
+// interrupted page jobs are recovered at startup rather than whenever someone
+// happens to open a project. An OTA restart is exactly what interrupts them.
+func (s *Server) Prepare() error {
+	_, err := s.getDocumentManager()
+	return err
+}
+
+// HasActiveJobs reports whether recognition work is in flight, counting both
+// the document queue and request-scoped OCR calls. The updater waits for it to
+// go false before replacing the binary.
+func (s *Server) HasActiveJobs() bool {
+	if s.inFlightOCR.Load() > 0 {
+		return true
+	}
+	// 走 getDocumentManager 而不是直接读字段:documentOnce 提供必要的同步。
+	manager, _ := s.getDocumentManager()
+	if manager == nil {
+		return false
+	}
+	return manager.active()
+}
+
+// trackOCR marks one recognition as in flight and returns its release func.
+func (s *Server) trackOCR() func() {
+	s.inFlightOCR.Add(1)
+	return func() { s.inFlightOCR.Add(-1) }
 }
 
 func (s *Server) engineTimeout() time.Duration {
@@ -183,6 +227,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 // handleOCR accepts an image and configured model references. Connections and
 // credentials are resolved exclusively from the server-side configuration.
 func (s *Server) handleOCR(w http.ResponseWriter, r *http.Request) {
+	release := s.trackOCR()
+	defer release()
 	image, runConfig, ok := s.parseOCRRequest(w, r)
 	if !ok {
 		return
@@ -223,6 +269,8 @@ type streamEvent struct {
 // handleOCRStream emits newline-delimited JSON fragments as each upstream
 // model generates text, followed by one result event with the fused output.
 func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
+	release := s.trackOCR()
+	defer release()
 	image, runConfig, ok := s.parseOCRRequest(w, r)
 	if !ok {
 		return
@@ -289,6 +337,8 @@ func (s *Server) handleOCRStream(w http.ResponseWriter, r *http.Request) {
 // not rerun the base OCR engines, so a user can merge candidates and arbitrate
 // the remaining uncertainty independently.
 func (s *Server) handleArbitrateStream(w http.ResponseWriter, r *http.Request) {
+	release := s.trackOCR()
+	defer release()
 	image, resolvedModel, disputes, ok := s.parseArbitrationRequest(w, r)
 	if !ok {
 		return

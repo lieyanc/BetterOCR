@@ -649,6 +649,34 @@ type DocumentRecovery struct {
 	Process []string
 }
 
+// FailInterruptedTasks closes out single-image tasks that were still running
+// when the process stopped. 它们绑定在请求生命周期上,重启后没人再收尾,
+// 不处理就会永远停在 running。返回被收尾的任务数。
+func (s *Store) FailInterruptedTasks() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := append([]Task(nil), s.data.Tasks...)
+	completed := time.Now().UTC()
+	changed := 0
+	for i := range s.data.Tasks {
+		if s.data.Tasks[i].Status != "running" {
+			continue
+		}
+		s.data.Tasks[i].Status = "failed"
+		s.data.Tasks[i].CompletedAt = &completed
+		s.data.Tasks[i].Error = "服务重启中断了这次识别"
+		changed++
+	}
+	if changed == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		s.data.Tasks = previous
+		return 0, err
+	}
+	return changed, nil
+}
+
 // RecoverDocuments converts interrupted page operations into resumable states
 // and returns the jobs that should be placed back on the background queue.
 func (s *Store) RecoverDocuments() (DocumentRecovery, error) {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lieyanc/BetterOCR/internal/model"
+	"github.com/lieyanc/BetterOCR/internal/updater"
 )
 
 // DefaultPath 是默认的配置文件路径(相对当前工作目录)。
@@ -48,6 +49,8 @@ type Config struct {
 	TimeoutSeconds int `json:"timeout_seconds,omitempty" config:"legacy"`
 	// ServeAddr 是 -serve 模式的监听地址。
 	ServeAddr string `json:"serve_addr"`
+	// Update configures OTA self-update in Web mode. 自更新是 opt-in,默认关闭。
+	Update updater.Config `json:"update"`
 }
 
 // Default 返回内置硬编码模板,与 README 示例保持一致。
@@ -82,6 +85,14 @@ func Default() Config {
 		EngineMaxAttempts:     defaultMaxAttempts,
 		ArbiterMaxAttempts:    defaultMaxAttempts,
 		ServeAddr:             "127.0.0.1:8787",
+		Update: updater.Config{
+			Enabled:       false,
+			Channel:       "stable",
+			CheckInterval: updater.DefaultCheckInterval,
+			Source:        updater.SourceGitHub,
+			ProxyBaseURL:  updater.DefaultProxyBaseURL,
+			Repo:          updater.DefaultRepo,
+		},
 	}
 }
 
@@ -124,6 +135,8 @@ func (c Config) normalized() Config {
 	if c.ArbiterMaxAttempts == 0 {
 		c.ArbiterMaxAttempts = defaultMaxAttempts
 	}
+	// 更新块的第二层兜底:写回配置文件时字段就是 updater 实际会用的值。
+	c.Update = updater.Normalize(c.Update)
 	c.TimeoutSeconds = 0
 	return c
 }
@@ -209,11 +222,12 @@ func Save(path string, cfg Config) error {
 	if path == "" {
 		return errors.New("配置文件路径不能为空")
 	}
-	cfg = cfg.normalized()
+	// 先按提交的原值校验,再规范化:反过来的话 normalize 会把非法的
+	// update 字段悄悄改成默认值,管理员永远看不到自己写错了。
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	return write(path, cfg)
+	return write(path, cfg.normalized())
 }
 
 // supplementProviderAliases 给 alias 为空(缺失或显式空)的 provider 补显示名:
@@ -240,6 +254,11 @@ func supplementProviderAliases(providers []model.Provider) bool {
 
 // Validate checks provider/model identity and all configured selections.
 func (c Config) Validate() error {
+	// 更新块按用户写下的原值校验:normalized 会把非法值静默纠正成默认值,
+	// 那样管理员改错了字段也不会收到任何提示。
+	if err := validateUpdate(c.Update); err != nil {
+		return err
+	}
 	c = c.normalized()
 	if c.EngineTimeoutSeconds <= 0 {
 		return errors.New("engine_timeout_seconds 必须大于 0")
@@ -306,6 +325,29 @@ func (c Config) Validate() error {
 		if _, ok := refs[ref]; !ok {
 			return fmt.Errorf("duplicate_checker 引用了未配置模型 %q", ref)
 		}
+	}
+	return nil
+}
+
+// validateUpdate rejects unusable OTA settings instead of silently coercing
+// them, so a typo in the admin settings editor is reported back.
+func validateUpdate(update updater.Config) error {
+	if channel := strings.ToLower(strings.TrimSpace(update.Channel)); channel != "" && channel != "stable" && channel != "dev" {
+		return fmt.Errorf("update.channel %q 无效,只能是 stable 或 dev", update.Channel)
+	}
+	source := strings.ToLower(strings.TrimSpace(update.Source))
+	if source != "" && source != updater.SourceGitHub && source != updater.SourceProxy {
+		return fmt.Errorf("update.source %q 无效,只能是 github 或 proxy", update.Source)
+	}
+	if update.CheckInterval < 0 {
+		return errors.New("update.check_interval 不能为负数")
+	}
+	if repo := strings.Trim(strings.TrimSpace(update.Repo), "/"); repo != "" && strings.Count(repo, "/") != 1 {
+		return fmt.Errorf("update.repo %q 必须是 owner/name 形式", update.Repo)
+	}
+	if source == updater.SourceProxy && strings.TrimSpace(update.ProxyBaseURL) != "" &&
+		!strings.HasPrefix(update.ProxyBaseURL, "http://") && !strings.HasPrefix(update.ProxyBaseURL, "https://") {
+		return fmt.Errorf("update.proxy_base_url %q 必须以 http:// 或 https:// 开头", update.ProxyBaseURL)
 	}
 	return nil
 }

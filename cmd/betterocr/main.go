@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +24,8 @@ import (
 	"github.com/lieyanc/BetterOCR/internal/model"
 	"github.com/lieyanc/BetterOCR/internal/pipeline"
 	"github.com/lieyanc/BetterOCR/internal/server"
+	"github.com/lieyanc/BetterOCR/internal/updater"
+	"github.com/lieyanc/BetterOCR/internal/version"
 )
 
 func main() {
@@ -153,16 +156,69 @@ func runServe(cfg config.Config, configPath, databasePath string) {
 	if cfg.ServeAddr == "" {
 		fatal("配置错误:", "serve_addr 为空,Web 模式无监听地址")
 	}
+	// 上一次进程(可能是自更新重启)留下的僵尸任务必须在这里收尾,
+	// 否则它们永远停在 running。文档项目的恢复在 srv.Prepare 里。
+	if recovered, err := store.FailInterruptedTasks(); err != nil {
+		fatal("恢复中断的任务记录失败:", err)
+	} else if recovered > 0 {
+		fmt.Fprintf(os.Stderr, "已将 %d 个被重启中断的任务标记为失败\n", recovered)
+	}
 	srv := &server.Server{
 		Config:     cfg,
 		ConfigPath: configPath,
 		Store:      store,
 	}
-	fmt.Fprintf(os.Stderr, "BetterOCR Web 模式已启动: http://%s\n", displayAddr(cfg.ServeAddr))
-	hs := &http.Server{Addr: cfg.ServeAddr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
-	if err := hs.ListenAndServe(); err != nil {
-		fatal("HTTP 服务失败:", err)
+	// 文档后台在这里就绪:上一次进程留下的未完成页面会重新排队。初始化失败
+	// 只让文档接口降级为 503,单图识别与其余功能照常可用。
+	if err := srv.Prepare(); err != nil {
+		fmt.Fprintln(os.Stderr, "警告: 文档后台不可用:", err)
 	}
+
+	bgCtx, cancelBackground := context.WithCancel(context.Background())
+	defer cancelBackground()
+	hs := &http.Server{Addr: cfg.ServeAddr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+
+	restartErr := make(chan error, 1)
+	srv.Updater = updater.New(
+		srv.UpdateConfig,
+		func() string { return store.Directory() },
+		log.New(os.Stderr, "", log.LstdFlags),
+		updater.RestartHooks{
+			BeforeExec: func(tag string) error {
+				// 停后台检查并优雅关闭监听,再交出进程镜像。
+				cancelBackground()
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cancel()
+				if err := hs.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "已为更新 %s 准备重启\n", tag)
+				return nil
+			},
+			OnExecFailure: func(err error) {
+				select {
+				case restartErr <- err:
+				default:
+				}
+			},
+			IsBusy: srv.HasActiveJobs,
+		},
+	)
+
+	fmt.Fprintf(os.Stderr, "BetterOCR %s (commit=%s, built=%s)\n", version.Version, version.Commit, version.BuildTime)
+	fmt.Fprintf(os.Stderr, "BetterOCR Web 模式已启动: http://%s\n", displayAddr(cfg.ServeAddr))
+	srv.Updater.StartBackground(bgCtx)
+
+	err = hs.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		// 只有 BeforeExec 会主动关闭监听:此时等 exec 的结果,
+		// 成功的话进程镜像已被替换,永远走不到这里。
+		if execErr := <-restartErr; execErr != nil {
+			fatal("自更新重启失败:", execErr)
+		}
+		return
+	}
+	fatal("HTTP 服务失败:", err)
 }
 
 func migrateLegacyWebSettings(store *database.Store, configPath string, current config.Config) (config.Config, bool, error) {

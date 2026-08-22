@@ -103,6 +103,9 @@ func TestLoadSupplementsMissingFields(t *testing.T) {
 		cfg.ServeAddr != Default().ServeAddr {
 		t.Errorf("缺失字段未按模板补全: %+v", cfg)
 	}
+	if cfg.Update != Default().Update {
+		t.Errorf("update 块未按模板补全: %+v", cfg.Update)
+	}
 	_, action, err = Load(path)
 	if err != nil || action != ActionNone {
 		t.Errorf("补全后二次加载 = (%v, %v), want ActionNone", action, err)
@@ -141,7 +144,7 @@ func TestLoadSupplementsProviderAliases(t *testing.T) {
 
 func TestLoadKeepsExplicitProviderAlias(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
-	full := []byte(`{"providers":[{"id":"openai","alias":"My OpenAI","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","duplicate_checker":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
+	full := []byte(`{"providers":[{"id":"openai","alias":"My OpenAI","base_url":"http://o/v1","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"openai-responses"}]}],"engines":["openai/m"],"arbiter":"","duplicate_checker":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1","update":{"enabled":false,"channel":"stable","check_interval":3600,"source":"github","proxy_base_url":"https://dl.repo.chycloud.top","repo":"lieyanc/BetterOCR"}}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +163,7 @@ func TestLoadKeepsExplicitProviderAlias(t *testing.T) {
 func TestLoadKeepsCompleteFileByteForByte(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "betterocr.json")
 	// 顶层字段与 provider alias 均齐全 → 原样使用,逐字节不变
-	full := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","duplicate_checker":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1"}`)
+	full := []byte(`{"providers":[{"id":"local","alias":"Local","base_url":"http://b","api_key":"","models":[{"id":"m","context":4096,"alias":"M","api":"anthropic-messages"}]}],"engines":["local/m"],"arbiter":"","duplicate_checker":"","engine_timeout_seconds":30,"arbiter_timeout_seconds":45,"engine_max_attempts":2,"arbiter_max_attempts":3,"serve_addr":":1","update":{"enabled":false,"channel":"stable","check_interval":3600,"source":"github","proxy_base_url":"https://dl.repo.chycloud.top","repo":"lieyanc/BetterOCR"}}`)
 	if err := os.WriteFile(path, full, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +177,51 @@ func TestLoadKeepsCompleteFileByteForByte(t *testing.T) {
 	raw, _ := os.ReadFile(path)
 	if !bytes.Equal(raw, full) {
 		t.Errorf("字段齐全仍被重写:\n%s", raw)
+	}
+}
+
+// TestUpdateBlockRejectsInvalidValues 覆盖两条入口:配置文件加载与管理界面
+// 保存。非法值必须报错,而不是被 normalize 悄悄改成默认值。
+func TestUpdateBlockRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"channel", `{"channel":"beta"}`, "update.channel"},
+		{"source", `{"source":"ftp"}`, "update.source"},
+		{"interval", `{"check_interval":-1}`, "update.check_interval"},
+		{"repo", `{"repo":"lieyanc/BetterOCR/extra"}`, "update.repo"},
+		{"proxy scheme", `{"source":"proxy","proxy_base_url":"dl.example.com"}`, "update.proxy_base_url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			raw := []byte(`{"providers":[],"engines":[],"arbiter":"","duplicate_checker":"",` +
+				`"engine_timeout_seconds":30,"arbiter_timeout_seconds":30,"engine_max_attempts":1,` +
+				`"arbiter_max_attempts":1,"serve_addr":":1","update":` + tc.json + `}`)
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Load error = %v, want one mentioning %s", err, tc.want)
+			}
+			if after, _ := os.ReadFile(path); !bytes.Equal(after, raw) {
+				t.Errorf("非法配置被改写:\n%s", after)
+			}
+
+			// 管理界面保存走 Save,同样不能被静默纠正。
+			var cfg Config
+			if err := json.Unmarshal(raw, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			if err := Save(filepath.Join(dir, "saved.json"), cfg); err == nil ||
+				!strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Save error = %v, want one mentioning %s", err, tc.want)
+			}
+		})
 	}
 }
 

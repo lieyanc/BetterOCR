@@ -128,6 +128,13 @@ func (m *documentManager) enqueue(job documentJob) error {
 	}
 }
 
+// active reports whether any document job is queued or running.
+func (m *documentManager) active() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.queued) > 0 || len(m.runs) > 0
+}
+
 func (m *documentManager) cancel(id string) {
 	m.mu.Lock()
 	cancel := m.runs[id]

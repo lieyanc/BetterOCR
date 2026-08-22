@@ -141,7 +141,7 @@ Web 界面启用基于角色的访问控制：
 
 | 角色 | 权限 |
 |------|------|
-| 管理员 | 识别图片、查看全部任务记录、创建/编辑/停用/删除用户、编辑完整系统设置 |
+| 管理员 | 识别图片、查看全部任务记录、创建/编辑/停用/删除用户、编辑完整系统设置、检查并应用 OTA 更新 |
 | 普通用户 | 识别图片、仅查看自己的任务记录 |
 
 密码使用带随机盐的 PBKDF2-SHA256 哈希保存；登录会话使用 HttpOnly、SameSite
@@ -194,6 +194,9 @@ data/documents/<项目 ID>/
 - API 只接受配置文件中存在的模型引用;Provider 密钥绝不下发到浏览器,
   请求也不能覆盖端点或密钥。
 - 监听地址(`serve_addr`)请保持 127.0.0.1;要暴露到公网需自行加认证层。
+- 管理员的「管理 → 更新」页可以查看版本信息、检查更新、下载并原地重启到新版本,
+  详见「发版与自更新(OTA)」;更新完成后页面会自动整页刷新,避免旧前端资源
+  与新后端错配。
 - 前端开发:`cd web && npm run dev`(Vite 把 /api 代理到 127.0.0.1:8787)。
 - 未构建前端时 `go build` 依然可用,Web 模式会返回一页构建指引。
 
@@ -275,11 +278,91 @@ data/documents/<项目 ID>/
 | `engine_max_attempts`     | 单个基础模型最大尝试次数,`1` 表示不重试                    |
 | `arbiter_max_attempts`    | 仲裁模型与 Fast Model 最大尝试次数,`1` 表示不重试          |
 | `serve_addr`              | Web 模式监听地址,如 `127.0.0.1:8787`                       |
+| `update`                  | OTA 自更新配置块,见下节;默认关闭                          |
 
 启动时的配置文件处理:不存在 → 释放内置模板;缺字段 →
 按模板补全写回;解析或引用校验失败 → 报错且绝不改动原文件。不读取任何环境变量。
 
 单引擎失败不影响其他引擎;全部失败时退出码 1,细节在 `candidates[].err`。
+
+## 发版与自更新(OTA)
+
+CI 交叉编译七个平台的单文件二进制,推 `main` 发滚动预发布,推 `v*` tag 发正式版;
+Web 模式的管理员可以在「管理 → 更新」里检查、下载并原地重启到新版本。
+
+### 发版流程
+
+`.github/workflows/cross-compile.yml`:
+
+```
+push main       → meta(算版本) → test → build(7 平台矩阵) → release-dev (固定 dev tag,prerelease)
+push v* tag     → meta          → test → build             → release-prod(make_latest)
+```
+
+- 版本号在 `meta` job 里算一次,由 `-ldflags` 注入 `internal/version`:dev 版为
+  `dev-{run:%04d}-{yyyymmdd}-{shortsha}`,正式版为 tag 本身。该 dev 格式是客户端
+  `parseDevTag` 依赖的协议,改一边必须改另一边。
+- 资产名为 `betterocr-{goos}-{goarch}[.exe]`,每个二进制配一份 `.sha256`,
+  外加一份 `version.json`(两个通道各自的版本发现入口)。
+- 资产名必须与 `updater.targetName()` 逐字一致,否则该平台自更新永远 404;
+  `internal/updater` 的 `TestReleaseAssetNamesMatchCIMatrix` 会把矩阵和命名对表,
+  `.github/scripts/verify-release-assets.sh` 在发布前按矩阵核对文件与校验和。
+- `dev` release 每次先删后建,并显式 `--latest=false`,避免预发布抢占
+  `releases/latest` 重定向、毒化 stable 通道。
+
+本地打一个带版本信息的二进制:`make build`(从 `git describe` 取值),
+或手动 `go build -ldflags="-X .../internal/version.Version=v0.1.0" ...`。
+
+### 更新配置块
+
+```json
+"update": {
+  "enabled": false,
+  "channel": "stable",
+  "check_interval": 3600,
+  "source": "github",
+  "proxy_base_url": "https://dl.repo.chycloud.top",
+  "repo": "lieyanc/BetterOCR"
+}
+```
+
+| 字段              | 说明                                                                 |
+|-------------------|----------------------------------------------------------------------|
+| `enabled`         | 是否启用后台定期检查;关闭时仍可在管理界面手动检查与更新              |
+| `channel`         | `stable` 走正式版(下载校验后自动重启);`dev` 走滚动预发布(停在待重启,等管理员确认) |
+| `check_interval`  | 后台检查间隔秒数,下限 60 秒;服务启动后先等 30 秒再首次检查           |
+| `source`          | `github` 直连 release 下载直链(不用 REST API,无速率限制);`proxy` 走镜像 |
+| `proxy_base_url`  | `source: proxy` 时的镜像地址                                          |
+| `repo`            | 发布仓库,`owner/name`                                                |
+
+非法值会被拒绝而不是静默纠正;字段留空时按内置默认值兜底。
+
+### 更新接口
+
+| 端点                   | 方法 | 鉴权   | 行为                                        |
+|------------------------|------|--------|---------------------------------------------|
+| `/api/version`         | GET  | 无     | 版本、commit、构建时间与当前更新配置        |
+| `/api/update/status`   | GET  | 管理员 | 状态机快照(state/进度/最新版本/错误)       |
+| `/api/update/check`    | POST | 管理员 | 只检查不下载;检查失败随 200 返回 `error` 字段 |
+| `/api/update/apply`    | POST | 管理员 | 待重启态则重启;否则触发检查+下载+安装      |
+| `/api/update/dismiss`  | POST | 管理员 | 丢弃已下载的预发布二进制,回到空闲          |
+
+三个 POST 与其余变更接口一样需要管理员会话 + `X-CSRF-Token`。
+
+### 安全边界与已知限制
+
+- **不做发布签名**:信任锚是 github.com 的 TLS 与 CI 生成的 `.sha256`。
+  校验和缺失或不匹配一律硬失败、绝不降级安装,但被攻破的镜像可以同时替换
+  二进制与校验和 —— 所以 `source: proxy` 的可信度等同于镜像本身。
+- 更新落地时机受在途任务保护:有文档队列任务或在途识别请求时,更新会等到
+  空闲再重启(上限 10 分钟)。被重启打断的任务会在下次启动时收尾为失败,
+  文档项目里未完成的页面会重新排队。
+- Unix 上通过 `syscall.Exec` 原地替换进程镜像,PID 不变,systemd 不感知重启;
+  Windows 用 PowerShell 脚本等原进程退出后替换并重新拉起。
+- 无启动崩溃自动回滚:备份在 exec 前就已删除。
+- 本地裸编译(`Version == "dev"`)总被判定为"有更新",这是刻意的。
+- `source: github` 拿不到 Release 说明(那是 REST API 数据),界面显示"暂无发布说明"。
+
 
 ## 接入自定义引擎 / 仲裁器
 
@@ -305,7 +388,9 @@ go test ./...
 
 核心算法(对齐、共识、仲裁流程)用内联假实现测试,三种模型 API、HTTP 客户端
 与 Web 服务(multipart 上传、模型白名单、密钥隔离、静态回退)用 `httptest`
-假端点测试,不依赖网络与真实模型。Go 侧零第三方依赖,纯标准库。
+假端点测试,不依赖网络与真实模型。自更新链路同样全程 `httptest`:双通道版本
+比较、校验和缺失与不匹配的拒绝、状态机跃迁、更新端点的鉴权矩阵,以及 CI
+构建矩阵与资产命名的对表。Go 侧零第三方依赖,纯标准库。
 
 ## License
 

@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Loader2,
   Pencil,
+  RefreshCw,
   Save,
   Settings,
   ShieldCheck,
@@ -62,6 +63,7 @@ import {
 } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
+import { UpdatePanel } from "@/components/update-panel"
 import {
   Tooltip,
   TooltipContent,
@@ -165,6 +167,10 @@ export function AdminDialog({
             <TabsTrigger value="settings">
               <Settings />
               设置
+            </TabsTrigger>
+            <TabsTrigger value="update">
+              <RefreshCw />
+              更新
             </TabsTrigger>
           </TabsList>
           <TabsContent value="users" className="min-h-0 flex-1">
@@ -280,6 +286,9 @@ export function AdminDialog({
                 </Button>
               </div>
             </div>
+          </TabsContent>
+          <TabsContent value="update" className="min-h-0 flex-1">
+            <UpdatePanel />
           </TabsContent>
         </Tabs>
       </DialogContent>

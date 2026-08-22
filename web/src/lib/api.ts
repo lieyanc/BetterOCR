@@ -115,6 +115,15 @@ export interface SettingsProvider extends Omit<Provider, "has_api_key"> {
   api_key: string
 }
 
+export interface UpdateSettings {
+  enabled: boolean
+  channel: "stable" | "dev"
+  check_interval: number
+  source: "github" | "proxy"
+  proxy_base_url: string
+  repo: string
+}
+
 export interface AdminSettings {
   providers: SettingsProvider[]
   engines: string[]
@@ -125,6 +134,80 @@ export interface AdminSettings {
   engine_max_attempts: number
   arbiter_max_attempts: number
   serve_addr: string
+  update: UpdateSettings
+}
+
+export interface VersionInfo {
+  version: string
+  commit: string
+  build_time: string
+  update_enabled: boolean
+  update_channel: string
+  update_source: string
+  update_repo: string
+}
+
+export type UpdateState =
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "ready"
+  | "applying"
+  | "failed"
+
+export interface UpdateStatus {
+  state: UpdateState
+  current_version: string
+  latest_version?: string
+  is_prerelease: boolean
+  /** 整条链路的总进度 0-100 */
+  progress?: number
+  /** 仅下载阶段的字节进度 0-100 */
+  download_progress?: number
+  error?: string
+  last_check?: string
+  release_notes?: string
+}
+
+export interface UpdateCheckResult {
+  has_update: boolean
+  current_version: string
+  latest_version?: string
+  is_prerelease: boolean
+  release_notes?: string
+  channel: string
+  /** 检查失败时随 200 一起返回,便于与当前状态一起展示 */
+  error?: string
+}
+
+export async function fetchVersion(): Promise<VersionInfo> {
+  const res = await fetch("/api/version")
+  await assertOK(res, "获取版本信息")
+  return res.json() as Promise<VersionInfo>
+}
+
+export async function fetchUpdateStatus(): Promise<UpdateStatus> {
+  const res = await apiFetch("/api/update/status")
+  await assertOK(res, "获取更新状态")
+  return res.json() as Promise<UpdateStatus>
+}
+
+export async function checkUpdate(): Promise<UpdateCheckResult> {
+  const res = await apiFetch("/api/update/check", { method: "POST" })
+  await assertOK(res, "检查更新")
+  return res.json() as Promise<UpdateCheckResult>
+}
+
+export async function applyUpdate(): Promise<{ status: string }> {
+  const res = await apiFetch("/api/update/apply", { method: "POST" })
+  await assertOK(res, "应用更新")
+  return res.json() as Promise<{ status: string }>
+}
+
+export async function dismissUpdate(): Promise<{ status: string }> {
+  const res = await apiFetch("/api/update/dismiss", { method: "POST" })
+  await assertOK(res, "忽略更新")
+  return res.json() as Promise<{ status: string }>
 }
 
 let csrfToken = ""

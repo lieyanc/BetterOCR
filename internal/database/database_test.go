@@ -183,6 +183,55 @@ func TestRecoverDocumentsQueuesInterruptedWork(t *testing.T) {
 	}
 }
 
+func TestFailInterruptedTasksClosesRunningRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := store.InitializeAdmin("admin", "admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := store.CreateTask(admin, "interrupted.png", []string{"openai/gpt-4o-mini"}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := store.CreateTask(admin, "finished.png", []string{"openai/gpt-4o-mini"}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishTask(finished.ID, &arbiter.Final{Text: "done"}, "", time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := reopened.FailInterruptedTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+	byID := map[string]Task{}
+	for _, task := range reopened.Tasks("", true) {
+		byID[task.ID] = task
+	}
+	if got := byID[interrupted.ID]; got.Status != "failed" || got.Error == "" || got.CompletedAt == nil {
+		t.Errorf("interrupted task = %+v", got)
+	}
+	if got := byID[finished.ID]; got.Status != "completed" || got.Error != "" {
+		t.Errorf("completed task was rewritten: %+v", got)
+	}
+	// 幂等:再次启动不应重复改写。
+	if again, err := reopened.FailInterruptedTasks(); err != nil || again != 0 {
+		t.Fatalf("second recovery = (%d, %v), want (0, nil)", again, err)
+	}
+}
+
 func TestDatabaseNeverPersistsSettingsAndRemovesLegacyCopy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database.json")
 	store, err := Open(path)
