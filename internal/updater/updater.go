@@ -940,10 +940,43 @@ func (u *Updater) applyUpdate(newBinaryPath, tag string) error {
 	u.status.Progress = progressApplying
 	u.mu.Unlock()
 
+	// 换二进制靠在安装目录里改名,先探一次可写性。等 BeforeExec 关掉监听之后
+	// 才发现目录只读,一次本该只是报错的更新就变成了服务中断;Windows 更糟,
+	// 换文件的脚本在进程退出后才跑,失败时没人再把服务拉起来。
+	if err := checkInstallDirWritable(); err != nil {
+		return err
+	}
+
 	if runtime.GOOS == "windows" {
 		return u.applyUpdateWindows(newBinaryPath, tag)
 	}
 	return u.applyUpdateUnix(newBinaryPath, tag)
+}
+
+// executablePath 指向当前进程的可执行文件,测试里换成临时目录中的假二进制。
+var executablePath = os.Executable
+
+// checkInstallDirWritable 确认可执行文件所在目录能建文件,例如二进制装在
+// root 拥有的目录里而服务以普通用户运行时,这里就会提前失败。
+func checkInstallDirWritable() error {
+	execPath, err := executablePath()
+	if err != nil {
+		return fmt.Errorf("resolve executable path: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(execPath); err == nil {
+		execPath = resolved
+	}
+	dir := filepath.Dir(execPath)
+	probe, err := os.CreateTemp(dir, ".betterocr-swap-probe-*")
+	if err != nil {
+		return fmt.Errorf("install directory %s is not writable: %w", dir, err)
+	}
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(name)
+		return fmt.Errorf("install directory %s is not writable: %w", dir, err)
+	}
+	return os.Remove(name)
 }
 
 // applyUpdateUnix swaps the binary in place and re-execs it, so the PID never

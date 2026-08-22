@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -409,6 +410,56 @@ func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
 	}
 
 	time.Sleep(250 * time.Millisecond)
+}
+
+// TestApplyUpdateChecksInstallDirBeforeShuttingDown pins the ordering that
+// keeps a doomed update from costing an outage: BeforeExec tears down the HTTP
+// listener, so an unwritable install directory has to be detected before it
+// runs. Otherwise the swap fails with the service already stopped.
+func TestApplyUpdateChecksInstallDirBeforeShuttingDown(t *testing.T) {
+	installDir := t.TempDir()
+	fakeExec := filepath.Join(installDir, "betterocr")
+	if err := os.WriteFile(fakeExec, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := executablePath
+	executablePath = func() (string, error) { return fakeExec, nil }
+	t.Cleanup(func() { executablePath = original })
+
+	if err := os.Chmod(installDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(installDir, 0o700) })
+
+	u := testUpdater(Config{})
+	shutdownCalled := false
+	u.hooks.BeforeExec = func(string) error {
+		shutdownCalled = true
+		return nil
+	}
+
+	err := u.applyUpdate(filepath.Join(t.TempDir(), "betterocr-dev"), "dev")
+	if err == nil || !strings.Contains(err.Error(), "not writable") {
+		t.Fatalf("applyUpdate error = %v, want one reporting an unwritable install directory", err)
+	}
+	if shutdownCalled {
+		t.Fatal("BeforeExec ran despite a known-unwritable install directory, so the listener closed for nothing")
+	}
+
+	// 目录恢复可写后同一个检查必须放行,否则等于永久禁用自更新。
+	if err := os.Chmod(installDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkInstallDirWritable(); err != nil {
+		t.Fatalf("checkInstallDirWritable on a writable directory = %v", err)
+	}
+	left, err := os.ReadDir(installDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 {
+		t.Fatalf("probe left files behind: %d entries", len(left))
+	}
 }
 
 func TestDismissPendingRemovesDownloadedBinary(t *testing.T) {
